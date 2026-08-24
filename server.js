@@ -7,6 +7,13 @@ const path = require('path');
 const util = require('util');
 const execPromise = util.promisify(exec);
 
+// NEW: detects apps built assuming Claude Artifacts' window.storage API,
+// which does not exist outside that sandbox and will fail if deployed
+// here unmodified. Blocks the deploy with a clear message rather than
+// building/shipping an app that will break at runtime. Skipped entirely
+// for apps that already declare a real database dependency.
+const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
+
 const app = express();
 
 // Configure Multer to save uploaded files to a temporary folder
@@ -64,21 +71,55 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       cwd: buildDir
     });
 
-    // 2b. Detect whether the app uses an embedded database (PGlite), which
-    // needs more memory headroom than a plain static/Express app.
-    // Falls back to the lower default if package.json is missing/unreadable
-    // (e.g. non-Node apps) or doesn't declare the dependency.
-    let usesEmbeddedDb = false;
+    // NEW 2a. Read package.json once, up front — shared by the embedded-DB
+    // memory check below AND to decide whether the window.storage scan is
+    // even worth running (skipped entirely if a real DB dependency already
+    // exists, since that's the exact case that doesn't need this check).
+    let deps = {};
     try {
       const pkgPath = path.join(buildDir, 'package.json');
       if (await fs.pathExists(pkgPath)) {
         const pkg = await fs.readJson(pkgPath);
-        const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-        usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
+        deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
       }
     } catch (e) {
-      console.warn(`[${appName}] Could not inspect package.json for DB usage, defaulting to standard memory: ${e.message}`);
+      console.warn(`[${appName}] Could not read package.json, defaulting to standard memory and running storage scan: ${e.message}`);
     }
+
+    const hasRealDb = hasRealDatabaseDependency(deps);
+
+    // NEW 2b. Reject apps that rely on window.storage BEFORE spending any
+    // build time/resources on them — but only bother checking if the app
+    // doesn't already have real persistence, since that's the one case
+    // this check exists for. This is a hard stop, not a warning — the app
+    // would break at runtime on hostnsoft otherwise, and a compatibility
+    // shim was considered and rejected (it would require exposing an
+    // unauthenticated public endpoint to every app's visitor traffic —
+    // see project notes for that discussion).
+    if (!hasRealDb) {
+      const storageUsage = await detectWindowStorageUsage(buildDir);
+      if (storageUsage.detected) {
+        console.log(`[${appName}] Rejected: window.storage usage detected in: ${storageUsage.files.join(', ')}`);
+        await fs.remove(buildDir);
+        await fs.remove(req.file.path);
+        return res.status(422).json({
+          error: "Unsupported storage pattern detected",
+          detail:
+            "This app calls window.storage, an API specific to Claude Artifacts' sandbox. " +
+            "It does not exist outside that environment and will fail at runtime if deployed " +
+            "here as-is. Please update the app to persist data with a real database before " +
+            "redeploying: SQLite for simple key-value/document-style data, or PGlite " +
+            "(@electric-sql/pglite) for relational data needing joins or queries.",
+          filesDetected: storageUsage.files,
+          docs: "https://ship.hostnsoft.com/docs/storage-requirements",
+        });
+      }
+    }
+
+    // 2c. Embedded DB (PGlite) needs more memory headroom than a plain
+    // static/Express app. Uses the same `deps` read above — no second
+    // package.json read.
+    const usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
     const taskMemory = usesEmbeddedDb ? 512 : 256;
     console.log(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} -> memory = ${taskMemory}MB`);
 
