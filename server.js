@@ -14,22 +14,19 @@ const execPromise = util.promisify(exec);
 // for apps that already declare a real database dependency.
 const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
 
+// NEW: every deploy now authenticates as a specific company via a
+// company-scoped token issued (and revocable/rotatable) by hostnsoft-api,
+// replacing the old single shared PLATFORM_TOKEN everyone used.
+const { validateDeployToken } = require('./validate-deploy-token');
+
 const app = express();
 
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
 
-// Security token — must come from the environment, never hardcoded.
-// Generate a real one with: openssl rand -hex 32
-if (!process.env.PLATFORM_TOKEN) {
-  console.error("FATAL: PLATFORM_TOKEN environment variable is not set.");
-  console.error("Generate one with: openssl rand -hex 32");
-  process.exit(1);
-}
-const PLATFORM_TOKEN = process.env.PLATFORM_TOKEN;
-
 app.post('/apps', upload.single('source'), async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
+  const companyId = req.headers['x-company-id'];
   const appName = req.headers['x-app-name'];
 
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
@@ -41,7 +38,11 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     : `${Date.now()}`;
 
   // 1. Validation
-  if (token !== PLATFORM_TOKEN) {
+  if (!companyId) {
+    return res.status(400).json({ error: "Missing X-Company-Id header." });
+  }
+
+  if (!token || !(await validateDeployToken(companyId, token))) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
