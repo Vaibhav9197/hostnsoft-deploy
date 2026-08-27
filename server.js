@@ -27,6 +27,10 @@ const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detec
 // replacing the old single shared PLATFORM_TOKEN everyone used.
 const { validateDeployToken } = require('./validate-deploy-token');
 
+// NEW: reports each deploy attempt's outcome back to hostnsoft-api so its
+// dashboard deployment history is actually populated.
+const { recordDeployment } = require('./record-deployment');
+
 const app = express();
 
 // Configure Multer to save uploaded files to a temporary folder
@@ -205,6 +209,18 @@ job "${appName}" {
     await fs.remove(buildDir);
     await fs.remove(req.file.path);
 
+    // NEW: report this deploy's outcome to hostnsoft-api so its dashboard
+    // deployment history is actually populated.
+    await recordDeployment({
+      companyId,
+      token,
+      projectSlug: appName,
+      appVersion,
+      status: 'success',
+      imageTag: imageName,
+      memoryMb: taskMemory,
+    });
+
     // 7. Send Success Response
     res.status(200).json({
       success: true,
@@ -217,6 +233,20 @@ job "${appName}" {
 
   } catch (error) {
     console.error(`[${appName}] Deployment failed:`, error);
+
+    // NEW: report the failure too — companyId/token/appName/appVersion are
+    // all validated before this try block starts, so they're safe here
+    // even if the failure happened early in the pipeline (taskMemory isn't,
+    // hence its absence below).
+    await recordDeployment({
+      companyId,
+      token,
+      projectSlug: appName,
+      appVersion,
+      status: 'failed',
+      errorDetail: error.message,
+    });
+
     res.status(500).json({ error: "Deployment failed", details: error.message });
   }
 });

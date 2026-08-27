@@ -43,6 +43,15 @@ history first).
   is unreachable or returns anything other than `{valid: true}` —
   logged distinctly from a plain bad-token rejection so ops can tell
   "hostnsoft-api is down" apart from "wrong token" in `pm2 logs`.
+- **`record-deployment.js`** (added 2026-08-27) — reports each deploy
+  attempt's outcome (success or failure, with the failure's `error.message`
+  as the log) to `hostnsoft-api`'s `POST /internal/deployments/record`,
+  called from both the success and failure paths in `server.js`. This is
+  what makes the dashboard's deployment history real instead of always
+  empty. Best-effort and fails open on the *deploy's* own response — a
+  `hostnsoft-api` outage here only means this one deploy's outcome doesn't
+  get recorded (logged to `pm2 logs`), it never changes the response
+  already going back to whoever triggered the deploy.
 - **`detect-storage-usage.js`** — detects `window.storage` usage
   (Claude Artifacts' sandbox API, which doesn't exist outside it) in an
   app's source before building, and causes `server.js` to reject the
