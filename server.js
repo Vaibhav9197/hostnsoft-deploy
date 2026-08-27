@@ -1,9 +1,17 @@
+const path = require('path');
+
+// Loads .env from this file's own directory, not process.cwd() — pm2 isn't
+// guaranteed to launch this with its cwd set to here, so the default
+// (cwd-relative) dotenv behavior would silently miss the file under pm2.
+// Must run before validate-deploy-token.js (and anything else reading
+// process.env) is required below.
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
 const express = require('express');
 const multer = require('multer');
 const tar = require('tar');
 const fs = require('fs-extra');
 const { exec } = require('child_process');
-const path = require('path');
 const util = require('util');
 const execPromise = util.promisify(exec);
 

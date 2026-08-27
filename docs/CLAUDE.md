@@ -31,7 +31,13 @@ history first).
   live by calling `hostnsoft-api`'s `POST /internal/deploy-tokens/validate`
   (see `validate-deploy-token.js`) before doing anything else. Requires
   `HOSTNSOFT_API_URL` in the environment (fails fast at startup if unset,
-  same pattern `PLATFORM_TOKEN` used to follow).
+  same pattern `PLATFORM_TOKEN` used to follow). **Since 2026-08-27**,
+  loaded from a `.env` file next to `server.js` (via `dotenv`, path
+  resolved from `__dirname` rather than the process's cwd, since pm2
+  doesn't guarantee it launches with cwd set to this directory) — copy
+  `.env.example` to `.env` on the server and fill it in, rather than
+  relying on the shell/pm2 environment carrying it. `.env` is gitignored;
+  never commit it.
 - **`validate-deploy-token.js`** — the new company-scoped auth check
   described above. Fails closed (rejects the deploy) if `hostnsoft-api`
   is unreachable or returns anything other than `{valid: true}` —
