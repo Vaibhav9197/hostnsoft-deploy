@@ -31,6 +31,11 @@ const { validateDeployToken } = require('./validate-deploy-token');
 // dashboard deployment history is actually populated.
 const { recordDeployment } = require('./record-deployment');
 
+// NEW: confirms the app name is available to this company BEFORE any
+// build/Nomad resources are spent — the app name is also the live
+// subdomain, so it must be unique platform-wide.
+const { claimProject } = require('./claim-project');
+
 const app = express();
 
 // Configure Multer to save uploaded files to a temporary folder
@@ -60,6 +65,15 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid or missing X-App-Name header. Use lowercase letters and dashes." });
+  }
+
+  // NEW: the app name is also the live subdomain and the Nomad job name —
+  // confirm it's either already this company's or free to claim BEFORE
+  // spending any build time on it. No project needs to exist via the
+  // dashboard first; this auto-creates one on first sight.
+  const claim = await claimProject(companyId, token, appName);
+  if (!claim.ok) {
+    return res.status(claim.status).json({ error: claim.error });
   }
 
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
