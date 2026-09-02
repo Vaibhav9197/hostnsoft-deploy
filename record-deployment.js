@@ -20,6 +20,8 @@
  * No companyId here either — hostnsoft-api reads it off the token, same
  * as every other internal call.
  */
+const logger = require("./logger");
+
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/validated by validate-deploy-token.js at startup
 
 async function recordDeployment({
@@ -47,12 +49,13 @@ async function recordDeployment({
     });
 
     if (!response.ok) {
-      console.error(
-        `[record-deployment] hostnsoft-api returned HTTP ${response.status} recording ${projectSlug}@${appVersion}`
+      const bodyText = await response.text().catch(() => "<unreadable response body>");
+      logger.error(
+        `[record-deployment] hostnsoft-api returned HTTP ${response.status} recording ${projectSlug}@${appVersion}: ${bodyText}`
       );
     }
   } catch (e) {
-    console.error(
+    logger.error(
       `[record-deployment] could not reach hostnsoft-api to record ${projectSlug}@${appVersion}: ${e.message}`
     );
   }

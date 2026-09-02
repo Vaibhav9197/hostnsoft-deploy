@@ -9,9 +9,11 @@
  * the token.
  */
 
+const logger = require("./logger");
+
 if (!process.env.HOSTNSOFT_API_URL) {
-  console.error("FATAL: HOSTNSOFT_API_URL environment variable is not set.");
-  console.error("Point it at the hostnsoft-api instance this service validates deploy tokens against.");
+  logger.error("FATAL: HOSTNSOFT_API_URL environment variable is not set.");
+  logger.error("Point it at the hostnsoft-api instance this service validates deploy tokens against.");
   process.exit(1);
 }
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL;
@@ -28,12 +30,13 @@ async function validateDeployToken(token) {
     // Fail closed — an unreachable hostnsoft-api must never be treated as
     // "any token is fine". Logged distinctly from a bad-token rejection so
     // ops can tell "hostnsoft-api is down" apart from "wrong token".
-    console.error(`[validate-deploy-token] could not reach hostnsoft-api: ${e.message}`);
+    logger.error(`[validate-deploy-token] could not reach hostnsoft-api: ${e.message}`);
     return false;
   }
 
   if (!response.ok) {
-    console.error(`[validate-deploy-token] hostnsoft-api returned HTTP ${response.status}`);
+    const bodyText = await response.text().catch(() => "<unreadable response body>");
+    logger.error(`[validate-deploy-token] hostnsoft-api returned HTTP ${response.status}: ${bodyText}`);
     return false;
   }
 

@@ -16,6 +16,8 @@
  * Fails closed, same as validate-deploy-token.js: an unreachable
  * hostnsoft-api must never be treated as "any app name is fine".
  */
+const logger = require("./logger");
+
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/validated by validate-deploy-token.js at startup
 
 async function claimProject(token, slug) {
@@ -27,7 +29,7 @@ async function claimProject(token, slug) {
       body: JSON.stringify({ token, slug }),
     });
   } catch (e) {
-    console.error(`[claim-project] could not reach hostnsoft-api to claim "${slug}": ${e.message}`);
+    logger.error(`[claim-project] could not reach hostnsoft-api to claim "${slug}": ${e.message}`);
     return { ok: false, status: 502, code: 'app_name_check_failed', error: "Could not verify app name availability" };
   }
 
@@ -37,7 +39,8 @@ async function claimProject(token, slug) {
   }
 
   if (!response.ok) {
-    console.error(`[claim-project] hostnsoft-api returned HTTP ${response.status} claiming "${slug}"`);
+    const bodyText = await response.text().catch(() => "<unreadable response body>");
+    logger.error(`[claim-project] hostnsoft-api returned HTTP ${response.status} claiming "${slug}": ${bodyText}`);
     return { ok: false, status: 502, code: 'app_name_check_failed', error: "Could not verify app name availability" };
   }
 

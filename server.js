@@ -14,6 +14,7 @@ const fs = require('fs-extra');
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const logger = require('./logger');
 
 // NEW: detects apps built assuming Claude Artifacts' window.storage API,
 // which does not exist outside that sandbox and will fail if deployed
@@ -95,7 +96,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
   try {
     // 2. Extract the uploaded tar.gz file
-    console.log(`[${appName}] Extracting code...`);
+    logger.info(`[${appName}] Extracting code...`);
     await fs.ensureDir(buildDir);
     await tar.x({
       file: req.file.path,
@@ -114,7 +115,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
         deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
       }
     } catch (e) {
-      console.warn(`[${appName}] Could not read package.json, defaulting to standard memory and running storage scan: ${e.message}`);
+      logger.warn(`[${appName}] Could not read package.json, defaulting to standard memory and running storage scan: ${e.message}`);
     }
 
     const hasRealDb = hasRealDatabaseDependency(deps);
@@ -130,7 +131,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     if (!hasRealDb) {
       const storageUsage = await detectWindowStorageUsage(buildDir);
       if (storageUsage.detected) {
-        console.log(`[${appName}] Rejected: window.storage usage detected in: ${storageUsage.files.join(', ')}`);
+        logger.info(`[${appName}] Rejected: window.storage usage detected in: ${storageUsage.files.join(', ')}`);
         await fs.remove(buildDir);
         await fs.remove(req.file.path);
         return res.status(422).json({
@@ -153,17 +154,17 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // package.json read.
     const usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
     const taskMemory = usesEmbeddedDb ? 512 : 256;
-    console.log(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} -> memory = ${taskMemory}MB`);
+    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} -> memory = ${taskMemory}MB`);
 
     // 3. Build the container image using Railpack
-    console.log(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
+    logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
     // FIXED: Railpack's CLI takes the directory as a positional arg and the
     // image tag via --name. The original `railpack build ${imageName}` treated
     // the tag itself as a directory path and always failed.
     await execPromise(`cd ${buildDir} && railpack build . --name ${imageName}`);
 
     // 4. Generate the Nomad Job Specification
-    console.log(`[${appName}] Generating Nomad file...`);
+    logger.info(`[${appName}] Generating Nomad file...`);
     const nomadJobSpec = `
 job "${appName}" {
   datacenters = ["dc1"]
@@ -221,7 +222,7 @@ job "${appName}" {
     await fs.writeFile(nomadFilePath, nomadJobSpec);
 
     // 5. Deploy to Nomad
-    console.log(`[${appName}] Deploying to Nomad...`);
+    logger.info(`[${appName}] Deploying to Nomad...`);
     await execPromise(`nomad job run ${nomadFilePath}`);
 
     // 6. Cleanup temp files
@@ -250,7 +251,7 @@ job "${appName}" {
     });
 
   } catch (error) {
-    console.error(`[${appName}] Deployment failed:`, error);
+    logger.error(`[${appName}] Deployment failed:`, error);
 
     // NEW: report the failure too — token/appName/appVersion are all
     // validated before this try block starts, so they're safe here even
@@ -270,5 +271,5 @@ job "${appName}" {
 
 // Start the API Server on port 4000
 app.listen(4000, '0.0.0.0', () => {
-  console.log("🚀 Platform Deployment API running on port 4000");
+  logger.info("🚀 Platform Deployment API running on port 4000");
 });

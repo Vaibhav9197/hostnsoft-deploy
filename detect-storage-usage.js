@@ -18,6 +18,7 @@ const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const path = require('path');
+const logger = require('./logger');
 
 const REAL_DB_PACKAGE_PREFIXES = ['@electric-sql/pglite', 'better-sqlite3', 'sqlite3'];
 
@@ -54,7 +55,7 @@ async function detectWindowStorageUsage(buildDir) {
       return { detected: false, files: [] };
     }
     // Fail open: a broken scan should never block a legitimate deploy.
-    console.warn(`[detect-storage-usage] scan failed, skipping check: ${e.message}`);
+    logger.warn(`[detect-storage-usage] scan failed, skipping check: ${e.message}`);
     return { detected: false, files: [] };
   }
 }
