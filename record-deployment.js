@@ -16,11 +16,13 @@
  * reporting step must never change the response already being sent back
  * to the client that triggered the deploy — the deploy itself already
  * succeeded or failed on its own terms by the time this runs.
+ *
+ * No companyId here either — hostnsoft-api reads it off the token, same
+ * as every other internal call.
  */
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/validated by validate-deploy-token.js at startup
 
 async function recordDeployment({
-  companyId,
   token,
   projectSlug,
   appVersion,
@@ -34,7 +36,6 @@ async function recordDeployment({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        companyId,
         token,
         projectSlug,
         appVersion,

@@ -43,7 +43,6 @@ const upload = multer({ dest: '/tmp/platform-uploads/' });
 
 app.post('/apps', upload.single('source'), async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
-  const companyId = req.headers['x-company-id'];
   const appName = req.headers['x-app-name'];
 
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
@@ -55,33 +54,33 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     : `${Date.now()}`;
 
   // 1. Validation
-  if (!companyId) {
-    return res.status(400).json({ error: "Missing X-Company-Id header." });
-  }
-
-  if (!token || !(await validateDeployToken(companyId, token))) {
-    return res.status(401).json({ error: "Unauthorized" });
+  // NEW: no X-Company-Id header — the deploy token is already company-
+  // scoped at creation (hostnsoft-api mints one per company), so which
+  // company this deploy belongs to is read off the token itself. One
+  // fewer thing for a caller to get right or send inconsistently.
+  if (!token || !(await validateDeployToken(token))) {
+    return res.status(401).json({ error: "Unauthorized", code: "unauthorized" });
   }
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
-    return res.status(400).json({ error: "Invalid or missing X-App-Name header. Use lowercase letters and dashes." });
+    return res.status(400).json({ error: "Invalid or missing X-App-Name header. Use lowercase letters and dashes.", code: "invalid_app_name" });
   }
 
   // NEW: the app name is also the live subdomain and the Nomad job name —
-  // confirm it's either already this company's or free to claim BEFORE
-  // spending any build time on it. No project needs to exist via the
-  // dashboard first; this auto-creates one on first sight.
-  const claim = await claimProject(companyId, token, appName);
+  // confirm it's either already this token's company's or free to claim
+  // BEFORE spending any build time on it. No project needs to exist via
+  // the dashboard first; this auto-creates one on first sight.
+  const claim = await claimProject(token, appName);
   if (!claim.ok) {
-    return res.status(claim.status).json({ error: claim.error });
+    return res.status(claim.status).json({ error: claim.error, code: claim.code });
   }
 
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
-    return res.status(400).json({ error: "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only." });
+    return res.status(400).json({ error: "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", code: "invalid_app_version" });
   }
 
   if (!req.file) {
-    return res.status(400).json({ error: "No source code uploaded" });
+    return res.status(400).json({ error: "No source code uploaded", code: "missing_source_file" });
   }
 
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
@@ -136,6 +135,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
         await fs.remove(req.file.path);
         return res.status(422).json({
           error: "Unsupported storage pattern detected",
+          code: "unsupported_storage_pattern",
           detail:
             "This app calls window.storage, an API specific to Claude Artifacts' sandbox. " +
             "It does not exist outside that environment and will fail at runtime if deployed " +
@@ -231,7 +231,6 @@ job "${appName}" {
     // NEW: report this deploy's outcome to hostnsoft-api so its dashboard
     // deployment history is actually populated.
     await recordDeployment({
-      companyId,
       token,
       projectSlug: appName,
       appVersion,
@@ -253,12 +252,11 @@ job "${appName}" {
   } catch (error) {
     console.error(`[${appName}] Deployment failed:`, error);
 
-    // NEW: report the failure too — companyId/token/appName/appVersion are
-    // all validated before this try block starts, so they're safe here
-    // even if the failure happened early in the pipeline (taskMemory isn't,
+    // NEW: report the failure too — token/appName/appVersion are all
+    // validated before this try block starts, so they're safe here even
+    // if the failure happened early in the pipeline (taskMemory isn't,
     // hence its absence below).
     await recordDeployment({
-      companyId,
       token,
       projectSlug: appName,
       appVersion,
@@ -266,7 +264,7 @@ job "${appName}" {
       errorDetail: error.message,
     });
 
-    res.status(500).json({ error: "Deployment failed", details: error.message });
+    res.status(500).json({ error: "Deployment failed", code: "deploy_failed", details: error.message });
   }
 });
 

@@ -1,11 +1,12 @@
 /**
  * validate-deploy-token.js
  *
- * Confirms a deploy request's (companyId, token) pair against
+ * Confirms a deploy request's token is real and live against
  * hostnsoft-api before this service spends any build/deploy resources on
- * it. Replaces the old single shared PLATFORM_TOKEN model — every deploy
- * now authenticates as a specific company via a token hostnsoft-api
- * issued (and can revoke/rotate), not one secret shared by everyone.
+ * it. The token itself is company-scoped (issued per-company by
+ * hostnsoft-api) — there's no separate X-Company-Id for the caller to
+ * send or get wrong; hostnsoft-api reads the owning company directly off
+ * the token.
  */
 
 if (!process.env.HOSTNSOFT_API_URL) {
@@ -15,13 +16,13 @@ if (!process.env.HOSTNSOFT_API_URL) {
 }
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL;
 
-async function validateDeployToken(companyId, token) {
+async function validateDeployToken(token) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/deploy-tokens/validate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ companyId, token }),
+      body: JSON.stringify({ token }),
     });
   } catch (e) {
     // Fail closed — an unreachable hostnsoft-api must never be treated as
