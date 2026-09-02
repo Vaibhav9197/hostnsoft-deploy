@@ -14,7 +14,9 @@ const fs = require('fs-extra');
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const { randomUUID } = require('crypto');
 const logger = require('./logger');
+const { runWithRequestId } = require('./request-context');
 
 // NEW: detects apps built assuming Claude Artifacts' window.storage API,
 // which does not exist outside that sandbox and will fail if deployed
@@ -38,6 +40,23 @@ const { recordDeployment } = require('./record-deployment');
 const { claimProject } = require('./claim-project');
 
 const app = express();
+
+// First, ahead of every route — assigns a unique id to each request so
+// every log line made while handling it (anywhere, including inside
+// claim-project.js/record-deployment.js) can be correlated back to this
+// one invocation, plus logs the request's start and its final status.
+app.use((req, res, next) => {
+  const requestId = randomUUID();
+  res.setHeader('X-Request-Id', requestId);
+
+  runWithRequestId(requestId, () => {
+    logger.info(`--> ${req.method} ${req.originalUrl}`);
+    res.on('finish', () => {
+      logger.info(`<-- ${req.method} ${req.originalUrl} ${res.statusCode}`);
+    });
+    next();
+  });
+});
 
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
