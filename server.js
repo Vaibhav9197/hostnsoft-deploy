@@ -87,6 +87,11 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
   const imageName = `${appName}:${appVersion}`; // CHANGED: versioned tag instead of :latest
   // Real domain via Cloudflare DNS, routed through Traefik with Let's Encrypt TLS.
+  // TODO(embarko rebrand, 2026-09-02): switch to embarko.ai once its DNS,
+  // Cloudflare zone, and wildcard cert resolver are confirmed live — not
+  // yet ready, so this intentionally still points at hostnsoft.com. Do
+  // not change this without confirming the new domain actually resolves
+  // and can issue certs first, or every deploy after the switch breaks.
   const domain = `${appName}.app.hostnsoft.com`;
 
   try {
@@ -119,7 +124,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // build time/resources on them — but only bother checking if the app
     // doesn't already have real persistence, since that's the one case
     // this check exists for. This is a hard stop, not a warning — the app
-    // would break at runtime on hostnsoft otherwise, and a compatibility
+    // would break at runtime on Embarko otherwise, and a compatibility
     // shim was considered and rejected (it would require exposing an
     // unauthenticated public endpoint to every app's visitor traffic —
     // see project notes for that discussion).

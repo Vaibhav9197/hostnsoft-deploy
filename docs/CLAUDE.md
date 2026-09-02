@@ -109,12 +109,14 @@ stay consistent with `detect-storage-usage.js`'s server-side logic. If
 that skill package lives somewhere else instead, note the actual location
 here so this doc stays accurate.
 
-**Not yet done, needed following the 2026-08-26 auth change above**: the
-skill's `deploy.sh` and its docs still document a single `HOSTNSOFT_TOKEN`
-env var and no company id at all (per `docs/hostnsoft-context-gist.md`,
-written before this change). It needs to start sending `X-Company-Id`
-alongside the token — as its own env var (e.g. `HOSTNSOFT_COMPANY_ID`) —
-or every existing deploy using that skill will now get a 400. The actual
-skill source wasn't available to edit from this session (see the gist's
-note on where it lives); flagging this explicitly rather than leaving it
-silently stale.
+**Still not done, needed following the 2026-08-26 auth change above**:
+the skill now lives at `../hostnsoft-skill/` (its own repo, checked out
+locally as of 2026-09-02 — the `HOSTNSOFT_TOKEN` → `DEPLOY_TOKEN` rename
+from the Embarko rebrand has been applied there, see that repo's own
+notes) but its `deploy.sh` and `SKILL.md` still only send the token —
+**no `X-Company-Id` header at all**. Every deploy through that skill
+still gets a 400 until it's updated to send one (as a new required env
+var, e.g. `COMPANY_ID`, alongside `DEPLOY_TOKEN`). This is a separate,
+still-open gap from the rename — flagging it again explicitly rather
+than letting it look resolved just because the skill source is no longer
+missing.
