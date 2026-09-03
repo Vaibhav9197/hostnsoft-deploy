@@ -111,12 +111,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
   const imageName = `${appName}:${appVersion}`; // CHANGED: versioned tag instead of :latest
-  // Real domain via Cloudflare DNS, routed through Traefik with Let's Encrypt TLS.
-  // TODO(embarko rebrand, 2026-09-02): switch to embarko.ai once its DNS,
-  // Cloudflare zone, and wildcard cert resolver are confirmed live — not
-  // yet ready, so this intentionally still points at hostnsoft.com. Do
-  // not change this without confirming the new domain actually resolves
-  // and can issue certs first, or every deploy after the switch breaks.
+  
   const domain = defaultDomainFor(appName);
 
   try {
@@ -308,7 +303,10 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   }
 });
 
-// Start the API Server on port 4000
-app.listen(4000, '0.0.0.0', () => {
-  logger.info("🚀 Platform Deployment API running on port 4000");
+// Start the API Server — PORT is env-driven so multiple environments
+// (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
+// without colliding; defaults to 4000 to match prior fixed behavior.
+const PORT = Number(process.env.PORT) || 4000;
+app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
 });

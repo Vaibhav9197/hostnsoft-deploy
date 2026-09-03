@@ -114,10 +114,22 @@ ${tagLines}
 
 module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER };
 
-// Not defined by application code at all — declared here for reference
-// only, exported so any part of this codebase that needs the app's own
-// default domain shape has one place to derive it from.
+// Fail-fast at require-time, same convention as internal-auth.js and
+// validate-deploy-token.js — server-setup.sh computes and exports this
+// per environment (APPS_SUBDOMAIN_BASE + DOMAIN, offset by APP_ENV) before
+// starting this service; see its APPS_DOMAIN_SUFFIX.
+if (!process.env.APPS_DOMAIN_SUFFIX) {
+  throw new Error(
+    'APPS_DOMAIN_SUFFIX environment variable is not set. This is the ' +
+      'domain suffix deployed apps live under (e.g. "app.embarko.ai") — ' +
+      'see server-setup.sh, which computes and exports it per environment.'
+  );
+}
+const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
+
+// Exported so any part of this codebase that needs the app's own default
+// domain shape has one place to derive it from.
 function defaultDomainFor(appName) {
-  return `${appName}.app.hostnsoft.com`;
+  return `${appName}.${APPS_DOMAIN_SUFFIX}`;
 }
 module.exports.defaultDomainFor = defaultDomainFor;
