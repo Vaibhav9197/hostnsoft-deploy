@@ -39,6 +39,18 @@ const { recordDeployment } = require('./record-deployment');
 // subdomain, so it must be unique platform-wide.
 const { claimProject } = require('./claim-project');
 
+// Fail-fast at startup, same convention as validate-deploy-token.js —
+// the domain suffix deployed apps live under (e.g. "app.embarko.ai").
+// server-setup.sh computes and exports this per environment.
+if (!process.env.APPS_DOMAIN_SUFFIX) {
+  throw new Error(
+    'APPS_DOMAIN_SUFFIX environment variable is not set. This is the ' +
+      'domain suffix deployed apps live under (e.g. "app.embarko.ai") — ' +
+      'see server-setup.sh, which computes and exports it per environment.'
+  );
+}
+const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -106,12 +118,9 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
   const imageName = `${appName}:${appVersion}`; // CHANGED: versioned tag instead of :latest
   // Real domain via Cloudflare DNS, routed through Traefik with Let's Encrypt TLS.
-  // TODO(embarko rebrand, 2026-09-02): switch to embarko.ai once its DNS,
-  // Cloudflare zone, and wildcard cert resolver are confirmed live — not
-  // yet ready, so this intentionally still points at hostnsoft.com. Do
-  // not change this without confirming the new domain actually resolves
-  // and can issue certs first, or every deploy after the switch breaks.
-  const domain = `${appName}.app.hostnsoft.com`;
+  // Domain suffix comes from APPS_DOMAIN_SUFFIX (see top of file) — not
+  // hardcoded, so it tracks whatever server-setup.sh configured.
+  const domain = `${appName}.${APPS_DOMAIN_SUFFIX}`;
 
   try {
     // 2. Extract the uploaded tar.gz file
@@ -288,7 +297,10 @@ job "${appName}" {
   }
 });
 
-// Start the API Server on port 4000
-app.listen(4000, '0.0.0.0', () => {
-  logger.info("🚀 Platform Deployment API running on port 4000");
+// Start the API Server — PORT is env-driven so multiple environments
+// (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
+// without colliding; defaults to 4000 to match prior fixed behavior.
+const PORT = Number(process.env.PORT) || 4000;
+app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
 });
