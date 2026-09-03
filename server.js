@@ -39,6 +39,12 @@ const { recordDeployment } = require('./record-deployment');
 // subdomain, so it must be unique platform-wide.
 const { claimProject } = require('./claim-project');
 
+// NEW: shared Nomad job spec builder — see docs/Customdomain-req.md. Used
+// here after a fresh build, and by the /internal/apps/:appName/config
+// endpoint below when only custom-domain routing changed (no rebuild).
+const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
+const { requireInternalSecret } = require('./internal-auth');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -111,7 +117,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // yet ready, so this intentionally still points at hostnsoft.com. Do
   // not change this without confirming the new domain actually resolves
   // and can issue certs first, or every deploy after the switch breaks.
-  const domain = `${appName}.app.hostnsoft.com`;
+  const domain = defaultDomainFor(appName);
 
   try {
     // 2. Extract the uploaded tar.gz file
@@ -184,58 +190,19 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
     // 4. Generate the Nomad Job Specification
     logger.info(`[${appName}] Generating Nomad file...`);
-    const nomadJobSpec = `
-job "${appName}" {
-  datacenters = ["dc1"]
-  type        = "service"
-
-  group "web" {
-    network {
-      port "http" {}
-    }
-
-    # Persists /alloc/data across redeploys by biasing the scheduler to reuse
-    # the same client node, and migrating the data if it ever can't.
-    # Apps that don't use DATA_DIR simply ignore this — it's opt-in.
-    ephemeral_disk {
-      size    = 500
-      sticky  = true
-      migrate = true
-    }
-
-    service {
-      name     = "${appName}"
-      provider = "nomad"
-      port     = "http"
-
-      tags = [
-        "traefik.enable=true",
-        "traefik.http.routers.${appName}.rule=Host(\`${domain}\`)",
-        "traefik.http.routers.${appName}.entrypoints=websecure",
-        "traefik.http.routers.${appName}.tls.certresolver=cloudflare"
-      ]
-    }
-    task "server" {
-      driver = "docker"
-      config {
-        image      = "${imageName}"
-        ports      = ["http"]
-        force_pull = false # Use the local image we just built
-      }
-      env {
-        PORT        = "\${NOMAD_PORT_http}"
-        APP_NAME    = "${appName}"
-        APP_VERSION = "${appVersion}"
-        DATA_DIR    = "/alloc/data"
-      }
-      resources {
-        cpu    = 100
-        memory = ${taskMemory}
-      }
-    }
-  }
-}
-    `;
+    // NEW: includes one HTTP-01 router per already-active custom domain
+    // for this project (claim.customDomains, from
+    // /internal/projects/claim) — without this, redeploying an app that
+    // already has a custom domain attached would silently drop its
+    // router. See docs/Customdomain-req.md.
+    const nomadJobSpec = buildNomadJobSpec({
+      appName,
+      domain,
+      imageName,
+      appVersion,
+      taskMemory,
+      customDomains: claim.customDomains || [],
+    });
 
     const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
     await fs.writeFile(nomadFilePath, nomadJobSpec);
@@ -285,6 +252,59 @@ job "${appName}" {
     });
 
     res.status(500).json({ error: "Deployment failed", code: "deploy_failed", details: error.message });
+  }
+});
+
+// NEW: pushes updated custom-domain routing to a project's already-
+// running app WITHOUT a rebuild — see docs/Customdomain-req.md
+// "Activating the router". Called by hostnsoft-api once a custom
+// domain's DNS is verified (or once one is removed/deactivated), with
+// its full current list of active domains for the project each time
+// (a resync, not a diff). Reuses the exact same buildNomadJobSpec +
+// `nomad job run` as a fresh deploy — Nomad applies job spec changes
+// in-place when the job name already exists, so the running container
+// image is never touched.
+app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  const { imageTag, memoryMb, customDomains } = req.body || {};
+
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+  if (typeof imageTag !== 'string' || !imageTag.includes(':')) {
+    return res.status(400).json({ error: 'imageTag is required and must be a full "name:version" image reference' });
+  }
+  if (!Array.isArray(customDomains) || !customDomains.every((d) => typeof d === 'string')) {
+    return res.status(400).json({ error: "customDomains must be an array of strings" });
+  }
+
+  // imageTag is always "<appName>:<appVersion>" (see how it's built in
+  // POST /apps above and stored as Deployment.imageTag in hostnsoft-api)
+  // — the version is whatever follows the first colon.
+  const appVersion = imageTag.slice(imageTag.indexOf(':') + 1);
+  const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : 256;
+  const domain = defaultDomainFor(appName);
+
+  const nomadJobSpec = buildNomadJobSpec({
+    appName,
+    domain,
+    imageName: imageTag,
+    appVersion,
+    taskMemory,
+    customDomains,
+  });
+
+  const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
+  try {
+    await fs.ensureDir(path.dirname(nomadFilePath));
+    await fs.writeFile(nomadFilePath, nomadJobSpec);
+    logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
+    await execPromise(`nomad job run ${nomadFilePath}`);
+    await fs.remove(nomadFilePath);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error(`[${appName}] Applying config update failed:`, error);
+    res.status(500).json({ error: "Applying config update failed", details: error.message });
   }
 });
 
