@@ -48,6 +48,9 @@ const { claimProject } = require('./claim-project');
 const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
+// NEW: anonymous ("orphan") deploys — see docs/Anonymous-deploy-req.md.
+const { injectOrphanBanner } = require('./orphan-banner');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -71,7 +74,8 @@ app.use((req, res, next) => {
 const upload = multer({ dest: '/tmp/platform-uploads/' });
 
 app.post('/apps', upload.single('source'), async (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
   const appName = req.headers['x-app-name'];
 
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
@@ -87,8 +91,18 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // scoped at creation (hostnsoft-api mints one per company), so which
   // company this deploy belongs to is read off the token itself. One
   // fewer thing for a caller to get right or send inconsistently.
-  if (!token || !(await validateDeployToken(token))) {
-    return res.status(401).json({ error: "Unauthorized", code: "unauthorized" });
+  //
+  // NEW: a MISSING Authorization header opts into an anonymous ("orphan")
+  // deploy — see docs/Anonymous-deploy-req.md — but a header that's
+  // present and invalid is still a hard 401, never a silent fallback to
+  // anonymous. Anonymous is opt-in by omission only, so a typo'd/expired
+  // token surfaces as an auth error instead of masquerading as a feature.
+  let hasValidToken = false;
+  if (authHeader) {
+    if (!token || !(await validateDeployToken(token))) {
+      return res.status(401).json({ error: "Unauthorized", code: "unauthorized" });
+    }
+    hasValidToken = true;
   }
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
@@ -98,8 +112,10 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // NEW: the app name is also the live subdomain and the Nomad job name —
   // confirm it's either already this token's company's or free to claim
   // BEFORE spending any build time on it. No project needs to exist via
-  // the dashboard first; this auto-creates one on first sight.
-  const claim = await claimProject(token, appName);
+  // the dashboard first; this auto-creates one on first sight. Passing
+  // `undefined` (not the invalid/absent token itself) when there's no
+  // valid token routes this to hostnsoft-api's anonymous/orphan path.
+  const claim = await claimProject(hasValidToken ? token : undefined, appName);
   if (!claim.ok) {
     return res.status(claim.status).json({ error: claim.error, code: claim.code });
   }
@@ -128,6 +144,13 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       file: req.file.path,
       cwd: buildDir
     });
+
+    // NEW: orphan expiry notice — see docs/Anonymous-deploy-req.md #5.
+    // Only meaningful for anonymous/unclaimed deploys; a no-op (and not
+    // even called) once a project has been claimed with a token.
+    if (claim.isOrphan) {
+      await injectOrphanBanner(buildDir, claim.orphanExpiresAt, claim.orphanLoginUrl);
+    }
 
     // NEW 2a. Read package.json once, up front — shared by the embedded-DB
     // memory check below AND to decide whether the window.storage scan is
@@ -217,25 +240,40 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     await fs.remove(req.file.path);
 
     // NEW: report this deploy's outcome to hostnsoft-api so its dashboard
-    // deployment history is actually populated.
-    await recordDeployment({
-      token,
-      projectSlug: appName,
-      appVersion,
-      status: 'success',
-      imageTag: imageName,
-      memoryMb: taskMemory,
-    });
+    // deployment history is actually populated. Skipped for anonymous
+    // deploys — see docs/Anonymous-deploy-req.md's "out of scope": there's
+    // no company to attribute history to until/unless the project is
+    // claimed, and nothing is retroactively backfilled once it is.
+    if (hasValidToken) {
+      await recordDeployment({
+        token,
+        projectSlug: appName,
+        appVersion,
+        status: 'success',
+        imageTag: imageName,
+        memoryMb: taskMemory,
+      });
+    }
 
     // 7. Send Success Response
-    res.status(200).json({
+    const responseBody = {
       success: true,
       message: "Deployment successful!",
       version: appVersion,
       image: imageName,
       memory: `${taskMemory}MB`,
       url: `https://${domain}`
-    });
+    };
+    // NEW: see docs/Anonymous-deploy-req.md #4 — orphanMessage is a
+    // complete, self-contained instruction sequence, written so an AI
+    // agent relaying this to a human can explain every step unaided.
+    if (claim.isOrphan) {
+      responseBody.orphan = {
+        expiresAt: claim.orphanExpiresAt,
+        message: claim.orphanMessage,
+      };
+    }
+    res.status(200).json(responseBody);
 
   } catch (error) {
     logger.error(`[${appName}] Deployment failed:`, error);
@@ -243,14 +281,17 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // NEW: report the failure too — token/appName/appVersion are all
     // validated before this try block starts, so they're safe here even
     // if the failure happened early in the pipeline (taskMemory isn't,
-    // hence its absence below).
-    await recordDeployment({
-      token,
-      projectSlug: appName,
-      appVersion,
-      status: 'failed',
-      errorDetail: error.message,
-    });
+    // hence its absence below). Skipped for anonymous deploys, same
+    // reasoning as the success path above.
+    if (hasValidToken) {
+      await recordDeployment({
+        token,
+        projectSlug: appName,
+        appVersion,
+        status: 'failed',
+        errorDetail: error.message,
+      });
+    }
 
     res.status(500).json({ error: "Deployment failed", code: "deploy_failed", details: error.message });
   }
@@ -306,6 +347,39 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   } catch (error) {
     logger.error(`[${appName}] Applying config update failed:`, error);
     res.status(500).json({ error: "Applying config update failed", details: error.message });
+  }
+});
+
+// NEW: fully tears down an app — see docs/Anonymous-deploy-req.md #7.
+// Called by hostnsoft-api's hourly orphan-cleanup job. `nomad job stop
+// -purge` removes both the Nomad job AND its Traefik routing (Traefik's
+// Nomad provider derives config from the running job, so purging it is
+// sufficient — no separate Traefik cleanup step exists or is needed).
+// Uploaded tarballs/build directories are already removed immediately
+// after every deploy attempt (success or failure) today, so there's
+// nothing left over for this endpoint to clean up there.
+app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  try {
+    await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+      // A job that was never successfully deployed (e.g. an orphan whose
+      // build/deploy failed) has no Nomad job at all — treat "not found"
+      // as already-torn-down rather than an error.
+      const output = `${e.stdout || ''}${e.stderr || ''}`;
+      if (!/not found/i.test(output)) throw e;
+    });
+    await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
+      logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);
+    });
+    logger.info(`[${appName}] Orphan teardown complete`);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error(`[${appName}] Orphan teardown failed:`, error);
+    res.status(500).json({ error: "Teardown failed", details: error.message });
   }
 });
 
