@@ -104,11 +104,16 @@ function buildNomadJobSpec({
       driver = "docker"
       config {
         image        = "${ORPHAN_PROXY_IMAGE}"
-        network_mode = "host" # reaches the app task via 127.0.0.1:$\{NOMAD_PORT_app}, same technique Traefik itself uses to reach every app container
+        network_mode = "host" # shares the host's network stack, needed to reach the app task's published port at all
         force_pull   = false  # built once by server-setup.sh, not per-deploy
       }
       env {
         LISTEN_PORT       = "\${NOMAD_PORT_http}"
+        # NOT 127.0.0.1 — confirmed in practice that Docker publishes
+        # this platform's app ports bound to the box's own advertised/
+        # public IP specifically, not to loopback or 0.0.0.0. ORIGIN_IP
+        # is that same address (see this module's fail-fast check below).
+        TARGET_HOST       = "${ORIGIN_IP}"
         TARGET_PORT       = "\${NOMAD_PORT_app}"
         BANNER_EXPIRES_AT = "${orphanExpiresAt}"
         BANNER_LOGIN_URL  = "${orphanLoginUrl}"
@@ -185,6 +190,25 @@ if (!process.env.APPS_DOMAIN_SUFFIX) {
   );
 }
 const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
+
+// Same convention — the address Docker actually publishes app container
+// ports to on this box (confirmed in practice: NOT 0.0.0.0/127.0.0.1,
+// specifically the box's own advertised/public IP — see nomad.hcl's
+// `advertise` block in server-setup.sh). Only used for the orphan-proxy
+// sidecar (see buildNomadJobSpec's TARGET_HOST above) to reach the app
+// task it fronts, but required unconditionally at require-time same as
+// every other fail-fast config in this codebase, rather than only when
+// an orphan deploy actually happens.
+if (!process.env.ORIGIN_IP) {
+  throw new Error(
+    'ORIGIN_IP environment variable is not set. This must be the same address ' +
+      "Docker actually publishes app container ports to on this box (this platform's " +
+      "Nomad setup binds published ports to the box's own advertised/public IP, not " +
+      '0.0.0.0 or 127.0.0.1 — confirmed in practice, not an assumption) — ' +
+      'see server-setup.sh, which computes and exports it per environment.'
+  );
+}
+const ORIGIN_IP = process.env.ORIGIN_IP;
 
 // Exported so any part of this codebase that needs the app's own default
 // domain shape has one place to derive it from.

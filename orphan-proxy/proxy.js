@@ -14,10 +14,14 @@
  * index.html, or scanning a Node entry file for an inline HTML template
  * literal), which only ever covered a handful of specific cases.
  *
- * Reaches the real app via 127.0.0.1 using Nomad's own dynamically
- * allocated host port for it (TARGET_PORT) — the exact same mechanism
- * Traefik itself already uses to reach every app container, see this
- * task's `network_mode = "host"` in nomad-job-spec.js.
+ * Reaches the real app via TARGET_HOST:TARGET_PORT — Nomad's own
+ * dynamically allocated host port for it, at whatever host address
+ * Docker actually published it to. Confirmed in practice: that is NOT
+ * necessarily 127.0.0.1 — on this platform's Nomad setup, published
+ * ports are bound to the box's advertised/public IP specifically (the
+ * same address Traefik itself uses to reach every app container), not
+ * to 0.0.0.0 or loopback. TARGET_HOST must be set to that same address
+ * (see nomad-job-spec.js / ORIGIN_IP) — don't assume 127.0.0.1 works.
  */
 'use strict';
 
@@ -25,11 +29,12 @@ const http = require('http');
 const net = require('net');
 
 const LISTEN_PORT = process.env.LISTEN_PORT;
+const TARGET_HOST = process.env.TARGET_HOST;
 const TARGET_PORT = process.env.TARGET_PORT;
 const BANNER_EXPIRES_AT = process.env.BANNER_EXPIRES_AT;
 const BANNER_LOGIN_URL = process.env.BANNER_LOGIN_URL;
 
-for (const [name, value] of Object.entries({ LISTEN_PORT, TARGET_PORT, BANNER_EXPIRES_AT, BANNER_LOGIN_URL })) {
+for (const [name, value] of Object.entries({ LISTEN_PORT, TARGET_HOST, TARGET_PORT, BANNER_EXPIRES_AT, BANNER_LOGIN_URL })) {
   if (!value) {
     console.error(`[orphan-proxy] FATAL: ${name} environment variable is not set.`);
     process.exit(1);
@@ -80,7 +85,7 @@ const server = http.createServer((clientReq, clientRes) => {
   delete headers['accept-encoding'];
 
   const proxyReq = http.request(
-    { host: '127.0.0.1', port: TARGET_PORT, method: clientReq.method, path: clientReq.url, headers },
+    { host: TARGET_HOST, port: TARGET_PORT, method: clientReq.method, path: clientReq.url, headers },
     (proxyRes) => {
       const contentType = proxyRes.headers['content-type'] || '';
       if (!contentType.startsWith('text/html')) {
@@ -117,7 +122,7 @@ const server = http.createServer((clientReq, clientRes) => {
 // WebSocket / other Upgrade requests — raw byte pipe straight through,
 // no HTML inspection (never applies to an upgraded connection anyway).
 server.on('upgrade', (req, clientSocket, head) => {
-  const backendSocket = net.connect(TARGET_PORT, '127.0.0.1', () => {
+  const backendSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
     const headerLines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       headerLines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
@@ -132,5 +137,5 @@ server.on('upgrade', (req, clientSocket, head) => {
 });
 
 server.listen(Number(LISTEN_PORT), '0.0.0.0', () => {
-  console.log(`[orphan-proxy] listening on :${LISTEN_PORT}, proxying to 127.0.0.1:${TARGET_PORT}`);
+  console.log(`[orphan-proxy] listening on :${LISTEN_PORT}, proxying to ${TARGET_HOST}:${TARGET_PORT}`);
 });
