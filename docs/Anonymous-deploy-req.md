@@ -83,22 +83,35 @@ plainly enough that an agent won't need to guess at any step.
 
 ### 5. On-page notice for the deployed app itself
 
-Inject a script into the build output before it's built, so anyone who
-visits the live URL directly (not just whoever ran the deploy) sees the
-same warning. Concretely: if the build output contains an `index.html`
-at its root, inject a small inline `<script>` right before `</body>`
-that renders a fixed, dismissible-or-not banner: *"This app will be
-deleted at **HH:MM** — [log in to keep it](<login URL>)"*, computed from
-the same `orphanExpiresAt` stored on the project.
+So anyone who visits the live URL directly (not just whoever ran the
+deploy) sees the same warning: a fixed, dismissible-or-not banner reading
+*"This app will be deleted at **HH:MM** — [log in to keep it](<login
+URL>)"*, computed from the same `orphanExpiresAt` stored on the project.
 
-**Known limitation, accepted rather than solved here**: this only works
-for apps that produce a static `index.html` the platform can modify
-post-build (most frontend frameworks). A pure backend/API-only app (no
-HTML being served) has no generic injection point — such an app is still
-tracked and deleted identically, it just won't display an in-app notice.
-The deploy response's `orphan.message` (#4) is the notice of record
-regardless; the injected banner is a bonus for browser-visited apps, not
-the only channel.
+**Runtime, language/framework-agnostic, not a build-time step**: while a
+project is orphaned, Traefik routes its traffic through a small sidecar
+(`orphan-proxy/`, added to the app's Nomad job only when `isOrphan` is
+true — see `nomad-job-spec.js`) that sits in front of the real app
+container and rewrites any `text/html` response to inject the banner
+before `</body>` (or appends it, if none is found). Everything else —
+JSON, assets, streaming responses, WebSocket upgrades — passes through
+byte-for-byte untouched. Because this operates on raw HTTP bytes rather
+than the app's source, it works identically no matter what language or
+framework the app is written in, including apps with no static
+`index.html` at all (e.g. a raw `http.createServer` app rendering HTML
+from a JS template string).
+
+An earlier version of this (`orphan-banner.js`, removed) worked at build
+time instead — string-replacing a static `index.html`, with a narrow
+Node-specific fallback for inline HTML. It only ever covered a handful of
+specific cases; the sidecar replaces it entirely.
+
+**Known limitation, accepted rather than solved here**: an app with no
+HTML output at all (a pure backend/API-only app) has no in-app notice
+either way — the sidecar only rewrites `text/html` responses, so a JSON-
+only API is proxied through unchanged. Such an app is still tracked and
+deleted identically, it just won't display a banner. The deploy
+response's `orphan.message` (#4) is the notice of record regardless.
 
 ### 6. Claiming an orphan project with a token
 
@@ -106,11 +119,13 @@ When a token **is** present and `X-App-Name` matches an existing orphan
 project:
 - Set `companyId` to the token's company.
 - Clear `isOrphan` and `orphanExpiresAt`.
-- Remove the injected banner script from the build **on this deploy** —
-  since deploys always rebuild from the freshly uploaded source, this is
-  automatic as long as the injection step (#5) is skipped whenever the
-  request carries a valid token, not a separate removal step against
-  already-running code.
+- Remove the orphan-proxy sidecar (#5) **on this deploy** — since
+  `buildNomadJobSpec` builds the entire job spec fresh from `isOrphan`
+  every time and deploys always rebuild it, omitting the sidecar task and
+  its extra port is automatic the moment a deploy carries a valid token,
+  not a separate removal step against the already-running job. Traefik's
+  service goes back to pointing directly at the app container the moment
+  this new job spec is applied.
 - From this point on the project behaves exactly like any other
   token-created project — no trace of having been orphaned.
 

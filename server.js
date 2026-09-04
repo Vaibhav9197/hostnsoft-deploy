@@ -48,9 +48,6 @@ const { claimProject } = require('./claim-project');
 const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
-// NEW: anonymous ("orphan") deploys — see docs/Anonymous-deploy-req.md.
-const { injectOrphanBanner } = require('./orphan-banner');
-
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -145,13 +142,6 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       cwd: buildDir
     });
 
-    // NEW: orphan expiry notice — see docs/Anonymous-deploy-req.md #5.
-    // Only meaningful for anonymous/unclaimed deploys; a no-op (and not
-    // even called) once a project has been claimed with a token.
-    if (claim.isOrphan) {
-      await injectOrphanBanner(buildDir, claim.orphanExpiresAt, claim.orphanLoginUrl);
-    }
-
     // NEW 2a. Read package.json once, up front — shared by the embedded-DB
     // memory check below AND to decide whether the window.storage scan is
     // even worth running (skipped entirely if a real DB dependency already
@@ -219,6 +209,13 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // /internal/projects/claim) — without this, redeploying an app that
     // already has a custom domain attached would silently drop its
     // router. See docs/Customdomain-req.md.
+    //
+    // NEW: isOrphan/orphanExpiresAt/orphanLoginUrl route traffic through
+    // the language-agnostic orphan-proxy sidecar instead of the app
+    // directly — see docs/Anonymous-deploy-req.md #5 and
+    // nomad-job-spec.js. Replaces the old build-time source-injection
+    // approach (orphan-banner.js, removed), which only ever covered a
+    // static index.html or a narrow Node-specific case.
     const nomadJobSpec = buildNomadJobSpec({
       appName,
       domain,
@@ -226,6 +223,9 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       appVersion,
       taskMemory,
       customDomains: claim.customDomains || [],
+      isOrphan: claim.isOrphan,
+      orphanExpiresAt: claim.orphanExpiresAt,
+      orphanLoginUrl: claim.orphanLoginUrl,
     });
 
     const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
