@@ -58,10 +58,16 @@ async function claimProject(token, slug) {
   // docs/Anonymous-deploy-req.md — present when this deploy has no (or
   // an as-yet-unclaimed) token, so server.js knows to inject the expiry
   // banner and include the orphan notice in its own response.
+  // envVars: this project's configured env vars (set via hostnsoft-api's
+  // /companies/:companyId/projects/:projectId/env-vars) — passed through
+  // so server.js can bake them into the container's env block. Previously
+  // these were persisted in hostnsoft-api's DB but never actually reached
+  // a running app; this is that missing integration point.
   return {
     ok: true,
     projectId: body.projectId,
     customDomains: body.customDomains || [],
+    envVars: body.envVars || [],
     isOrphan: !!body.isOrphan,
     orphanExpiresAt: body.orphanExpiresAt || null,
     orphanMessage: body.orphanMessage || null,
