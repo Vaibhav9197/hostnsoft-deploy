@@ -24,6 +24,17 @@
 const DNS01_CERT_RESOLVER = 'cloudflare';
 const HTTP01_CERT_RESOLVER = 'letsencrypt-http';
 
+// Deliberately NOT ":latest" — confirmed in practice (and documented:
+// https://github.com/hashicorp/nomad/issues/20548) that Nomad's docker
+// driver always attempts a real registry pull when an image reference's
+// tag is "latest" or omitted, REGARDLESS of force_pull, and treats that
+// pull's failure as fatal rather than falling back to an already-present
+// local image. This image is only ever built locally (server-setup.sh /
+// redeploy.sh), never pushed anywhere — any other fixed tag makes
+// force_pull=false actually work as intended. Must match exactly what
+// those scripts pass to `docker build -t`.
+const ORPHAN_PROXY_IMAGE = 'orphan-banner-proxy:local';
+
 function defaultRouterTags(appName, domain) {
   return [
     `traefik.http.routers.${appName}.rule=Host(\`${domain}\`)`,
@@ -63,10 +74,6 @@ function buildNomadJobSpec({
   isOrphan = false,
   orphanExpiresAt,
   orphanLoginUrl,
-  // Resolved local image ID for orphan-banner-proxy, NOT the `:latest`
-  // tag — see server.js's caller for why. Required whenever isOrphan is
-  // true; callers must resolve it before calling this.
-  orphanProxyImageRef,
 }) {
   const tags = [
     'traefik.enable=true',
@@ -96,7 +103,7 @@ function buildNomadJobSpec({
     task "orphan-proxy" {
       driver = "docker"
       config {
-        image        = "${orphanProxyImageRef}" # local image ID, not the ":latest" tag — see server.js
+        image        = "${ORPHAN_PROXY_IMAGE}"
         network_mode = "host" # reaches the app task via 127.0.0.1:$\{NOMAD_PORT_app}, same technique Traefik itself uses to reach every app container
         force_pull   = false  # built once by server-setup.sh, not per-deploy
       }

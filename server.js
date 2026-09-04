@@ -217,28 +217,6 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // approach (orphan-banner.js, removed), which only ever covered a
     // static index.html or a narrow Node-specific case.
     //
-    // NEW: resolve orphan-banner-proxy to its local image ID rather than
-    // referencing it by the mutable `:latest` tag. Confirmed in
-    // practice — Nomad's docker driver attempts a real registry pull for
-    // a tag-referenced image regardless of force_pull=false, and treats
-    // that pull's failure as fatal instead of falling back to the local
-    // copy, even when the image demonstrably exists locally. A raw image
-    // ID has no registry/tag semantics at all, so there's nothing for
-    // the driver to "pull" or check freshness on — it's used as-is, or
-    // container creation fails immediately and clearly.
-    let orphanProxyImageRef;
-    if (claim.isOrphan) {
-      const { stdout } = await execPromise('docker images -q orphan-banner-proxy:latest');
-      orphanProxyImageRef = stdout.trim().split('\n')[0];
-      if (!orphanProxyImageRef) {
-        throw new Error(
-          'orphan-banner-proxy:latest image not found locally. Build it first: ' +
-          'docker build -t orphan-banner-proxy:latest orphan-proxy/ ' +
-          '(see docs/Anonymous-deploy-req.md #5 and Server-setup/README.md).'
-        );
-      }
-    }
-
     const nomadJobSpec = buildNomadJobSpec({
       appName,
       domain,
@@ -249,7 +227,6 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       isOrphan: claim.isOrphan,
       orphanExpiresAt: claim.orphanExpiresAt,
       orphanLoginUrl: claim.orphanLoginUrl,
-      orphanProxyImageRef,
     });
 
     const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
