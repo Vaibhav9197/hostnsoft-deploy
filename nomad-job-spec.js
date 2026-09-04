@@ -21,8 +21,67 @@
  *   code) create the resolver itself. See the custom-domains rollout
  *   notes for that manual infra step.
  */
+const logger = require('./logger');
+
 const DNS01_CERT_RESOLVER = 'cloudflare';
 const HTTP01_CERT_RESOLVER = 'letsencrypt-http';
+
+// PORT/APP_NAME/APP_VERSION/DATA_DIR are set by this platform itself and
+// must never be overridable by a project's own configured env vars — an
+// override could break how the app is actually reached (wrong port) or
+// how its data persists (wrong directory). Silently dropped (with a
+// warning) rather than erroring, so one stray reserved-name env var
+// doesn't block every future deploy of that project.
+const RESERVED_ENV_KEYS = new Set(['PORT', 'APP_NAME', 'APP_VERSION', 'DATA_DIR']);
+
+// Nomad job specs interpolate ${...} sequences at parse/apply time (see
+// e.g. ${NOMAD_PORT_http} below) — a user-supplied env var value that
+// happens to literally contain "${" would otherwise either break job
+// submission (unknown interpolation variable) or resolve to something
+// never intended. "$${" is Nomad's own escape for a literal "${" in the
+// output, so this neutralizes it rather than passing it through raw.
+// hostnsoft-api's envVars.routes.ts is the actual enforcement point for
+// `key` (restricted to safe identifier syntax there, since it's embedded
+// as a bare unquoted attribute name here, not a quoted string) — this
+// only needs to handle `value`.
+function escapeHclStringValue(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    // A function replacer, not a '$${' string replacer — String.replace
+    // treats "$$" in a replacement STRING as its own escape for a single
+    // literal "$", which would silently collapse '$${' back down to a
+    // single "$" and defeat this entirely. A function's return value has
+    // no such special-casing.
+    .replace(/\$\{/g, () => '$${');
+}
+
+// `key` is embedded below as a bare, unquoted HCL attribute name — an
+// unrestricted key could break out of the env block and inject arbitrary
+// job-spec content. hostnsoft-api's envVars.routes.ts already restricts
+// this at set-time, but this is the actual template-injection boundary,
+// so it's enforced again here rather than trusting the caller.
+const ENV_VAR_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// One line per project-configured env var (see docs/CLAUDE.md's env-vars
+// feature) — appended into the "server" task's env block below so they
+// actually reach the running container, not just hostnsoft-api's DB.
+function projectEnvVarLines(envVars) {
+  return envVars
+    .filter(({ key }) => {
+      if (RESERVED_ENV_KEYS.has(key)) {
+        logger.warn(`[nomad-job-spec] skipping project env var "${key}" — reserved, set by the platform itself`);
+        return false;
+      }
+      if (!ENV_VAR_KEY_PATTERN.test(key)) {
+        logger.warn(`[nomad-job-spec] skipping project env var with invalid key "${key}"`);
+        return false;
+      }
+      return true;
+    })
+    .map(({ key, value }) => `        ${key} = "${escapeHclStringValue(value)}"`)
+    .join('\n');
+}
 
 // Deliberately NOT ":latest" — confirmed in practice (and documented:
 // https://github.com/hashicorp/nomad/issues/20548) that Nomad's docker
@@ -71,10 +130,12 @@ function buildNomadJobSpec({
   appVersion,
   taskMemory,
   customDomains = [],
+  envVars = [],
   isOrphan = false,
   orphanExpiresAt,
   orphanLoginUrl,
 }) {
+  const projectEnvLines = projectEnvVarLines(envVars);
   const tags = [
     'traefik.enable=true',
     ...defaultRouterTags(appName, domain),
@@ -164,6 +225,7 @@ ${tagLines}
         APP_NAME    = "${appName}"
         APP_VERSION = "${appVersion}"
         DATA_DIR    = "/alloc/data"
+${projectEnvLines}
       }
       resources {
         cpu    = 100

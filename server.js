@@ -217,6 +217,10 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // approach (orphan-banner.js, removed), which only ever covered a
     // static index.html or a narrow Node-specific case.
     //
+    // NEW: claim.envVars — this project's configured env vars (see
+    // hostnsoft-api's env-vars.routes.ts), baked into the container's
+    // env block on every deploy. Previously persisted in hostnsoft-api's
+    // DB but never actually reached a running app.
     const nomadJobSpec = buildNomadJobSpec({
       appName,
       domain,
@@ -224,6 +228,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       appVersion,
       taskMemory,
       customDomains: claim.customDomains || [],
+      envVars: claim.envVars || [],
       isOrphan: claim.isOrphan,
       orphanExpiresAt: claim.orphanExpiresAt,
       orphanLoginUrl: claim.orphanLoginUrl,
@@ -309,7 +314,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 // image is never touched.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { imageTag, memoryMb, customDomains } = req.body || {};
+  const { imageTag, memoryMb, customDomains, envVars } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -319,6 +324,13 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   }
   if (!Array.isArray(customDomains) || !customDomains.every((d) => typeof d === 'string')) {
     return res.status(400).json({ error: "customDomains must be an array of strings" });
+  }
+  // Optional (defaults to []) — hostnsoft-api sends this on every push
+  // (see customDomainActivation.ts) so a custom-domain activation never
+  // silently strips a project's env vars, but tolerate it being absent
+  // rather than failing a request that has nothing to do with env vars.
+  if (envVars !== undefined && (!Array.isArray(envVars) || !envVars.every((v) => v && typeof v.key === 'string' && typeof v.value === 'string'))) {
+    return res.status(400).json({ error: "envVars must be an array of {key, value} strings" });
   }
 
   // imageTag is always "<appName>:<appVersion>" (see how it's built in
@@ -335,6 +347,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     appVersion,
     taskMemory,
     customDomains,
+    envVars: envVars || [],
   });
 
   const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
