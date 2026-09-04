@@ -53,13 +53,60 @@ function customDomainRouterTags(appName, customDomains) {
   });
 }
 
-function buildNomadJobSpec({ appName, domain, imageName, appVersion, taskMemory, customDomains = [] }) {
+function buildNomadJobSpec({
+  appName,
+  domain,
+  imageName,
+  appVersion,
+  taskMemory,
+  customDomains = [],
+  isOrphan = false,
+  orphanExpiresAt,
+  orphanLoginUrl,
+}) {
   const tags = [
     'traefik.enable=true',
     ...defaultRouterTags(appName, domain),
     ...customDomainRouterTags(appName, customDomains),
   ];
   const tagLines = tags.map((tag) => `        "${tag}"`).join(',\n');
+
+  // While a project is orphaned, public traffic is routed through a
+  // small language/framework-agnostic sidecar (orphan-proxy/) that
+  // injects the expiry banner into any text/html response, instead of
+  // reaching the app container directly — see
+  // docs/Anonymous-deploy-req.md #5. Traefik's service always points at
+  // the "http" port label; which task actually owns that label shifts
+  // depending on isOrphan, so the app itself is untouched either way.
+  //
+  // Since every deploy rebuilds this entire job spec from scratch, this
+  // — and the sidecar task itself — is automatically gone the moment a
+  // project is claimed and redeployed (isOrphan false): see #6. No
+  // separate removal step exists or is needed.
+  const appPortLabel = isOrphan ? 'app' : 'http';
+
+  const sidecarNetworkPort = isOrphan ? '\n      port "app"  {}' : '';
+
+  const sidecarTask = isOrphan ? `
+    # Only present for orphan (anonymous, unclaimed) deploys — see above.
+    task "orphan-proxy" {
+      driver = "docker"
+      config {
+        image        = "orphan-banner-proxy:latest"
+        network_mode = "host" # reaches the app task via 127.0.0.1:$\{NOMAD_PORT_app}, same technique Traefik itself uses to reach every app container
+        force_pull   = false  # built once by server-setup.sh, not per-deploy
+      }
+      env {
+        LISTEN_PORT       = "\${NOMAD_PORT_http}"
+        TARGET_PORT       = "\${NOMAD_PORT_app}"
+        BANNER_EXPIRES_AT = "${orphanExpiresAt}"
+        BANNER_LOGIN_URL  = "${orphanLoginUrl}"
+      }
+      resources {
+        cpu    = 50
+        memory = 64
+      }
+    }` : '';
 
   return `
 job "${appName}" {
@@ -68,7 +115,7 @@ job "${appName}" {
 
   group "web" {
     network {
-      port "http" {}
+      port "http" {}${sidecarNetworkPort}
     }
 
     # Persists /alloc/data across redeploys by biasing the scheduler to reuse
@@ -93,11 +140,11 @@ ${tagLines}
       driver = "docker"
       config {
         image      = "${imageName}"
-        ports      = ["http"]
+        ports      = ["${appPortLabel}"]
         force_pull = false # Use the local image we just built
       }
       env {
-        PORT        = "\${NOMAD_PORT_http}"
+        PORT        = "\${NOMAD_PORT_${appPortLabel}}"
         APP_NAME    = "${appName}"
         APP_VERSION = "${appVersion}"
         DATA_DIR    = "/alloc/data"
@@ -107,6 +154,7 @@ ${tagLines}
         memory = ${taskMemory}
       }
     }
+${sidecarTask}
   }
 }
     `;
