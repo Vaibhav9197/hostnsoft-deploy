@@ -45,7 +45,11 @@ async function claimProject(token, slug) {
   }
 
   const body = await response.json();
-  return { ok: true, projectId: body.projectId };
+  // customDomains: this project's already-active custom domains (see
+  // docs/Customdomain-req.md) — passed through so server.js can include
+  // their routers in the regenerated job spec on every deploy, not just
+  // when a domain is first activated.
+  return { ok: true, projectId: body.projectId, customDomains: body.customDomains || [] };
 }
 
 module.exports = { claimProject };
