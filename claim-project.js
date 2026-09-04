@@ -7,6 +7,10 @@
  * src/routes/internalProjects.routes.ts. hostnsoft-api reads the owning
  * company directly off the token; no X-Company-Id involved.
  *
+ * `token` may be omitted entirely (pass `undefined`, not `null`) — see
+ * docs/Anonymous-deploy-req.md. That creates/reuses an anonymous
+ * ("orphan") project instead of requiring a company.
+ *
  * The app name doubles as the live subdomain (<appName>.app.hostnsoft.com)
  * and the Nomad job name, so it must be unique platform-wide. Previously
  * the only uniqueness check happened in record-deployment.js, AFTER the
@@ -45,7 +49,24 @@ async function claimProject(token, slug) {
   }
 
   const body = await response.json();
-  return { ok: true, projectId: body.projectId };
+  // customDomains: this project's already-active custom domains (see
+  // docs/Customdomain-req.md) — passed through so server.js can include
+  // their routers in the regenerated job spec on every deploy, not just
+  // when a domain is first activated.
+  //
+  // isOrphan/orphanExpiresAt/orphanMessage/orphanLoginUrl: see
+  // docs/Anonymous-deploy-req.md — present when this deploy has no (or
+  // an as-yet-unclaimed) token, so server.js knows to inject the expiry
+  // banner and include the orphan notice in its own response.
+  return {
+    ok: true,
+    projectId: body.projectId,
+    customDomains: body.customDomains || [],
+    isOrphan: !!body.isOrphan,
+    orphanExpiresAt: body.orphanExpiresAt || null,
+    orphanMessage: body.orphanMessage || null,
+    orphanLoginUrl: body.orphanLoginUrl || null,
+  };
 }
 
 module.exports = { claimProject };

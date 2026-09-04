@@ -1,0 +1,7 @@
+{
+  "name": "orphan-banner-proxy",
+  "private": true,
+  "description": "Sidecar that injects the orphan-expiry banner into any orphan app's HTML responses, regardless of the app's own language/framework. Built once by server-setup.sh, not per-deploy.",
+  "main": "proxy.js",
+  "dependencies": {}
+}

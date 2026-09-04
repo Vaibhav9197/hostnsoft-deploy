@@ -39,17 +39,14 @@ const { recordDeployment } = require('./record-deployment');
 // subdomain, so it must be unique platform-wide.
 const { claimProject } = require('./claim-project');
 
-// Fail-fast at startup, same convention as validate-deploy-token.js —
-// the domain suffix deployed apps live under (e.g. "app.embarko.ai").
-// server-setup.sh computes and exports this per environment.
-if (!process.env.APPS_DOMAIN_SUFFIX) {
-  throw new Error(
-    'APPS_DOMAIN_SUFFIX environment variable is not set. This is the ' +
-      'domain suffix deployed apps live under (e.g. "app.embarko.ai") — ' +
-      'see server-setup.sh, which computes and exports it per environment.'
-  );
-}
-const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
+// NEW: shared Nomad job spec builder — see docs/Customdomain-req.md. Used
+// here after a fresh build, and by the /internal/apps/:appName/config
+// endpoint below when only custom-domain routing changed (no rebuild).
+// APPS_DOMAIN_SUFFIX's fail-fast check now lives inside this module (see
+// its defaultDomainFor) rather than here, since both this file and the
+// config endpoint below need it.
+const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
+const { requireInternalSecret } = require('./internal-auth');
 
 const app = express();
 
@@ -74,7 +71,8 @@ app.use((req, res, next) => {
 const upload = multer({ dest: '/tmp/platform-uploads/' });
 
 app.post('/apps', upload.single('source'), async (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
   const appName = req.headers['x-app-name'];
 
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
@@ -90,8 +88,18 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // scoped at creation (hostnsoft-api mints one per company), so which
   // company this deploy belongs to is read off the token itself. One
   // fewer thing for a caller to get right or send inconsistently.
-  if (!token || !(await validateDeployToken(token))) {
-    return res.status(401).json({ error: "Unauthorized", code: "unauthorized" });
+  //
+  // NEW: a MISSING Authorization header opts into an anonymous ("orphan")
+  // deploy — see docs/Anonymous-deploy-req.md — but a header that's
+  // present and invalid is still a hard 401, never a silent fallback to
+  // anonymous. Anonymous is opt-in by omission only, so a typo'd/expired
+  // token surfaces as an auth error instead of masquerading as a feature.
+  let hasValidToken = false;
+  if (authHeader) {
+    if (!token || !(await validateDeployToken(token))) {
+      return res.status(401).json({ error: "Unauthorized", code: "unauthorized" });
+    }
+    hasValidToken = true;
   }
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
@@ -101,8 +109,10 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // NEW: the app name is also the live subdomain and the Nomad job name —
   // confirm it's either already this token's company's or free to claim
   // BEFORE spending any build time on it. No project needs to exist via
-  // the dashboard first; this auto-creates one on first sight.
-  const claim = await claimProject(token, appName);
+  // the dashboard first; this auto-creates one on first sight. Passing
+  // `undefined` (not the invalid/absent token itself) when there's no
+  // valid token routes this to hostnsoft-api's anonymous/orphan path.
+  const claim = await claimProject(hasValidToken ? token : undefined, appName);
   if (!claim.ok) {
     return res.status(claim.status).json({ error: claim.error, code: claim.code });
   }
@@ -118,9 +128,10 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
   const imageName = `${appName}:${appVersion}`; // CHANGED: versioned tag instead of :latest
   // Real domain via Cloudflare DNS, routed through Traefik with Let's Encrypt TLS.
-  // Domain suffix comes from APPS_DOMAIN_SUFFIX (see top of file) — not
-  // hardcoded, so it tracks whatever server-setup.sh configured.
-  const domain = `${appName}.${APPS_DOMAIN_SUFFIX}`;
+  // Domain suffix comes from APPS_DOMAIN_SUFFIX (see nomad-job-spec.js's
+  // defaultDomainFor) — not hardcoded, so it tracks whatever
+  // server-setup.sh configured.
+  const domain = defaultDomainFor(appName);
 
   try {
     // 2. Extract the uploaded tar.gz file
@@ -193,58 +204,29 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
     // 4. Generate the Nomad Job Specification
     logger.info(`[${appName}] Generating Nomad file...`);
-    const nomadJobSpec = `
-job "${appName}" {
-  datacenters = ["dc1"]
-  type        = "service"
-
-  group "web" {
-    network {
-      port "http" {}
-    }
-
-    # Persists /alloc/data across redeploys by biasing the scheduler to reuse
-    # the same client node, and migrating the data if it ever can't.
-    # Apps that don't use DATA_DIR simply ignore this — it's opt-in.
-    ephemeral_disk {
-      size    = 500
-      sticky  = true
-      migrate = true
-    }
-
-    service {
-      name     = "${appName}"
-      provider = "nomad"
-      port     = "http"
-
-      tags = [
-        "traefik.enable=true",
-        "traefik.http.routers.${appName}.rule=Host(\`${domain}\`)",
-        "traefik.http.routers.${appName}.entrypoints=websecure",
-        "traefik.http.routers.${appName}.tls.certresolver=cloudflare"
-      ]
-    }
-    task "server" {
-      driver = "docker"
-      config {
-        image      = "${imageName}"
-        ports      = ["http"]
-        force_pull = false # Use the local image we just built
-      }
-      env {
-        PORT        = "\${NOMAD_PORT_http}"
-        APP_NAME    = "${appName}"
-        APP_VERSION = "${appVersion}"
-        DATA_DIR    = "/alloc/data"
-      }
-      resources {
-        cpu    = 100
-        memory = ${taskMemory}
-      }
-    }
-  }
-}
-    `;
+    // NEW: includes one HTTP-01 router per already-active custom domain
+    // for this project (claim.customDomains, from
+    // /internal/projects/claim) — without this, redeploying an app that
+    // already has a custom domain attached would silently drop its
+    // router. See docs/Customdomain-req.md.
+    //
+    // NEW: isOrphan/orphanExpiresAt/orphanLoginUrl route traffic through
+    // the language-agnostic orphan-proxy sidecar instead of the app
+    // directly — see docs/Anonymous-deploy-req.md #5 and
+    // nomad-job-spec.js. Replaces the old build-time source-injection
+    // approach (orphan-banner.js, removed), which only ever covered a
+    // static index.html or a narrow Node-specific case.
+    const nomadJobSpec = buildNomadJobSpec({
+      appName,
+      domain,
+      imageName,
+      appVersion,
+      taskMemory,
+      customDomains: claim.customDomains || [],
+      isOrphan: claim.isOrphan,
+      orphanExpiresAt: claim.orphanExpiresAt,
+      orphanLoginUrl: claim.orphanLoginUrl,
+    });
 
     const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
     await fs.writeFile(nomadFilePath, nomadJobSpec);
@@ -258,25 +240,40 @@ job "${appName}" {
     await fs.remove(req.file.path);
 
     // NEW: report this deploy's outcome to hostnsoft-api so its dashboard
-    // deployment history is actually populated.
-    await recordDeployment({
-      token,
-      projectSlug: appName,
-      appVersion,
-      status: 'success',
-      imageTag: imageName,
-      memoryMb: taskMemory,
-    });
+    // deployment history is actually populated. Skipped for anonymous
+    // deploys — see docs/Anonymous-deploy-req.md's "out of scope": there's
+    // no company to attribute history to until/unless the project is
+    // claimed, and nothing is retroactively backfilled once it is.
+    if (hasValidToken) {
+      await recordDeployment({
+        token,
+        projectSlug: appName,
+        appVersion,
+        status: 'success',
+        imageTag: imageName,
+        memoryMb: taskMemory,
+      });
+    }
 
     // 7. Send Success Response
-    res.status(200).json({
+    const responseBody = {
       success: true,
       message: "Deployment successful!",
       version: appVersion,
       image: imageName,
       memory: `${taskMemory}MB`,
       url: `https://${domain}`
-    });
+    };
+    // NEW: see docs/Anonymous-deploy-req.md #4 — orphanMessage is a
+    // complete, self-contained instruction sequence, written so an AI
+    // agent relaying this to a human can explain every step unaided.
+    if (claim.isOrphan) {
+      responseBody.orphan = {
+        expiresAt: claim.orphanExpiresAt,
+        message: claim.orphanMessage,
+      };
+    }
+    res.status(200).json(responseBody);
 
   } catch (error) {
     logger.error(`[${appName}] Deployment failed:`, error);
@@ -284,16 +281,105 @@ job "${appName}" {
     // NEW: report the failure too — token/appName/appVersion are all
     // validated before this try block starts, so they're safe here even
     // if the failure happened early in the pipeline (taskMemory isn't,
-    // hence its absence below).
-    await recordDeployment({
-      token,
-      projectSlug: appName,
-      appVersion,
-      status: 'failed',
-      errorDetail: error.message,
-    });
+    // hence its absence below). Skipped for anonymous deploys, same
+    // reasoning as the success path above.
+    if (hasValidToken) {
+      await recordDeployment({
+        token,
+        projectSlug: appName,
+        appVersion,
+        status: 'failed',
+        errorDetail: error.message,
+      });
+    }
 
     res.status(500).json({ error: "Deployment failed", code: "deploy_failed", details: error.message });
+  }
+});
+
+// NEW: pushes updated custom-domain routing to a project's already-
+// running app WITHOUT a rebuild — see docs/Customdomain-req.md
+// "Activating the router". Called by hostnsoft-api once a custom
+// domain's DNS is verified (or once one is removed/deactivated), with
+// its full current list of active domains for the project each time
+// (a resync, not a diff). Reuses the exact same buildNomadJobSpec +
+// `nomad job run` as a fresh deploy — Nomad applies job spec changes
+// in-place when the job name already exists, so the running container
+// image is never touched.
+app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  const { imageTag, memoryMb, customDomains } = req.body || {};
+
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+  if (typeof imageTag !== 'string' || !imageTag.includes(':')) {
+    return res.status(400).json({ error: 'imageTag is required and must be a full "name:version" image reference' });
+  }
+  if (!Array.isArray(customDomains) || !customDomains.every((d) => typeof d === 'string')) {
+    return res.status(400).json({ error: "customDomains must be an array of strings" });
+  }
+
+  // imageTag is always "<appName>:<appVersion>" (see how it's built in
+  // POST /apps above and stored as Deployment.imageTag in hostnsoft-api)
+  // — the version is whatever follows the first colon.
+  const appVersion = imageTag.slice(imageTag.indexOf(':') + 1);
+  const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : 256;
+  const domain = defaultDomainFor(appName);
+
+  const nomadJobSpec = buildNomadJobSpec({
+    appName,
+    domain,
+    imageName: imageTag,
+    appVersion,
+    taskMemory,
+    customDomains,
+  });
+
+  const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
+  try {
+    await fs.ensureDir(path.dirname(nomadFilePath));
+    await fs.writeFile(nomadFilePath, nomadJobSpec);
+    logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
+    await execPromise(`nomad job run ${nomadFilePath}`);
+    await fs.remove(nomadFilePath);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error(`[${appName}] Applying config update failed:`, error);
+    res.status(500).json({ error: "Applying config update failed", details: error.message });
+  }
+});
+
+// NEW: fully tears down an app — see docs/Anonymous-deploy-req.md #7.
+// Called by hostnsoft-api's hourly orphan-cleanup job. `nomad job stop
+// -purge` removes both the Nomad job AND its Traefik routing (Traefik's
+// Nomad provider derives config from the running job, so purging it is
+// sufficient — no separate Traefik cleanup step exists or is needed).
+// Uploaded tarballs/build directories are already removed immediately
+// after every deploy attempt (success or failure) today, so there's
+// nothing left over for this endpoint to clean up there.
+app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  try {
+    await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+      // A job that was never successfully deployed (e.g. an orphan whose
+      // build/deploy failed) has no Nomad job at all — treat "not found"
+      // as already-torn-down rather than an error.
+      const output = `${e.stdout || ''}${e.stderr || ''}`;
+      if (!/not found/i.test(output)) throw e;
+    });
+    await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
+      logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);
+    });
+    logger.info(`[${appName}] Orphan teardown complete`);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error(`[${appName}] Orphan teardown failed:`, error);
+    res.status(500).json({ error: "Teardown failed", details: error.message });
   }
 });
 
