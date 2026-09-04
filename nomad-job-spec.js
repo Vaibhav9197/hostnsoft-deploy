@@ -63,6 +63,10 @@ function buildNomadJobSpec({
   isOrphan = false,
   orphanExpiresAt,
   orphanLoginUrl,
+  // Resolved local image ID for orphan-banner-proxy, NOT the `:latest`
+  // tag — see server.js's caller for why. Required whenever isOrphan is
+  // true; callers must resolve it before calling this.
+  orphanProxyImageRef,
 }) {
   const tags = [
     'traefik.enable=true',
@@ -92,7 +96,7 @@ function buildNomadJobSpec({
     task "orphan-proxy" {
       driver = "docker"
       config {
-        image        = "orphan-banner-proxy:latest"
+        image        = "${orphanProxyImageRef}" # local image ID, not the ":latest" tag — see server.js
         network_mode = "host" # reaches the app task via 127.0.0.1:$\{NOMAD_PORT_app}, same technique Traefik itself uses to reach every app container
         force_pull   = false  # built once by server-setup.sh, not per-deploy
       }
