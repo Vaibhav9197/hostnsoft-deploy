@@ -63,11 +63,18 @@ async function claimProject(token, slug) {
   // so server.js can bake them into the container's env block. Previously
   // these were persisted in hostnsoft-api's DB but never actually reached
   // a running app; this is that missing integration point.
+  //
+  // memoryMb: this project's configured memory override (set via
+  // hostnsoft-api's PATCH .../memory) — same gap as envVars had: this
+  // was already returned by hostnsoft-api but never actually read here,
+  // so server.js's auto-detected 256/512 always won regardless of what
+  // was configured.
   return {
     ok: true,
     projectId: body.projectId,
     customDomains: body.customDomains || [],
     envVars: body.envVars || [],
+    memoryMb: typeof body.memoryMb === 'number' ? body.memoryMb : null,
     isOrphan: !!body.isOrphan,
     orphanExpiresAt: body.orphanExpiresAt || null,
     orphanMessage: body.orphanMessage || null,

@@ -191,9 +191,23 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // 2c. Embedded DB (PGlite) needs more memory headroom than a plain
     // static/Express app. Uses the same `deps` read above — no second
     // package.json read.
+    //
+    // NEW: takes the project's configured memoryMb (hostnsoft-api's
+    // PATCH .../memory — previously persisted but never actually reached
+    // here) as a floor-adjustable override rather than either ignoring it
+    // or letting it override outright: the auto-detected embedded-DB
+    // requirement is a hard technical minimum (that app WILL OOM below
+    // it), not something a lower configured value should be able to
+    // undercut — hostnsoft-api's schema defaults every project to 256MB
+    // whether or not memory was ever explicitly configured, so treating
+    // the configured value as authoritative outright would silently
+    // regress every embedded-DB app that never touched this setting.
+    // Math.max lets an explicit HIGHER value win, while the auto-detected
+    // minimum always still applies.
     const usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
-    const taskMemory = usesEmbeddedDb ? 512 : 256;
-    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} -> memory = ${taskMemory}MB`);
+    const autoDetectedMemory = usesEmbeddedDb ? 512 : 256;
+    const taskMemory = Math.max(autoDetectedMemory, claim.memoryMb || autoDetectedMemory);
+    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} (min ${autoDetectedMemory}MB), configured: ${claim.memoryMb ?? 'none'}MB -> using ${taskMemory}MB`);
 
     // 3. Build the container image using Railpack
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
