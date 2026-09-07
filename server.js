@@ -48,6 +48,11 @@ const { claimProject } = require('./claim-project');
 const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
+// NEW: GET /internal/apps/:appName/status — real Nomad allocation status,
+// backing hostnsoft-api's project-health field (previously hardcoded to
+// "unknown"). See app-health.js.
+const { getAppHealth } = require('./app-health');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -191,9 +196,23 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // 2c. Embedded DB (PGlite) needs more memory headroom than a plain
     // static/Express app. Uses the same `deps` read above — no second
     // package.json read.
+    //
+    // NEW: takes the project's configured memoryMb (hostnsoft-api's
+    // PATCH .../memory — previously persisted but never actually reached
+    // here) as a floor-adjustable override rather than either ignoring it
+    // or letting it override outright: the auto-detected embedded-DB
+    // requirement is a hard technical minimum (that app WILL OOM below
+    // it), not something a lower configured value should be able to
+    // undercut — hostnsoft-api's schema defaults every project to 256MB
+    // whether or not memory was ever explicitly configured, so treating
+    // the configured value as authoritative outright would silently
+    // regress every embedded-DB app that never touched this setting.
+    // Math.max lets an explicit HIGHER value win, while the auto-detected
+    // minimum always still applies.
     const usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
-    const taskMemory = usesEmbeddedDb ? 512 : 256;
-    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} -> memory = ${taskMemory}MB`);
+    const autoDetectedMemory = usesEmbeddedDb ? 512 : 256;
+    const taskMemory = Math.max(autoDetectedMemory, claim.memoryMb || autoDetectedMemory);
+    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} (min ${autoDetectedMemory}MB), configured: ${claim.memoryMb ?? 'none'}MB -> using ${taskMemory}MB`);
 
     // 3. Build the container image using Railpack
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -382,9 +401,17 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
       // A job that was never successfully deployed (e.g. an orphan whose
       // build/deploy failed) has no Nomad job at all — treat "not found"
-      // as already-torn-down rather than an error.
+      // as already-torn-down rather than an error. Nomad's actual message
+      // here is "No job(s) with prefix or id \"x\" found" (confirmed via
+      // Nomad's own CLI source/issue tracker) — it does NOT contain the
+      // substring "not found", so the previous check here never matched
+      // and this path silently fell through to `throw e` instead (caught
+      // by this function's own outer try/catch, surfaced as a 500 to
+      // hostnsoft-api rather than the "already torn down" success this
+      // comment always described). Found while adding the same
+      // not-found detection to app-health.js's GET .../status endpoint.
       const output = `${e.stdout || ''}${e.stderr || ''}`;
-      if (!/not found/i.test(output)) throw e;
+      if (!/no job\(s\) with prefix or id/i.test(output)) throw e;
     });
     await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
       logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);
@@ -395,6 +422,21 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     logger.error(`[${appName}] Orphan teardown failed:`, error);
     res.status(500).json({ error: "Teardown failed", details: error.message });
   }
+});
+
+// NEW: read-only Nomad allocation status for a project — see
+// hostnsoft-api's src/services/appHealth.ts (its GET
+// /companies/:companyId/projects/:projectId consumes this, replacing the
+// previously-hardcoded health: "unknown"). See app-health.js for how
+// Nomad's own status vocabulary is simplified.
+app.get('/internal/apps/:appName/status', requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  const health = await getAppHealth(appName);
+  res.json({ health });
 });
 
 // Start the API Server — PORT is env-driven so multiple environments
