@@ -54,8 +54,30 @@ function buildBannerTag() {
   el.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:2147483647;' +
     'background:#1a1a1a;color:#fff;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;' +
     'padding:10px 16px;text-align:center;';
-  el.innerHTML = 'This app will be deleted at ' + expiresAt.toLocaleString() +
-    ' \\u2014 <a href="' + loginUrl + '" style="color:#8ab4ff;text-decoration:underline;">log in to keep it</a>';
+  var textEl = document.createElement('span');
+  el.appendChild(textEl);
+  el.appendChild(document.createTextNode(' \\u2014 '));
+  var linkEl = document.createElement('a');
+  linkEl.href = loginUrl;
+  linkEl.style.cssText = 'color:#8ab4ff;text-decoration:underline;';
+  linkEl.textContent = 'log in to keep it';
+  el.appendChild(linkEl);
+
+  // Ticks down live rather than showing a fixed wall-clock time, which a
+  // visitor would otherwise have to do the subtraction on themselves.
+  function render() {
+    var msLeft = expiresAt.getTime() - Date.now();
+    if (msLeft <= 0) {
+      textEl.textContent = 'This app has expired and may be deleted at any moment';
+      return;
+    }
+    var totalMinutes = Math.floor(msLeft / 60000);
+    var hh = Math.floor(totalMinutes / 60);
+    var mm = totalMinutes % 60;
+    var pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+    textEl.textContent = 'This app will be deleted in ' + pad(hh) + ':' + pad(mm);
+  }
+
   function mount() {
     if (document.body) {
       document.body.appendChild(el);
@@ -64,6 +86,8 @@ function buildBannerTag() {
         document.body.appendChild(el);
       });
     }
+    render();
+    setInterval(render, 30000);
   }
   mount();
 })();</script>`;
