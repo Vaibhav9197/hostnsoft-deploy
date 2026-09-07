@@ -49,19 +49,49 @@ function buildBannerTag() {
   return `<script>(function () {
   var expiresAt = new Date(${expiresAtLiteral});
   var loginUrl = ${loginUrlLiteral};
-  var el = document.createElement('div');
-  el.id = '__embarko_orphan_banner';
-  el.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:2147483647;' +
-    'background:#1a1a1a;color:#fff;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;' +
-    'padding:10px 16px;text-align:center;';
+
+  // Shadow DOM keeps this banner's appearance fully isolated from the
+  // host app's own CSS in both directions — confirmed in practice: a
+  // plain inline-styled element was getting invisible-on-dark-background
+  // text on some client apps, because a page-wide dark theme (a global
+  // "*"/element selector, an !important rule, or a CSS custom property
+  // consumed as a color value) still cascaded/inherited into it despite
+  // the inline style. A shadow root's own stylesheet is a separate scope
+  // that no outer page selector can reach into, and nothing inside it
+  // leaks back out either. Falls back to the old unisolated approach
+  // only on the handful of ancient browsers with no attachShadow, rather
+  // than not showing anything at all.
+  var host = document.createElement('div');
+  host.id = '__embarko_orphan_banner';
+  host.style.cssText = 'all:initial;position:fixed;top:0;left:0;right:0;z-index:2147483647;display:block;';
+
+  var isolated = !!host.attachShadow;
+  var root = isolated ? host.attachShadow({ mode: 'open' }) : host;
+
+  if (isolated) {
+    var style = document.createElement('style');
+    style.textContent =
+      '.bar{all:initial;display:block;box-sizing:border-box;width:100%;' +
+      'background:#1a1a1a;color:#fff;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;' +
+      'padding:10px 16px;text-align:center;}' +
+      '.bar a{color:#8ab4ff;text-decoration:underline;}';
+    root.appendChild(style);
+  }
+
+  var bar = document.createElement('div');
+  bar.className = 'bar';
+  if (!isolated) {
+    bar.style.cssText = 'background:#1a1a1a;color:#fff;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;padding:10px 16px;text-align:center;';
+  }
   var textEl = document.createElement('span');
-  el.appendChild(textEl);
-  el.appendChild(document.createTextNode(' \\u2014 '));
+  bar.appendChild(textEl);
+  bar.appendChild(document.createTextNode(' \\u2014 '));
   var linkEl = document.createElement('a');
   linkEl.href = loginUrl;
-  linkEl.style.cssText = 'color:#8ab4ff;text-decoration:underline;';
+  if (!isolated) linkEl.style.cssText = 'color:#8ab4ff;text-decoration:underline;';
   linkEl.textContent = 'log in to keep it';
-  el.appendChild(linkEl);
+  bar.appendChild(linkEl);
+  root.appendChild(bar);
 
   // Ticks down live rather than showing a fixed wall-clock time, which a
   // visitor would otherwise have to do the subtraction on themselves.
@@ -80,10 +110,10 @@ function buildBannerTag() {
 
   function mount() {
     if (document.body) {
-      document.body.appendChild(el);
+      document.body.appendChild(host);
     } else {
       document.addEventListener('DOMContentLoaded', function () {
-        document.body.appendChild(el);
+        document.body.appendChild(host);
       });
     }
     render();
