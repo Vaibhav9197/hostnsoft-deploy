@@ -322,15 +322,18 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   }
 });
 
-// NEW: pushes updated custom-domain routing to a project's already-
-// running app WITHOUT a rebuild — see docs/Customdomain-req.md
-// "Activating the router". Called by hostnsoft-api once a custom
-// domain's DNS is verified (or once one is removed/deactivated), with
-// its full current list of active domains for the project each time
-// (a resync, not a diff). Reuses the exact same buildNomadJobSpec +
-// `nomad job run` as a fresh deploy — Nomad applies job spec changes
-// in-place when the job name already exists, so the running container
-// image is never touched.
+// NEW: pushes an app's config (image, memory, custom domains, env vars)
+// WITHOUT a rebuild — see docs/Customdomain-req.md "Activating the
+// router". Called by hostnsoft-api for two things: (1) a custom domain
+// being verified/removed, with the project's current imageTag unchanged
+// and its full current active-domain list (a resync, not a diff), and
+// (2) one-click rollback, with a PAST imageTag and everything else left
+// at its current value — a rollback only changes what code is running,
+// never a project's current domains/env vars/memory floor. Reuses the
+// exact same buildNomadJobSpec + `nomad job run` as a fresh deploy —
+// Nomad applies job spec changes in-place when the job name already
+// exists, so this never touches anything except the one field that
+// actually changed.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
   const { imageTag, memoryMb, customDomains, envVars } = req.body || {};
@@ -358,6 +361,22 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   const appVersion = imageTag.slice(imageTag.indexOf(':') + 1);
   const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : 256;
   const domain = defaultDomainFor(appName);
+
+  // NEW: this endpoint now also backs one-click rollback (see
+  // hostnsoft-api's src/routes/deployments.routes.ts), which can request
+  // ANY past imageTag, not just the currently-running one. These images
+  // are railpack-built locally and never pushed to a registry, so if
+  // this one isn't on disk (e.g. the host was rebuilt, or it was pruned)
+  // there's nowhere for Nomad to pull it from — confirmed via
+  // `docker image inspect` up front instead of letting `nomad job run`
+  // fail deep in its own retry/placement logic with a confusing
+  // "pull access denied" error unrelated to the actual cause.
+  try {
+    await execPromise(`docker image inspect ${imageTag}`);
+  } catch (e) {
+    logger.warn(`[${appName}] Requested image "${imageTag}" not found locally, refusing config update`);
+    return res.status(404).json({ error: `Image "${imageTag}" is no longer available on this host` });
+  }
 
   const nomadJobSpec = buildNomadJobSpec({
     appName,
