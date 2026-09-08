@@ -28,7 +28,7 @@ const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detec
 // NEW: every deploy now authenticates as a specific company via a
 // company-scoped token issued (and revocable/rotatable) by hostnsoft-api,
 // replacing the old single shared PLATFORM_TOKEN everyone used.
-const { validateDeployToken } = require('./validate-deploy-token');
+const { validateDeployToken, validateDeployTokenWithCompany } = require('./validate-deploy-token');
 
 // NEW: reports each deploy attempt's outcome back to hostnsoft-api so its
 // dashboard deployment history is actually populated.
@@ -61,6 +61,17 @@ const { startResourcePoller } = require('./analytics/resource-poller');
 const { startRetentionLoop } = require('./analytics/retention');
 const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/query');
 
+// NEW: POST /apps now responds as soon as the upload is validated and
+// accepted, before the (potentially multi-minute) build/deploy actually
+// runs — a slow build was causing Cloudflare's own proxy timeout (524)
+// well before the deploy itself had a chance to finish. The build now
+// continues in the background; deploy-status.js tracks its progress
+// in-process (see GET /apps/:appName/status) and app-logs.js/
+// project-lookup.js back that endpoint and GET /apps/:appName/logs.
+const { setDeployState, getDeployState } = require('./deploy-status');
+const { lookupProject } = require('./project-lookup');
+const { getAppLogs } = require('./app-logs');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -82,6 +93,96 @@ app.use((req, res, next) => {
 
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
+
+// Runs the actually-slow part of a deploy (railpack build + `nomad job
+// run`) — split out of the request handler below so it can continue
+// AFTER the response is already sent (see the handler's own comment for
+// why). Never throws outward: this has no request/response to answer to
+// by the time it runs, so every failure is caught, recorded, and logged
+// here instead.
+async function performBuildAndDeploy({
+  appName, appVersion, imageName, domain, buildDir, filePath,
+  claim, taskMemory, hasValidToken, token, deploymentId,
+}) {
+  try {
+    logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
+    // Railpack's CLI takes the directory as a positional arg and the
+    // image tag via --name.
+    await execPromise(`cd ${buildDir} && railpack build . --name ${imageName}`);
+
+    logger.info(`[${appName}] Generating Nomad file...`);
+    const nomadJobSpec = buildNomadJobSpec({
+      appName,
+      domain,
+      imageName,
+      appVersion,
+      taskMemory,
+      customDomains: claim.customDomains || [],
+      envVars: claim.envVars || [],
+      isOrphan: claim.isOrphan,
+      orphanExpiresAt: claim.orphanExpiresAt,
+      orphanLoginUrl: claim.orphanLoginUrl,
+    });
+    const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
+    await fs.writeFile(nomadFilePath, nomadJobSpec);
+
+    logger.info(`[${appName}] Deploying to Nomad...`);
+    await execPromise(`nomad job run ${nomadFilePath}`);
+
+    await fs.remove(buildDir);
+    await fs.remove(filePath);
+
+    // Reports the outcome to hostnsoft-api so its dashboard deployment
+    // history is actually populated. Skipped for anonymous deploys — see
+    // docs/Anonymous-deploy-req.md's "out of scope": there's no company
+    // to attribute history to until/unless the project is claimed.
+    // deploymentId (from the in_progress call below) updates that same
+    // row in place rather than creating a second one for this attempt.
+    if (hasValidToken) {
+      await recordDeployment({
+        token,
+        projectSlug: appName,
+        appVersion,
+        status: 'success',
+        imageTag: imageName,
+        memoryMb: taskMemory,
+        deploymentId,
+      });
+    }
+    setDeployState(appName, {
+      status: 'success',
+      finishedAt: new Date().toISOString(),
+      errorDetail: null,
+      imageTag: imageName,
+    });
+    logger.info(`[${appName}] Deployment complete.`);
+  } catch (error) {
+    logger.error(`[${appName}] Deployment failed:`, error);
+
+    // Unlike before this became a background step, cleanup on failure
+    // matters here too — a build that keeps failing (bad Dockerfile,
+    // flaky dependency) would otherwise leave a build dir + upload behind
+    // on every single retry, forever, with nothing to ever remove them.
+    await fs.remove(buildDir).catch(() => {});
+    await fs.remove(filePath).catch(() => {});
+
+    if (hasValidToken) {
+      await recordDeployment({
+        token,
+        projectSlug: appName,
+        appVersion,
+        status: 'failed',
+        errorDetail: error.message,
+        deploymentId,
+      });
+    }
+    setDeployState(appName, {
+      status: 'failed',
+      finishedAt: new Date().toISOString(),
+      errorDetail: error.message,
+    });
+  }
+}
 
 app.post('/apps', upload.single('source'), async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -145,6 +246,12 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // defaultDomainFor) — not hardcoded, so it tracks whatever
   // server-setup.sh configured.
   const domain = defaultDomainFor(appName);
+  // The status/log check-back URLs below always answer as this same
+  // service, so they're built off the incoming request's own host rather
+  // than a separate env var — same https-hardcoding the response already
+  // relied on (this platform is always served through Traefik's TLS
+  // termination in practice).
+  const selfHost = req.get('host');
 
   try {
     // 2. Extract the uploaded tar.gz file
@@ -222,100 +329,86 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     const taskMemory = Math.max(autoDetectedMemory, claim.memoryMb || autoDetectedMemory);
     logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} (min ${autoDetectedMemory}MB), configured: ${claim.memoryMb ?? 'none'}MB -> using ${taskMemory}MB`);
 
-    // 3. Build the container image using Railpack
-    logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
-    // FIXED: Railpack's CLI takes the directory as a positional arg and the
-    // image tag via --name. The original `railpack build ${imageName}` treated
-    // the tag itself as a directory path and always failed.
-    await execPromise(`cd ${buildDir} && railpack build . --name ${imageName}`);
-
-    // 4. Generate the Nomad Job Specification
-    logger.info(`[${appName}] Generating Nomad file...`);
-    // NEW: includes one HTTP-01 router per already-active custom domain
-    // for this project (claim.customDomains, from
-    // /internal/projects/claim) — without this, redeploying an app that
-    // already has a custom domain attached would silently drop its
-    // router. See docs/Customdomain-req.md.
-    //
-    // NEW: isOrphan/orphanExpiresAt/orphanLoginUrl route traffic through
-    // the language-agnostic orphan-proxy sidecar instead of the app
-    // directly — see docs/Anonymous-deploy-req.md #5 and
-    // nomad-job-spec.js. Replaces the old build-time source-injection
-    // approach (orphan-banner.js, removed), which only ever covered a
-    // static index.html or a narrow Node-specific case.
-    //
-    // NEW: claim.envVars — this project's configured env vars (see
-    // hostnsoft-api's env-vars.routes.ts), baked into the container's
-    // env block on every deploy. Previously persisted in hostnsoft-api's
-    // DB but never actually reached a running app.
-    const nomadJobSpec = buildNomadJobSpec({
-      appName,
-      domain,
-      imageName,
-      appVersion,
-      taskMemory,
-      customDomains: claim.customDomains || [],
-      envVars: claim.envVars || [],
-      isOrphan: claim.isOrphan,
-      orphanExpiresAt: claim.orphanExpiresAt,
-      orphanLoginUrl: claim.orphanLoginUrl,
-    });
-
-    const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
-    await fs.writeFile(nomadFilePath, nomadJobSpec);
-
-    // 5. Deploy to Nomad
-    logger.info(`[${appName}] Deploying to Nomad...`);
-    await execPromise(`nomad job run ${nomadFilePath}`);
-
-    // 6. Cleanup temp files
-    await fs.remove(buildDir);
-    await fs.remove(req.file.path);
-
-    // NEW: report this deploy's outcome to hostnsoft-api so its dashboard
-    // deployment history is actually populated. Skipped for anonymous
-    // deploys — see docs/Anonymous-deploy-req.md's "out of scope": there's
-    // no company to attribute history to until/unless the project is
-    // claimed, and nothing is retroactively backfilled once it is.
+    // NEW: from here on, the actual build (railpack, which can easily
+    // take minutes for a fresh install) and the Nomad deploy run in the
+    // BACKGROUND, after the response below is already sent. A slow
+    // build was hitting Cloudflare's own proxy timeout (524) well before
+    // the deploy had a chance to finish — the client only needs to know
+    // the upload was accepted, not wait out the whole build inline.
+    // Progress is tracked via deploy-status.js (see GET
+    // /apps/:appName/status, whose URL is included in the response
+    // below) and, for token-authenticated deploys, mirrored into
+    // hostnsoft-api's own deployment history too.
+    let deploymentId = null;
     if (hasValidToken) {
-      await recordDeployment({
+      deploymentId = await recordDeployment({
         token,
         projectSlug: appName,
         appVersion,
-        status: 'success',
-        imageTag: imageName,
-        memoryMb: taskMemory,
+        status: 'in_progress',
       });
     }
+    setDeployState(appName, {
+      status: 'in_progress',
+      appVersion,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      errorDetail: null,
+      deploymentId,
+    });
 
-    // 7. Send Success Response
+    const statusUrl = `https://${selfHost}/apps/${appName}/status`;
+    const logsUrl = `https://${selfHost}/apps/${appName}/logs`;
+
+    // 7. Send Accepted Response — the build/deploy hasn't run yet; see
+    // performBuildAndDeploy above, kicked off (unawaited) below.
     const responseBody = {
       success: true,
-      message: "Deployment successful!",
+      accepted: true,
+      message:
+        `Deployment accepted and is building in the background — this can take a few ` +
+        `minutes for a fresh build. Check ${statusUrl} for progress (and ${logsUrl} for ` +
+        `build/runtime logs) before assuming it's live at the URL below.`,
       version: appVersion,
       image: imageName,
       memory: `${taskMemory}MB`,
-      url: `https://${domain}`
+      url: `https://${domain}`,
+      statusUrl,
+      logsUrl,
     };
     // NEW: see docs/Anonymous-deploy-req.md #4 — orphanMessage is a
     // complete, self-contained instruction sequence, written so an AI
     // agent relaying this to a human can explain every step unaided.
+    // statusUrl/logsUrl are repeated here (not just top-level) so that
+    // same self-contained instruction sequence doesn't force the reader
+    // to also go look at sibling fields to find them.
     if (claim.isOrphan) {
       responseBody.orphan = {
         expiresAt: claim.orphanExpiresAt,
         message: claim.orphanMessage,
+        statusUrl,
+        logsUrl,
       };
     }
-    res.status(200).json(responseBody);
+    res.status(202).json(responseBody);
+
+    // Deliberately not awaited — everything from here happens after the
+    // response above. performBuildAndDeploy has its own try/catch that
+    // records success/failure; .catch() here is only a backstop.
+    performBuildAndDeploy({
+      appName, appVersion, imageName, domain,
+      buildDir, filePath: req.file.path,
+      claim, taskMemory, hasValidToken, token, deploymentId,
+    }).catch((err) => {
+      logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
+    });
 
   } catch (error) {
-    logger.error(`[${appName}] Deployment failed:`, error);
+    // Only the SYNCHRONOUS section above (extraction, package.json read,
+    // storage scan, memory calc) can land here — the build/deploy itself
+    // has its own error handling inside performBuildAndDeploy.
+    logger.error(`[${appName}] Deploy request failed before accepting:`, error);
 
-    // NEW: report the failure too — token/appName/appVersion are all
-    // validated before this try block starts, so they're safe here even
-    // if the failure happened early in the pipeline (taskMemory isn't,
-    // hence its absence below). Skipped for anonymous deploys, same
-    // reasoning as the success path above.
     if (hasValidToken) {
       await recordDeployment({
         token,
@@ -328,6 +421,98 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
     res.status(500).json({ error: "Deployment failed", code: "deploy_failed", details: error.message });
   }
+});
+
+// Shared by GET /apps/:appName/status and .../logs below. Same auth
+// shape as POST /apps itself (Authorization: Bearer <deploy token>,
+// optional — its absence means "only allowed if this app is still an
+// unclaimed orphan"), but deliberately does NOT reuse claim-project.js:
+// that endpoint's job is to CLAIM (auto-creating a project on first
+// sight, or adopting an orphan into the caller's company as a side
+// effect) — exactly the wrong tool for a read-only status/log check,
+// which must never mutate anything just from being looked at. Uses
+// project-lookup.js's read-only counterpart instead.
+//
+// A claimed app's status/logs are only visible to a token from the SAME
+// company; anyone else (including no token at all) gets 404 — never
+// 403 — so a wrong/foreign token can't even confirm the app exists,
+// same convention hostnsoft-api's own loadCompanyContext uses.
+async function authorizeAppAccess(appName, authHeader) {
+  let callerCompanyId = null;
+  if (authHeader) {
+    const token = authHeader.split(' ')[1];
+    if (!token) return { ok: false, status: 401, error: "Unauthorized" };
+    const validation = await validateDeployTokenWithCompany(token);
+    if (!validation) return { ok: false, status: 401, error: "Unauthorized" };
+    callerCompanyId = validation.companyId;
+  }
+
+  const lookup = await lookupProject(appName);
+  if (!lookup.ok) {
+    return { ok: false, status: lookup.status, error: lookup.error };
+  }
+  if (lookup.isOrphan) {
+    return { ok: true };
+  }
+  if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
+    return { ok: false, status: 404, error: "Not found" };
+  }
+  return { ok: true };
+}
+
+// Public — the URL returned in POST /apps's own response. Reports the
+// in-flight/last-completed deploy attempt (from deploy-status.js, this
+// process's own in-memory state — see that module for why it isn't
+// sourced from hostnsoft-api's DB instead) alongside the app's real live
+// health (app-health.js), so "still building" and "built but crashed"
+// read differently instead of both just looking like silence.
+app.get('/apps/:appName/status', async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  const auth = await authorizeAppAccess(appName, req.headers.authorization);
+  if (!auth.ok) {
+    return res.status(auth.status).json({ error: auth.error });
+  }
+
+  const deployState = getDeployState(appName) || {};
+  const health = await getAppHealth(appName);
+
+  res.json({
+    appName,
+    deploy: {
+      status: deployState.status || 'unknown',
+      appVersion: deployState.appVersion || null,
+      startedAt: deployState.startedAt || null,
+      finishedAt: deployState.finishedAt || null,
+      errorDetail: deployState.errorDetail || null,
+    },
+    health,
+  });
+});
+
+// Public — same auth as .../status above. Recent (tail, not streaming)
+// stdout/stderr for the app's most recent allocation, regardless of
+// whether that allocation is currently healthy — see app-logs.js: the
+// most common reason to check logs is a build/runtime failure, so a
+// dead allocation's logs matter here as much as a healthy one's.
+// ?stream=stderr for the error stream; stdout is the default.
+app.get('/apps/:appName/logs', async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  const auth = await authorizeAppAccess(appName, req.headers.authorization);
+  if (!auth.ok) {
+    return res.status(auth.status).json({ error: auth.error });
+  }
+
+  const stream = req.query.stream === 'stderr' ? 'stderr' : 'stdout';
+  const result = await getAppLogs(appName, { stream });
+  res.json(result);
 });
 
 // NEW: pushes an app's config (image, memory, custom domains, env vars)
