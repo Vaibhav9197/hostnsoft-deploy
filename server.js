@@ -53,6 +53,14 @@ const { requireInternalSecret } = require('./internal-auth');
 // "unknown"). See app-health.js.
 const { getAppHealth } = require('./app-health');
 
+// NEW: GET /internal/apps/:appName/analytics — per-app traffic (from
+// Traefik's access log) and CPU/memory (from Nomad's stats API) history,
+// backing hostnsoft-api's analytics endpoints. See analytics/*.js.
+const { startAccessLogTailer } = require('./analytics/access-log-tailer');
+const { startResourcePoller } = require('./analytics/resource-poller');
+const { startRetentionLoop } = require('./analytics/retention');
+const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/query');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -458,6 +466,31 @@ app.get('/internal/apps/:appName/status', requireInternalSecret, async (req, res
   res.json({ health });
 });
 
+// NEW: per-app traffic (Traefik access log) and CPU/memory (Nomad stats)
+// history — see hostnsoft-api's src/services/appAnalytics.ts, which this
+// backs. `range` matches the values documented in the API reference:
+// 24h/7d/30d/90d/all.
+app.get('/internal/apps/:appName/analytics', requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+  const range = typeof req.query.range === 'string' ? req.query.range : '24h';
+  if (!isValidRange(range)) {
+    return res.status(400).json({ error: 'range must be one of: 24h, 7d, 30d, 90d, all' });
+  }
+
+  try {
+    res.json({
+      traffic: queryTraffic(appName, range),
+      resourceUsage: queryResourceUsage(appName, range),
+    });
+  } catch (error) {
+    logger.error(`[${appName}] Analytics query failed:`, error);
+    res.status(500).json({ error: "Analytics query failed", details: error.message });
+  }
+});
+
 // Start the API Server — PORT is env-driven so multiple environments
 // (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
 // without colliding; defaults to 4000 to match prior fixed behavior.
@@ -465,3 +498,11 @@ const PORT = Number(process.env.PORT) || 4000;
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
 });
+
+// Started after listen() so a broken analytics subsystem can never
+// prevent the actual deploy pipeline from coming up — each function
+// warns and no-ops on its own if its required env var isn't set, rather
+// than throwing, since analytics is additive, not load-bearing.
+startAccessLogTailer();
+startResourcePoller();
+startRetentionLoop();
