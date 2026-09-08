@@ -33,6 +33,15 @@ const logger = require('../logger');
 
 let db = null;
 
+// Shared guard used by the tailer, poller, and retention loop — all
+// three ultimately call getDb(), which throws if ANALYTICS_DB_PATH
+// isn't set. Checking this up front (instead of letting that throw
+// happen on the first tick) avoids each of them spinning up anyway and
+// then logging the same failure forever, once per poll interval.
+function isAnalyticsEnabled() {
+  return Boolean(process.env.ANALYTICS_DB_PATH);
+}
+
 function getDb() {
   if (db) return db;
 
@@ -81,4 +90,4 @@ function getDb() {
   return db;
 }
 
-module.exports = { getDb };
+module.exports = { getDb, isAnalyticsEnabled };

@@ -9,9 +9,12 @@
  * whichever is more recent" — not literally all-time.
  */
 const logger = require('../logger');
-const { getDb } = require('./db');
+const { getDb, isAnalyticsEnabled } = require('./db');
 
-const RETENTION_DAYS = Number(process.env.ANALYTICS_RETENTION_DAYS) || 100;
+// Math.max(1, ...) guards against a misconfigured 0 or negative value —
+// a cutoff of "now" (or later) would delete every row on the very next
+// prune, silently wiping all analytics history rather than bounding it.
+const RETENTION_DAYS = Math.max(1, Number(process.env.ANALYTICS_RETENTION_DAYS) || 100);
 const RUN_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day is plenty
 
 function prune() {
@@ -29,6 +32,10 @@ function prune() {
 }
 
 function startRetentionLoop() {
+  if (!isAnalyticsEnabled()) {
+    logger.warn('[analytics-retention] ANALYTICS_DB_PATH not set — retention loop disabled');
+    return;
+  }
   // Run once shortly after startup too, not just once a day from now —
   // otherwise a service that restarts daily (e.g. every redeploy) could
   // go a long time before this ever actually fires.

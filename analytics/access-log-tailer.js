@@ -27,7 +27,7 @@
  */
 const fs = require('fs');
 const logger = require('../logger');
-const { getDb } = require('./db');
+const { getDb, isAnalyticsEnabled } = require('./db');
 
 const POLL_INTERVAL_MS = Number(process.env.ACCESS_LOG_POLL_INTERVAL_MS) || 5000;
 
@@ -155,6 +155,10 @@ function startAccessLogTailer() {
   const logPath = process.env.TRAEFIK_ACCESS_LOG_PATH;
   if (!logPath) {
     logger.warn('[access-log-tailer] TRAEFIK_ACCESS_LOG_PATH not set — traffic analytics disabled');
+    return;
+  }
+  if (!isAnalyticsEnabled()) {
+    logger.warn('[access-log-tailer] ANALYTICS_DB_PATH not set — traffic analytics disabled');
     return;
   }
   logger.info(`[access-log-tailer] following ${logPath} every ${POLL_INTERVAL_MS}ms`);

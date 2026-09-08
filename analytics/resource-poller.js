@@ -22,7 +22,7 @@
  * stop every other app from being sampled this tick.
  */
 const logger = require('../logger');
-const { getDb } = require('./db');
+const { getDb, isAnalyticsEnabled } = require('./db');
 
 const POLL_INTERVAL_MS = Number(process.env.RESOURCE_POLL_INTERVAL_MS) || 60000;
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
@@ -92,6 +92,10 @@ async function tick() {
 }
 
 function startResourcePoller() {
+  if (!isAnalyticsEnabled()) {
+    logger.warn('[resource-poller] ANALYTICS_DB_PATH not set — resource-usage analytics disabled');
+    return;
+  }
   logger.info(`[resource-poller] sampling every ${POLL_INTERVAL_MS}ms via ${NOMAD_ADDR}`);
   setInterval(() => {
     tick().catch((e) => logger.error(`[resource-poller] tick failed: ${e.message}`));
