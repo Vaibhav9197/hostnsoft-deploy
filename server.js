@@ -72,6 +72,11 @@ const { setDeployState, getDeployState } = require('./deploy-status');
 const { lookupProject } = require('./project-lookup');
 const { getAppLogs } = require('./app-logs');
 
+// NEW: lets an AI agent submit a feature request or piece of feedback in
+// the context of the app it's deploying — see docs/request-feature-req.md
+// (Path C). Forwards to hostnsoft-api, same shape as recordDeployment.
+const { submitFeatureRequest } = require('./feature-request');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -452,12 +457,15 @@ async function authorizeAppAccess(appName, authHeader) {
     return { ok: false, status: lookup.status, error: lookup.error };
   }
   if (lookup.isOrphan) {
-    return { ok: true };
+    // companyId returned here too (null for a still-orphan app) so
+    // callers that need it (e.g. the feature-request route, to attribute
+    // the row) don't have to look the project up a second time.
+    return { ok: true, companyId: null, isOrphan: true };
   }
   if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
     return { ok: false, status: 404, error: "Not found" };
   }
-  return { ok: true };
+  return { ok: true, companyId: callerCompanyId, isOrphan: false };
 }
 
 // Public — the URL returned in POST /apps's own response. Reports the
@@ -513,6 +521,52 @@ app.get('/apps/:appName/logs', async (req, res) => {
   const stream = req.query.stream === 'stderr' ? 'stderr' : 'stdout';
   const result = await getAppLogs(appName, { stream });
   res.json(result);
+});
+
+// Path C of docs/request-feature-req.md — an AI agent (Claude Code,
+// Claude in a chat client, ChatGPT, whatever) submitting a feature
+// request or piece of feedback about the app it's deploying. Same auth
+// shape as .../status and .../logs above (reuses authorizeAppAccess):
+// token optional, required to belong to the app's own company once
+// claimed, no token needed while it's still an unclaimed orphan.
+// X-Agent-Name is required and free text on purpose — see the doc for
+// why this must never need a code change to recognize a new agent.
+app.post('/apps/:appName/feature-requests', express.json(), async (req, res) => {
+  const { appName } = req.params;
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  const auth = await authorizeAppAccess(appName, req.headers.authorization);
+  if (!auth.ok) {
+    return res.status(auth.status).json({ error: auth.error });
+  }
+
+  const agentName = (req.headers['x-agent-name'] || '').toString().trim();
+  if (!agentName) {
+    return res.status(400).json({ error: "X-Agent-Name header is required" });
+  }
+
+  const { type, message } = req.body || {};
+  if (type !== 'feature' && type !== 'feedback') {
+    return res.status(400).json({ error: 'type must be "feature" or "feedback"' });
+  }
+  if (typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  try {
+    const result = await submitFeatureRequest({
+      type,
+      message: message.trim(),
+      projectSlug: appName,
+      agentName,
+      companyId: auth.companyId,
+    });
+    res.status(201).json(result);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // NEW: pushes an app's config (image, memory, custom domains, env vars)
