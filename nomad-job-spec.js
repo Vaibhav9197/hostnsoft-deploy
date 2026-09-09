@@ -26,6 +26,45 @@ const logger = require('./logger');
 const DNS01_CERT_RESOLVER = 'cloudflare';
 const HTTP01_CERT_RESOLVER = 'letsencrypt-http';
 
+// Applied to every app's router(s) below via a Traefik headers
+// middleware — see securityHeadersMiddlewareTags(). This platform sets
+// NO response headers of its own otherwise; what a browser actually sees
+// today is whatever the app's own container happens to set (for a
+// static build, that's Railpack's built-in Caddy default — confirmed by
+// diffing a live response against Railpack's own Caddyfile.template on
+// GitHub). That upstream default is missing 'wasm-unsafe-eval' from
+// script-src, which breaks any WASM app (Godot/Unity/Emscripten/
+// Rust-wasm exports are static builds, so they hit exactly this path)
+// with a CompileError and a blank page — WebAssembly.compile requires
+// this directive, it isn't covered by 'unsafe-inline' or 'unsafe-eval'.
+// Otherwise byte-identical to Railpack's default, so this is a strict
+// superset: nothing that worked before stops working.
+//
+// Confirmed Traefik's headers middleware REPLACES a same-name header
+// already set by the backend rather than adding a second one — if it
+// instead produced two Content-Security-Policy headers, browsers
+// enforce the INTERSECTION of both policies, which would silently drop
+// 'wasm-unsafe-eval' again and defeat this fix without looking broken
+// under a plain `curl -I` check.
+//
+// Trade-off worth knowing: this now takes precedence over any CSP an
+// app might try to set for itself (e.g. via its own Caddyfile) — not a
+// concern today since nothing at this layer previously supported a
+// per-app override anyway, but worth remembering if that's ever wanted.
+const DEFAULT_CSP =
+  "default-src 'self'; img-src 'self' data: https: *; style-src 'self' 'unsafe-inline' https: *; " +
+  "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https: *; font-src 'self' data: https: *; " +
+  "connect-src 'self' https: *; media-src 'self' https: *; object-src 'none'; frame-src 'self' https: *;";
+
+function securityHeadersMiddlewareName(appName) {
+  return `${appName}-security-headers`;
+}
+
+function securityHeadersMiddlewareTags(appName) {
+  const name = securityHeadersMiddlewareName(appName);
+  return [`traefik.http.middlewares.${name}.headers.customResponseHeaders.Content-Security-Policy=${DEFAULT_CSP}`];
+}
+
 // PORT/APP_NAME/APP_VERSION/DATA_DIR are set by this platform itself and
 // must never be overridable by a project's own configured env vars — an
 // override could break how the app is actually reached (wrong port) or
@@ -99,6 +138,7 @@ function defaultRouterTags(appName, domain) {
     `traefik.http.routers.${appName}.rule=Host(\`${domain}\`)`,
     `traefik.http.routers.${appName}.entrypoints=websecure`,
     `traefik.http.routers.${appName}.tls.certresolver=${DNS01_CERT_RESOLVER}`,
+    `traefik.http.routers.${appName}.middlewares=${securityHeadersMiddlewareName(appName)}`,
   ];
 }
 
@@ -119,6 +159,10 @@ function customDomainRouterTags(appName, customDomains) {
       `traefik.http.routers.${routerName}.rule=Host(\`${customDomain}\`)`,
       `traefik.http.routers.${routerName}.entrypoints=websecure`,
       `traefik.http.routers.${routerName}.tls.certresolver=${HTTP01_CERT_RESOLVER}`,
+      // Same security-headers middleware as the default router — a
+      // custom domain is still the same app, and shouldn't get a
+      // different (missing) CSP just because of which hostname reached it.
+      `traefik.http.routers.${routerName}.middlewares=${securityHeadersMiddlewareName(appName)}`,
     ];
   });
 }
@@ -138,6 +182,7 @@ function buildNomadJobSpec({
   const projectEnvLines = projectEnvVarLines(envVars);
   const tags = [
     'traefik.enable=true',
+    ...securityHeadersMiddlewareTags(appName),
     ...defaultRouterTags(appName, domain),
     ...customDomainRouterTags(appName, customDomains),
   ];
