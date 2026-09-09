@@ -72,10 +72,11 @@ const { setDeployState, getDeployState } = require('./deploy-status');
 const { lookupProject } = require('./project-lookup');
 const { getAppLogs } = require('./app-logs');
 
-// NEW: lets an AI agent submit a feature request or piece of feedback in
-// the context of the app it's deploying — see docs/request-feature-req.md
-// (Path C). Forwards to hostnsoft-api, same shape as recordDeployment.
-const { submitFeatureRequest } = require('./feature-request');
+// NEW: lets an AI agent submit a feature request, piece of feedback, or
+// other query in the context of the app it's deploying — see
+// docs/request-feature-req.md (Path C). Forwards to hostnsoft-api, same
+// shape as recordDeployment.
+const { submitCustomerQuery } = require('./customer-query');
 
 const app = express();
 
@@ -458,7 +459,7 @@ async function authorizeAppAccess(appName, authHeader) {
   }
   if (lookup.isOrphan) {
     // companyId returned here too (null for a still-orphan app) so
-    // callers that need it (e.g. the feature-request route, to attribute
+    // callers that need it (e.g. the customer-query route, to attribute
     // the row) don't have to look the project up a second time.
     return { ok: true, companyId: null, isOrphan: true };
   }
@@ -525,13 +526,17 @@ app.get('/apps/:appName/logs', async (req, res) => {
 
 // Path C of docs/request-feature-req.md — an AI agent (Claude Code,
 // Claude in a chat client, ChatGPT, whatever) submitting a feature
-// request or piece of feedback about the app it's deploying. Same auth
-// shape as .../status and .../logs above (reuses authorizeAppAccess):
-// token optional, required to belong to the app's own company once
-// claimed, no token needed while it's still an unclaimed orphan.
-// X-Agent-Name is required and free text on purpose — see the doc for
-// why this must never need a code change to recognize a new agent.
-app.post('/apps/:appName/feature-requests', express.json(), async (req, res) => {
+// request, feedback, or other query about the app it's deploying. Same
+// auth shape as .../status and .../logs above (reuses
+// authorizeAppAccess): token optional, required to belong to the app's
+// own company once claimed, no token needed while it's still an
+// unclaimed orphan. X-Agent-Name is required and free text on purpose —
+// see the doc for why this must never need a code change to recognize a
+// new agent.
+//
+// Renamed from /feature-requests to /customer-query (2026-09-09) — see
+// customer-query.js.
+app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
   const { appName } = req.params;
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -548,15 +553,15 @@ app.post('/apps/:appName/feature-requests', express.json(), async (req, res) => 
   }
 
   const { type, message } = req.body || {};
-  if (type !== 'feature' && type !== 'feedback') {
-    return res.status(400).json({ error: 'type must be "feature" or "feedback"' });
+  if (type !== 'feature' && type !== 'feedback' && type !== 'other') {
+    return res.status(400).json({ error: 'type must be "feature", "feedback", or "other"' });
   }
   if (typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: "message is required" });
   }
 
   try {
-    const result = await submitFeatureRequest({
+    const result = await submitCustomerQuery({
       type,
       message: message.trim(),
       projectSlug: appName,
