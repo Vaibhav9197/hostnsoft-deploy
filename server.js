@@ -78,6 +78,16 @@ const { getAppLogs } = require('./app-logs');
 // shape as recordDeployment.
 const { submitCustomerQuery } = require('./customer-query');
 
+// NEW: keeps only the last N local images per app so one-click rollback
+// always has a bounded, known-good window to roll back into (and disk
+// usage stays bounded on a host that never pushes images to a registry).
+const { pruneOldImages, IMAGE_RETAIN_COUNT } = require('./image-retention');
+
+// NEW: reports an async config-push's real outcome (see the
+// POST /internal/apps/:appName/config deploymentId branch below) back to
+// hostnsoft-api once it's known.
+const { reportConfigPushResult } = require('./report-config-push');
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -134,6 +144,12 @@ async function performBuildAndDeploy({
 
     logger.info(`[${appName}] Deploying to Nomad...`);
     await execPromise(`nomad job run ${nomadFilePath}`);
+
+    // Best-effort, after the deploy that matters has already succeeded —
+    // never lets a retention hiccup affect the response/state below.
+    await pruneOldImages(appName).catch((e) => {
+      logger.warn(`[${appName}] Image retention pass failed (continuing): ${e.message}`);
+    });
 
     await fs.remove(buildDir);
     await fs.remove(filePath);
@@ -588,7 +604,7 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
 // actually changed.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { imageTag, memoryMb, customDomains, envVars } = req.body || {};
+  const { imageTag, memoryMb, customDomains, envVars, deploymentId } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -627,7 +643,17 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     await execPromise(`docker image inspect ${imageTag}`);
   } catch (e) {
     logger.warn(`[${appName}] Requested image "${imageTag}" not found locally, refusing config update`);
-    return res.status(404).json({ error: `Image "${imageTag}" is no longer available on this host` });
+    // code + retainCount let the caller (hostnsoft-api's rollback route)
+    // build a proper client-facing message instead of a generic 502 —
+    // see docs/request-feature-req.md's sibling note on this exact case.
+    // retainCount travels with the response rather than being hardcoded
+    // on hostnsoft-api's side, so the two services can't drift apart if
+    // this ever changes.
+    return res.status(404).json({
+      error: `Image "${imageTag}" is no longer available on this host`,
+      code: 'image_unavailable',
+      retainCount: IMAGE_RETAIN_COUNT,
+    });
   }
 
   const nomadJobSpec = buildNomadJobSpec({
@@ -641,6 +667,38 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   });
 
   const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
+
+  // NEW: a deploymentId (currently only set by one-click rollback — see
+  // hostnsoft-api's deployments.routes.ts) means the caller wants the
+  // ASYNC shape: respond as soon as the image check above has passed
+  // (the one thing worth failing fast on), apply the actual Nomad job
+  // run in the background, and report the real outcome back once it's
+  // known — same "accept fast, report later" split as POST /apps itself,
+  // since applying a job spec change can take a real, user-visible
+  // amount of time. pushCustomDomainConfig (no deploymentId) deliberately
+  // keeps the ORIGINAL synchronous behavior: it marks a Domain "active"
+  // the instant this call returns success, which must still mean "fully
+  // applied" for that caller, not "accepted."
+  if (deploymentId) {
+    res.status(202).json({ accepted: true });
+
+    (async () => {
+      try {
+        await fs.ensureDir(path.dirname(nomadFilePath));
+        await fs.writeFile(nomadFilePath, nomadJobSpec);
+        logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
+        await execPromise(`nomad job run ${nomadFilePath}`);
+        await fs.remove(nomadFilePath);
+        logger.info(`[${appName}] Config update applied.`);
+        await reportConfigPushResult(deploymentId, { success: true });
+      } catch (error) {
+        logger.error(`[${appName}] Applying config update failed:`, error);
+        await reportConfigPushResult(deploymentId, { success: false, errorDetail: error.message });
+      }
+    })();
+    return;
+  }
+
   try {
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
