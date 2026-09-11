@@ -325,7 +325,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
             "redeploying: SQLite for simple key-value/document-style data, or PGlite " +
             "(@electric-sql/pglite) for relational data needing joins or queries.",
           filesDetected: storageUsage.files,
-          docs: "https://ship.hostnsoft.com/docs/storage-requirements",
+          docs: "https://embarko.ai/doc",
         });
       }
     }
