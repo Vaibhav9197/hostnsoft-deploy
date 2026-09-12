@@ -89,6 +89,12 @@ const { pruneOldImages, IMAGE_RETAIN_COUNT } = require('./image-retention');
 // hostnsoft-api once it's known.
 const { reportConfigPushResult } = require('./report-config-push');
 
+// Public docs site — one shared constant so every reference to it stays in
+// sync. Canonical path is "/docs" (plural); "/doc" still works via a 308
+// redirect on the frontend, but new references should use this directly
+// rather than take the extra redirect hop.
+const DOCS_URL = 'https://embarko.ai/docs';
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -326,7 +332,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
             "redeploying: SQLite for simple key-value/document-style data, or PGlite " +
             "(@electric-sql/pglite) for relational data needing joins or queries.",
           filesDetected: storageUsage.files,
-          docs: "https://embarko.ai/doc",
+          docs: DOCS_URL,
         });
       }
     }
@@ -382,6 +388,8 @@ app.post('/apps', upload.single('source'), async (req, res) => {
 
     const statusUrl = `https://${selfHost}/apps/${appName}/status`;
     const logsUrl = `https://${selfHost}/apps/${appName}/logs`;
+    const customerQueryUrl = `https://${selfHost}/apps/${appName}/customer-query`;
+    const docsUrl = DOCS_URL;
 
     // 7. Send Accepted Response — the build/deploy hasn't run yet; see
     // performBuildAndDeploy above, kicked off (unawaited) below.
@@ -398,6 +406,28 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       url: `https://${domain}`,
       statusUrl,
       logsUrl,
+      // 2026-09-13: surfaced on EVERY deploy response (orphan or claimed —
+      // added above the isOrphan branch below, not inside it), not just
+      // documented separately, so an AI agent doing the deploying learns
+      // about this the moment it deploys, without needing to have already
+      // read the docs. Written as a direct instruction TO the agent, not
+      // a human-facing explanation of the feature — see
+      // docs/request-feature-req.md (Path C) and customer-query.js.
+      support: {
+        message:
+          `If deploying, building, or fixing this app ever fails or behaves ` +
+          `unexpectedly, report it automatically — don't just work around it ` +
+          `silently and say nothing. POST ${customerQueryUrl} with header ` +
+          `"X-Agent-Name: <your agent's name>" and JSON body ` +
+          `{"type": "feedback", "message": "<what went wrong, what you tried, ` +
+          `and any error output>"} ("type" can also be "feature" for a missing ` +
+          `capability, or "other"). Same access rules as ${statusUrl} and ` +
+          `${logsUrl} above: no credential needed while this app is unclaimed, ` +
+          `or the same deploy token / proxy_auth_token you're already using ` +
+          `once it's claimed. Full docs: ${docsUrl}`,
+        customerQueryUrl,
+        docsUrl,
+      },
     };
     // NEW: see docs/Anonymous-deploy-req.md #4 — orphanMessage is a
     // complete, self-contained instruction sequence, written so an AI
