@@ -70,6 +70,7 @@ const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/
 // project-lookup.js back that endpoint and GET /apps/:appName/logs.
 const { setDeployState, getDeployState } = require('./deploy-status');
 const { lookupProject } = require('./project-lookup');
+const { verifyProxyAuthCompanyAccess } = require('./verify-proxy-auth');
 const { getAppLogs } = require('./app-logs');
 
 // NEW: lets an AI agent submit a feature request, piece of feedback, or
@@ -445,23 +446,40 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   }
 });
 
-// Shared by GET /apps/:appName/status and .../logs below. Same auth
-// shape as POST /apps itself (Authorization: Bearer <deploy token>,
-// optional — its absence means "only allowed if this app is still an
-// unclaimed orphan"), but deliberately does NOT reuse claim-project.js:
-// that endpoint's job is to CLAIM (auto-creating a project on first
-// sight, or adopting an orphan into the caller's company as a side
-// effect) — exactly the wrong tool for a read-only status/log check,
-// which must never mutate anything just from being looked at. Uses
-// project-lookup.js's read-only counterpart instead.
+// Shared by GET /apps/:appName/status, .../logs, and .../customer-query
+// below. Same auth shape as POST /apps itself (Authorization: Bearer
+// <deploy token>, optional — its absence means "only allowed if this app
+// is still an unclaimed orphan"), but deliberately does NOT reuse
+// claim-project.js: that endpoint's job is to CLAIM (auto-creating a
+// project on first sight, or adopting an orphan into the caller's
+// company as a side effect) — exactly the wrong tool for a read-only
+// status/log check, which must never mutate anything just from being
+// looked at. Uses project-lookup.js's read-only counterpart instead.
 //
-// A claimed app's status/logs are only visible to a token from the SAME
-// company; anyone else (including no token at all) gets 404 — never
-// 403 — so a wrong/foreign token can't even confirm the app exists,
-// same convention hostnsoft-api's own loadCompanyContext uses.
-async function authorizeAppAccess(appName, authHeader) {
+// ALSO accepts a proxy_auth_token header (2026-09-13) — the dashboard's
+// own login credential (see hostnsoft-api's docs/CLAUDE.md "Auth flow"
+// #1) — as an alternative to a deploy token for a CLAIMED app, so someone
+// already logged into the dashboard can hit these same endpoints
+// directly rather than needing to separately mint a deploy token just to
+// check their own app. Deliberately the SAME three endpoints, not new
+// ones — only checked when no deploy token was presented, and only once
+// the app is confirmed claimed (an orphan app needs no credential at all,
+// same as before, so this never even looks at proxy_auth_token for one).
+// Unlike a deploy token, a PAT isn't itself scoped to one company, so
+// verifyProxyAuthCompanyAccess is asked about THIS app's specific company.
+//
+// A claimed app's status/logs are only visible to a token (of either
+// kind) tied to the SAME company; anyone else (including no credential at
+// all) gets 404 — never 403 — so a wrong/foreign credential can't even
+// confirm the app exists, same convention hostnsoft-api's own
+// loadCompanyContext uses. A credential that's PRESENT but itself invalid
+// (a bad deploy token, or a rejected/expired PAT) is 401 instead — "your
+// credential is wrong" reads differently from "this isn't your app".
+async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
   let callerCompanyId = null;
+  let deployTokenPresented = false;
   if (authHeader) {
+    deployTokenPresented = true;
     const token = authHeader.split(' ')[1];
     if (!token) return { ok: false, status: 401, error: "Unauthorized" };
     const validation = await validateDeployTokenWithCompany(token);
@@ -479,6 +497,17 @@ async function authorizeAppAccess(appName, authHeader) {
     // the row) don't have to look the project up a second time.
     return { ok: true, companyId: null, isOrphan: true };
   }
+
+  // Only reached for a CLAIMED app, and only when no deploy token was
+  // already presented above — a deploy token remains the primary/unchanged
+  // path for every existing agent/CI caller.
+  if (!deployTokenPresented && proxyAuthTokenHeader) {
+    const membership = await verifyProxyAuthCompanyAccess(proxyAuthTokenHeader, lookup.companyId);
+    if (!membership.valid) return { ok: false, status: 401, error: "Unauthorized" };
+    if (!membership.isMember) return { ok: false, status: 404, error: "Not found" };
+    callerCompanyId = lookup.companyId;
+  }
+
   if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
     return { ok: false, status: 404, error: "Not found" };
   }
@@ -497,7 +526,7 @@ app.get('/apps/:appName/status', async (req, res) => {
     return res.status(400).json({ error: "Invalid app name" });
   }
 
-  const auth = await authorizeAppAccess(appName, req.headers.authorization);
+  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
   if (!auth.ok) {
     return res.status(auth.status).json({ error: auth.error });
   }
@@ -530,7 +559,7 @@ app.get('/apps/:appName/logs', async (req, res) => {
     return res.status(400).json({ error: "Invalid app name" });
   }
 
-  const auth = await authorizeAppAccess(appName, req.headers.authorization);
+  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
   if (!auth.ok) {
     return res.status(auth.status).json({ error: auth.error });
   }
@@ -558,7 +587,7 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
     return res.status(400).json({ error: "Invalid app name" });
   }
 
-  const auth = await authorizeAppAccess(appName, req.headers.authorization);
+  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
   if (!auth.ok) {
     return res.status(auth.status).json({ error: auth.error });
   }
