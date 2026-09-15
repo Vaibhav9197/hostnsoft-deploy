@@ -136,8 +136,16 @@ const CAPABILITIES = {
 
   // Only values the code actually enforces. See the header comment.
   limits: {
+    // Ceilings (Nomad `memory_max`), i.e. the most a task may use and the
+    // number it gets OOM-killed at — unchanged, and still the number that
+    // matters when sizing an app. Tasks are SCHEDULED against the much
+    // lower *_floor_* values below and burst up to the ceiling when the
+    // host has room, so memory above the floor is best-effort rather than
+    // reserved. See docs/Memory-oversubscription-req.md.
     memory_mb_default: 256,
     memory_mb_with_embedded_db: 512,
+    memory_mb_scheduling_floor: 64,
+    memory_mb_scheduling_floor_with_embedded_db: 128,
     app_name_pattern: '^[a-z0-9-]+$',
     app_name_scope: 'platform_wide',
     app_name_min_length: 3,

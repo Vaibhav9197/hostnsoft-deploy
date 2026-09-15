@@ -48,6 +48,31 @@ const { claimProject } = require('./claim-project');
 const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
+// ---------------------------------------------------------------------------
+// Memory policy — see docs/Memory-oversubscription-req.md.
+//
+// Every app now gets TWO numbers in its Nomad job spec instead of one: a
+// low `memory` the scheduler packs against, and the `memory_max` ceiling
+// it may actually burst up to. The CEILING values below are exactly the
+// numbers that used to be the single flat reservation (and are still what
+// capabilities.js publishes and what hostnsoft-api persists as
+// Project.memoryMb) — no app's real limit changed. Only the number Nomad
+// bin-packs against got lower.
+//
+// The floors come from real `docker stats` data off the live server:
+// typical apps sit at 20-150MB against a 256MB reservation, so packing
+// against 256 was causing "resources exhausted" placement failures on a
+// box with plenty of free RAM. 64/128 roughly match observed steady-state
+// usage; a task that needs more still gets it, up to its ceiling.
+//
+// Applies to new deploys only. Already-running apps keep whatever job
+// spec they were last deployed with until their next deploy — nothing
+// needs to be restarted for this to take effect.
+const MEMORY_CEILING_MB = 256;
+const MEMORY_CEILING_EMBEDDED_DB_MB = 512;
+const SCHEDULING_FLOOR_MB = 64;
+const SCHEDULING_FLOOR_EMBEDDED_DB_MB = 128;
+
 // NEW: GET /internal/apps/:appName/status — real Nomad allocation status,
 // backing hostnsoft-api's project-health field (previously hardcoded to
 // "unknown"). See app-health.js.
@@ -126,7 +151,7 @@ const upload = multer({ dest: '/tmp/platform-uploads/' });
 // here instead.
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, taskMemory, hasValidToken, token, deploymentId,
+  claim, taskMemory, schedulingFloorMb, hasValidToken, token, deploymentId,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -141,6 +166,7 @@ async function performBuildAndDeploy({
       imageName,
       appVersion,
       taskMemory,
+      schedulingFloorMb,
       customDomains: claim.customDomains || [],
       envVars: claim.envVars || [],
       isOrphan: claim.isOrphan,
@@ -370,10 +396,22 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // regress every embedded-DB app that never touched this setting.
     // Math.max lets an explicit HIGHER value win, while the auto-detected
     // minimum always still applies.
+    //
+    // NEW: what this detection produces is now the task's memory_max
+    // CEILING rather than its flat reservation — same number, same
+    // Math.max-with-configured-value rule, unchanged. What's new is
+    // schedulingFloorMb alongside it: the much lower number Nomad's
+    // scheduler actually packs against. The floor is keyed off the same
+    // usesEmbeddedDb signal (an embedded DB has a genuinely higher
+    // baseline, not just a higher peak) and deliberately NOT off the
+    // configured memoryMb — raising a project's memory is a request for
+    // more headroom, not a promise to use it, so it should lift the
+    // ceiling without making the app harder to place.
     const usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
-    const autoDetectedMemory = usesEmbeddedDb ? 512 : 256;
+    const autoDetectedMemory = usesEmbeddedDb ? MEMORY_CEILING_EMBEDDED_DB_MB : MEMORY_CEILING_MB;
     const taskMemory = Math.max(autoDetectedMemory, claim.memoryMb || autoDetectedMemory);
-    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} (min ${autoDetectedMemory}MB), configured: ${claim.memoryMb ?? 'none'}MB -> using ${taskMemory}MB`);
+    const schedulingFloorMb = usesEmbeddedDb ? SCHEDULING_FLOOR_EMBEDDED_DB_MB : SCHEDULING_FLOOR_MB;
+    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} (min ${autoDetectedMemory}MB), configured: ${claim.memoryMb ?? 'none'}MB -> scheduling floor ${schedulingFloorMb}MB, burst ceiling ${taskMemory}MB`);
 
     // NEW: from here on, the actual build (railpack, which can easily
     // take minutes for a fresh install) and the Nomad deploy run in the
@@ -468,7 +506,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     performBuildAndDeploy({
       appName, appVersion, imageName, domain,
       buildDir, filePath: req.file.path,
-      claim, taskMemory, hasValidToken, token, deploymentId,
+      claim, taskMemory, schedulingFloorMb, hasValidToken, token, deploymentId,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
@@ -703,7 +741,19 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   // POST /apps above and stored as Deployment.imageTag in hostnsoft-api)
   // — the version is whatever follows the first colon.
   const appVersion = imageTag.slice(imageTag.indexOf(':') + 1);
-  const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : 256;
+  const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : MEMORY_CEILING_MB;
+  // No build dir here (that's the whole point of this endpoint), so the
+  // embedded-DB dependency scan that picks the floor on a real deploy
+  // can't run. The ceiling is the surviving signal: hostnsoft-api keeps
+  // Project.memoryMb in sync with the memory actually applied on each
+  // successful deploy (see internalDeployments.routes.ts), and the only
+  // thing that pushes that to 512 by itself is embedded-DB detection.
+  // Inferring from it errs the safe way — a non-embedded-DB app whose
+  // owner configured >=512MB gets the higher 128MB floor, which merely
+  // packs slightly less aggressively; an embedded-DB app can never come
+  // out UNDER-floored, since its ceiling is always at least 512.
+  const schedulingFloorMb =
+    taskMemory >= MEMORY_CEILING_EMBEDDED_DB_MB ? SCHEDULING_FLOOR_EMBEDDED_DB_MB : SCHEDULING_FLOOR_MB;
   const domain = defaultDomainFor(appName);
 
   // NEW: this endpoint now also backs one-click rollback (see
@@ -738,6 +788,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     imageName: imageTag,
     appVersion,
     taskMemory,
+    schedulingFloorMb,
     customDomains,
     envVars: envVars || [],
   });

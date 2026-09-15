@@ -167,12 +167,36 @@ function customDomainRouterTags(appName, customDomains) {
   });
 }
 
+// Emits the `memory` / `memory_max` pair for a task's resources block.
+//
+// Clamped rather than trusted: Nomad rejects a job whose memory_max is
+// below its memory, and the ceiling can legitimately come out lower than
+// the floor (a project whose owner configured an unusually small
+// memoryMb through hostnsoft-api, which only validates it as a positive
+// integer). In that case the floor is dropped and a single flat `memory`
+// is emitted, exactly as before this feature existed — an app asking for
+// less than the floor is already small enough that there's nothing to
+// oversubscribe. memory_max is likewise omitted when the two are equal,
+// since declaring a ceiling identical to the reservation buys nothing.
+function memoryResourceLines(taskMemory, schedulingFloorMb) {
+  const floor =
+    typeof schedulingFloorMb === 'number' && schedulingFloorMb > 0
+      ? Math.min(schedulingFloorMb, taskMemory)
+      : taskMemory;
+
+  if (floor >= taskMemory) {
+    return `        cpu    = 100\n        memory = ${taskMemory}`;
+  }
+  return `        cpu        = 100\n        memory     = ${floor}\n        memory_max = ${taskMemory}`;
+}
+
 function buildNomadJobSpec({
   appName,
   domain,
   imageName,
   appVersion,
   taskMemory,
+  schedulingFloorMb,
   customDomains = [],
   envVars = [],
   isOrphan = false,
@@ -203,6 +227,25 @@ function buildNomadJobSpec({
   const appPortLabel = isOrphan ? 'app' : 'http';
 
   const sidecarNetworkPort = isOrphan ? '\n      port "app"  {}' : '';
+
+  // Memory oversubscription (see docs/Memory-oversubscription-req.md).
+  // `memory` is what Nomad's scheduler PACKS against; `memory_max` is the
+  // ceiling a task may burst to when the host has spare capacity at that
+  // moment. Real `docker stats` data showed most apps sitting at 20-150MB
+  // against a flat 256MB reservation, so scheduling against the flat
+  // number caused "resources exhausted" placement failures long before
+  // the box was actually full. The ceiling here is the SAME
+  // embedded-DB-aware number that used to be the flat reservation — an
+  // app's real limit is unchanged, only what it's scheduled against is
+  // lower.
+  //
+  // Requires memory oversubscription to be enabled cluster-wide
+  // (`nomad operator scheduler set-config -memory-oversubscription=true`,
+  // done by Server-setup/server-setup.sh) — without it Nomad accepts the
+  // job but ignores memory_max, which silently means every task gets the
+  // low floor as a hard cap. If apps start OOMing right after a host
+  // rebuild, check that setting first.
+  const memoryLines = memoryResourceLines(taskMemory, schedulingFloorMb);
 
   const sidecarTask = isOrphan ? `
     # Only present for orphan (anonymous, unclaimed) deploys — see above.
@@ -273,8 +316,7 @@ ${tagLines}
 ${projectEnvLines}
       }
       resources {
-        cpu    = 100
-        memory = ${taskMemory}
+${memoryLines}
       }
     }
 ${sidecarTask}

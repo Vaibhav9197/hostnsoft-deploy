@@ -72,7 +72,15 @@ during a real production investigation (see session log for detail):
 
 - **Memory limits are real and enforced** (Docker/cgroup-level, per
   container) — confirmed via an actual OOM incident where the kernel
-  killed one container's process without affecting others.
+  killed one container's process without affecting others. Since memory
+  oversubscription, the enforced number is the job spec's `memory_max`
+  (256/512MB — the same value that used to be the flat reservation), NOT
+  its `memory`, which is only what the scheduler bin-packs against
+  (64/128MB). Requires `nomad operator scheduler set-config
+  -memory-oversubscription=true` cluster-wide, done by
+  `Server-setup/server-setup.sh` — with it off Nomad silently ignores
+  `memory_max` and the low floor becomes a hard cap instead. See
+  `docs/Memory-oversubscription-req.md`.
 - **CPU limits are NOT hard-enforced today.** The job spec's `cpu = 100`
   becomes a relative `--cpu-shares` weight, not a cap, unless the Nomad
   client config sets `cpu_hard_limit = true` (unconfirmed whether it is).
