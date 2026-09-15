@@ -25,6 +25,32 @@ const crypto = require('crypto');
 const CAPABILITIES = {
   capabilities_version: '2026-09-15',
 
+  // Where an agent goes for anything beyond deploy/status/logs. Same
+  // deploy token, addressed by app name rather than by the internal ids
+  // the dashboard uses.
+  control_plane: {
+    base: 'https://ship.embarko.ai/api/apps/<app-name>',
+    auth: 'Authorization: Bearer <deploy token>',
+    operations: {
+      get_app: 'GET /',
+      list_env_vars: 'GET /env-vars',
+      set_env_vars: 'PUT /env-vars',
+      update_env_var: 'PUT /env-vars/<key>',
+      delete_env_var: 'DELETE /env-vars/<key>',
+      apply_env_vars: 'POST /env-vars/apply',
+      list_deployments: 'GET /deployments',
+      get_deployment: 'GET /deployments/<id>',
+      rollback: 'POST /rollback',
+    },
+    // Reading a value back is deliberately not offered — see the
+    // env-vars route's own comment.
+    env_var_values_readable: false,
+    // Env vars are baked into the job spec at deploy time, so a write
+    // alone never reaches the running container. `apply` re-pushes the
+    // current image with the new values — no rebuild, no source upload.
+    env_var_writes_need_apply: true,
+  },
+
   // The contract an app's own code has to satisfy to run here at all.
   runtime: {
     port_env: 'PORT',
@@ -91,10 +117,13 @@ const CAPABILITIES = {
     deploy_status: { status: 'available', via: ['agent', 'dashboard'] },
     logs: { status: 'available', via: ['agent', 'dashboard'] },
     feedback: { status: 'available', via: ['agent', 'dashboard'] },
-    env_vars: { status: 'available', via: ['dashboard'] },
-    rollback: { status: 'available', via: ['dashboard'] },
+    // An agent reaches these with its deploy token, addressed by app name,
+    // under https://ship.embarko.ai/api/apps/<name>/... — see
+    // hostnsoft-api's routes/agentApps.routes.ts.
+    env_vars: { status: 'available', via: ['agent', 'dashboard'] },
+    rollback: { status: 'available', via: ['agent', 'dashboard'] },
+    deployment_history: { status: 'available', via: ['agent', 'dashboard'] },
     custom_domains: { status: 'available', via: ['dashboard'] },
-    deployment_history: { status: 'available', via: ['dashboard'] },
     memory_config: { status: 'available', via: ['dashboard'] },
     delete_app: { status: 'available', via: ['dashboard'] },
     analytics: { status: 'available', via: ['dashboard'] },
