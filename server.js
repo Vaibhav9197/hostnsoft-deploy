@@ -88,6 +88,7 @@ const { pruneOldImages, IMAGE_RETAIN_COUNT } = require('./image-retention');
 // POST /internal/apps/:appName/config deploymentId branch below) back to
 // hostnsoft-api once it's known.
 const { reportConfigPushResult } = require('./report-config-push');
+const { CAPABILITIES_BODY, CAPABILITIES_ETAG } = require('./capabilities');
 
 // Public docs site — one shared constant so every reference to it stays in
 // sync. Canonical path is "/docs" (plural); "/doc" still works via a 308
@@ -212,6 +213,22 @@ async function performBuildAndDeploy({
     });
   }
 }
+
+// The contract an agent reads before designing or deploying an app —
+// runtime requirements, how to get a credential, what persists, and which
+// features it can actually invoke itself. Unauthenticated on purpose: an
+// agent needs this BEFORE it has a token, and it's the same answer for
+// everyone. See capabilities.js for what may and may not go in it.
+app.get('/capabilities', (req, res) => {
+  res.setHeader('ETag', CAPABILITIES_ETAG);
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+  // A revalidating client costs us nothing and costs the agent no tokens.
+  if (req.headers['if-none-match'] === CAPABILITIES_ETAG) return res.status(304).end();
+
+  res.status(200).send(CAPABILITIES_BODY);
+});
 
 app.post('/apps', upload.single('source'), async (req, res) => {
   const authHeader = req.headers.authorization;
