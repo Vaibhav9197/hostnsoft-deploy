@@ -140,6 +140,15 @@ const CAPABILITIES = {
     memory_mb_with_embedded_db: 512,
     app_name_pattern: '^[a-z0-9-]+$',
     app_name_scope: 'platform_wide',
+    app_name_min_length: 3,
+    app_name_max_length: 63,
+    // An app name becomes a hostname, so some are kept by the platform.
+    // Published here so a name can be chosen before packaging and
+    // uploading, rather than learning it from a rejected deploy. Refused
+    // with code "app_name_reserved" — unlike "app_name_taken", this one
+    // never becomes available, so don't retry it.
+    app_name_reserved_examples: ['ship', 'api', 'www', 'login', 'docs', 'admin', 'mail'],
+    app_name_reserved_url: 'https://embarko.ai/docs#app-names',
     app_version_pattern: '^[a-zA-Z0-9._-]+$',
   },
 

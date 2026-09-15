@@ -39,7 +39,19 @@ async function claimProject(token, slug) {
 
   if (response.status === 409) {
     const body = await response.json().catch(() => ({}));
-    return { ok: false, status: 409, code: 'app_name_taken', error: body.error || `App name "${slug}" is already in use` };
+    // Pass hostnsoft-api's own code through rather than assuming
+    // "taken": a 409 here is also how a RESERVED name is refused
+    // (app_name_reserved, app_name_too_short/_too_long), and those mean
+    // something different to the caller. "Taken" invites retrying the
+    // same name later; "reserved" never becomes available, so an agent
+    // told the wrong one retries forever. Falls back to app_name_taken
+    // so an older hostnsoft-api that sends no code still behaves as it did.
+    return {
+      ok: false,
+      status: 409,
+      code: body.code || 'app_name_taken',
+      error: body.error || `App name "${slug}" is already in use`,
+    };
   }
 
   if (!response.ok) {
