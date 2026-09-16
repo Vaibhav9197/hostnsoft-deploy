@@ -144,7 +144,7 @@ const CAPABILITIES = {
     // reserved. See docs/Memory-oversubscription-req.md.
     memory_mb_default: 256,
     memory_mb_with_embedded_db: 512,
-    memory_mb_scheduling_floor: 64,
+    memory_mb_scheduling_floor: 32,
     memory_mb_scheduling_floor_with_embedded_db: 128,
     app_name_pattern: '^[a-z0-9-]+$',
     app_name_scope: 'platform_wide',

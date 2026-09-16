@@ -62,15 +62,17 @@ const { requireInternalSecret } = require('./internal-auth');
 // The floors come from real `docker stats` data off the live server:
 // typical apps sit at 20-150MB against a 256MB reservation, so packing
 // against 256 was causing "resources exhausted" placement failures on a
-// box with plenty of free RAM. 64/128 roughly match observed steady-state
-// usage; a task that needs more still gets it, up to its ceiling.
+// box with plenty of free RAM. 32/128 deliberately sit at the LOW end of
+// that observed range rather than at its middle — the floor only has to
+// be enough to schedule against, since everything above it is available
+// as burst. A task that needs more still gets it, up to its ceiling.
 //
 // Applies to new deploys only. Already-running apps keep whatever job
 // spec they were last deployed with until their next deploy — nothing
 // needs to be restarted for this to take effect.
 const MEMORY_CEILING_MB = 256;
 const MEMORY_CEILING_EMBEDDED_DB_MB = 512;
-const SCHEDULING_FLOOR_MB = 64;
+const SCHEDULING_FLOOR_MB = 32;
 const SCHEDULING_FLOOR_EMBEDDED_DB_MB = 128;
 
 // NEW: GET /internal/apps/:appName/status — real Nomad allocation status,

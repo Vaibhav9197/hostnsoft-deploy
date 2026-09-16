@@ -76,7 +76,7 @@ during a real production investigation (see session log for detail):
   oversubscription, the enforced number is the job spec's `memory_max`
   (256/512MB — the same value that used to be the flat reservation), NOT
   its `memory`, which is only what the scheduler bin-packs against
-  (64/128MB). Requires `nomad operator scheduler set-config
+  (32/128MB). Requires `nomad operator scheduler set-config
   -memory-oversubscription=true` cluster-wide, done by
   `Server-setup/server-setup.sh` — with it off Nomad silently ignores
   `memory_max` and the low floor becomes a hard cap instead. See
