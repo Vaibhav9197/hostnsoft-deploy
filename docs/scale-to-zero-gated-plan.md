@@ -22,7 +22,7 @@ completes it.
 | 0 | `DATA_DIR` on a host bind mount | **Shipped, live** — one GC check outstanding |
 | 1 | Request activity tracking | **Done** |
 | 2 | Idle detection, dry-run only | **Done** |
-| 3 | Real stop, one hardcoded test app | **Code shipped, NOT yet verified** |
+| 3 | Real stop, one hardcoded test app | **Code shipped, NOT yet verified** — job-spec capture added |
 | 4 | Activator (wake-on-request) | Not started |
 | 5 | Unattended 24-48h run | Not started |
 | 6 | A few real, consenting apps | Not started |
@@ -81,7 +81,10 @@ network namespace — same discovery as `ORIGIN_IP` in
       the guarantee that already existed).
 - [ ] `nomad job stop` it, wait past `job_gc_threshold`, re-run the job —
       confirm the data is STILL there. This is the whole point of the
-      step; if this check fails, nothing after it is safe.
+      step; if this check fails, nothing after it is safe. Re-run it from
+      the spec `idle-report.js` saved under `$APP_DATA_ROOT/.specs/`, NOT
+      from Nomad: by the time this check is due, Nomad has GC'd the
+      stopped job and no longer has the spec (see Step 3).
 - [x] Confirm the container can actually write to the mount (Railpack
       images don't all run as root — deploy-service chmods each app's
       directory 0777 as it creates it).
@@ -186,6 +189,29 @@ which Step 4 depends on:
   can assert the data is intact BEFORE serving a woken app — an app that
   wakes to an empty DATA_DIR usually just creates a fresh database and
   reports itself healthy, which is the silent-data-loss case.
+
+**A prerequisite discovered while verifying this step: the job spec.**
+`deploy-service` renders each app's spec into a temp build directory,
+runs it and deletes the file (`server.js`), so after a deploy the only
+copy lives in Nomad's own state — and `job_gc_threshold` (4h) collects a
+*stopped* job out of that state. At that moment the spec is gone: nothing
+for Step 4's activator to run, and no recovery short of a fresh deploy
+from source. The window in which a stopped app can be woken was
+therefore 4 hours, and it closed silently.
+
+`idle-report.js` now runs `nomad job inspect` and writes the result to
+`$APP_DATA_ROOT/.specs/<appName>.json` **before** the stop, and treats a
+capture failure as a reason to abort the stop — an app we cannot prove we
+can restart does not get stopped. `nomad job inspect` emits
+`{"Job": {...}}`, which `nomad job run -json` takes back unchanged.
+`server.js`'s delete endpoint removes the saved spec along with the data,
+so deleting an app stays final rather than leaving a runnable description
+of it where the activator looks.
+
+**Still owed before Step 6**: this captures the spec at *stop* time, which
+covers the apps this mechanism actually stops. Extending scale-to-zero to
+real apps wants `server.js` persisting the spec at *deploy* time instead,
+so a spec exists before anything has ever tried to stop the app.
 
 **Verification before moving on**:
 - [ ] Let the test app sit idle past the threshold, run the script in

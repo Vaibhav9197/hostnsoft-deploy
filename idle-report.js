@@ -220,6 +220,46 @@ async function snapshotAppData(appName) {
   return { dest, manifest };
 }
 
+// Capture the app's Nomad job spec to disk BEFORE stopping it.
+//
+// This is a hard prerequisite for Step 4, not a nicety. deploy-service
+// renders each job spec into a temp build directory, runs it, and
+// deletes the file (server.js) — so after a deploy the ONLY copy of an
+// app's spec lives inside Nomad's own state. `job_gc_threshold`
+// (4h by default) garbage collects a STOPPED job out of that state, and
+// at that moment the spec is gone for good: there is nothing left for an
+// activator to `nomad job run`, and no way to recover the app short of a
+// fresh deploy from source.
+//
+// So the window in which a stopped app can be woken is currently the GC
+// threshold, and it closes silently. Writing the spec out here makes
+// waking independent of Nomad's retention entirely.
+//
+// Before the stop, deliberately: `nomad job inspect` on an already-GC'd
+// job returns nothing, and the whole point is to hold a copy that
+// outlives GC. A capture failure ABORTS the stop — an app we cannot
+// prove we can restart must not be stopped.
+//
+// `nomad job inspect` emits `{"Job": {...}}`, which is exactly what
+// `nomad job run -json` accepts back, so no transformation is needed.
+async function captureJobSpec(appName) {
+  const specDir = appDataPathFor('.specs');
+  const dest = `${specDir}/${appName}.json`;
+  const { stdout } = await execFileAsync('nomad', ['job', 'inspect', appName]);
+
+  // Guard against writing an empty or unparseable file over a good one:
+  // a truncated spec would look like a successful capture and only fail
+  // at wake time, which is the worst moment to discover it.
+  const parsed = JSON.parse(stdout);
+  if (!parsed.Job || parsed.Job.ID !== appName) {
+    throw new Error(`inspect returned no Job for "${appName}"`);
+  }
+
+  await fsp.mkdir(specDir, { recursive: true });
+  await fsp.writeFile(dest, stdout);
+  return dest;
+}
+
 async function stopApp(appName) {
   // Belt and braces on top of the caller's own check: this function is
   // the one that shells out, so it re-asserts the rail itself rather
@@ -328,6 +368,17 @@ async function main() {
     }
     if (await hasDeployInFlight(row.appName)) {
       console.log('  ABORT — a deploy is in flight');
+      continue;
+    }
+
+    // Before the stop, and fatal to this app's stop if it fails: see
+    // captureJobSpec. An app whose spec we could not save is an app we
+    // could not wake once Nomad GCs the stopped job.
+    try {
+      const specPath = await captureJobSpec(row.appName);
+      console.log(`  job spec saved -> ${specPath}`);
+    } catch (e) {
+      console.log(`  ABORT — could not save job spec (${e.message}); refusing to stop an app we may not be able to restart`);
       continue;
     }
 

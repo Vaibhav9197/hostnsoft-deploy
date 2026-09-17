@@ -976,6 +976,17 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
       // fail a teardown that has otherwise completed.
       logger.warn(`[${appName}] Could not remove data directory ${appDataDir}: ${e.message}`);
     });
+
+    // idle-report.js saves a stopped app's Nomad job spec under
+    // $APP_DATA_ROOT/.specs so a scale-to-zero app stays wakeable after
+    // Nomad garbage collects the stopped job. A spec left behind for a
+    // DELETED app is worse than clutter: it is a complete, runnable
+    // description of an app the user asked us to remove, sitting exactly
+    // where the activator looks. Removed here so deletion stays final.
+    const appSpecFile = `${appDataPathFor('.specs')}/${appName}.json`;
+    await fs.remove(appSpecFile).catch((e) => {
+      logger.warn(`[${appName}] Could not remove saved job spec ${appSpecFile}: ${e.message}`);
+    });
     await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
       logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);
     });
