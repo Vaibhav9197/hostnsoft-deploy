@@ -45,7 +45,7 @@ const { claimProject } = require('./claim-project');
 // APPS_DOMAIN_SUFFIX's fail-fast check now lives inside this module (see
 // its defaultDomainFor) rather than here, since both this file and the
 // config endpoint below need it.
-const { buildNomadJobSpec, defaultDomainFor } = require('./nomad-job-spec');
+const { buildNomadJobSpec, defaultDomainFor, appDataPathFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
 // ---------------------------------------------------------------------------
@@ -149,6 +149,28 @@ app.use((req, res, next) => {
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
 
+// Creates this app's host data directory before Nomad is asked to bind
+// mount it. Docker would otherwise create a missing bind-mount source
+// itself, but as root and mode 0755 — and Railpack images do not
+// necessarily run as root, so the app would get a directory it cannot
+// write to and fail at runtime rather than at deploy time. Creating it
+// here with an explicit permissive mode avoids depending on whatever
+// user a given app's image happens to run as.
+//
+// Idempotent, and deliberately never removes anything: this runs on
+// every deploy of an existing app too, where the directory already
+// exists and holds the app's live database. Deleting an app's data is
+// the delete endpoint's job alone (see DELETE /internal/apps/:appName).
+async function ensureAppDataDir(appName) {
+  const dir = appDataPathFor(appName);
+  await fs.ensureDir(dir);
+  // ensureDir's own mode argument only applies to directories it
+  // actually creates, so chmod separately to also correct a directory
+  // that already exists from an earlier, stricter default.
+  await fs.chmod(dir, 0o777);
+  return dir;
+}
+
 // Runs the actually-slow part of a deploy (railpack build + `nomad job
 // run`) — split out of the request handler below so it can continue
 // AFTER the response is already sent (see the handler's own comment for
@@ -164,6 +186,11 @@ async function performBuildAndDeploy({
     // Railpack's CLI takes the directory as a positional arg and the
     // image tag via --name.
     await execPromise(`cd ${buildDir} && railpack build . --name ${imageName}`);
+
+    // Before the job spec is applied, not after — Nomad's bind mount
+    // needs this to exist and be writable at container start.
+    const appDataDir = await ensureAppDataDir(appName);
+    logger.info(`[${appName}] Data directory ready at ${appDataDir}`);
 
     logger.info(`[${appName}] Generating Nomad file...`);
     const nomadJobSpec = buildNomadJobSpec({
@@ -796,6 +823,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
 
     (async () => {
       try {
+        await ensureAppDataDir(appName);
         await fs.ensureDir(path.dirname(nomadFilePath));
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
@@ -812,6 +840,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   }
 
   try {
+    await ensureAppDataDir(appName);
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
@@ -853,6 +882,25 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
       // not-found detection to app-health.js's GET .../status endpoint.
       const output = `${e.stdout || ''}${e.stderr || ''}`;
       if (!/no job\(s\) with prefix or id/i.test(output)) throw e;
+    });
+
+    // Now that DATA_DIR is a host directory rather than the allocation's
+    // own ephemeral disk, purging the Nomad job no longer takes the app's
+    // data with it — so deleting it is an explicit step, and this is the
+    // ONLY place in the codebase that does it. Nothing on the
+    // scale-to-zero path (which stops jobs but keeps them) may ever touch
+    // this: see docs/scale-to-zero-gated-plan.md Step 0.
+    //
+    // After the job stop, not before: removing a running container's bind
+    // mount source out from under it is how you corrupt a database rather
+    // than delete one.
+    const appDataDir = appDataPathFor(appName);
+    await fs.remove(appDataDir).catch((e) => {
+      // Best-effort, same posture as the not-found handling above — an
+      // app whose deploy never succeeded may have no data directory, and
+      // a leftover directory is a disk-usage problem, not a reason to
+      // fail a teardown that has otherwise completed.
+      logger.warn(`[${appName}] Could not remove data directory ${appDataDir}: ${e.message}`);
     });
     await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
       logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);

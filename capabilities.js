@@ -105,6 +105,16 @@ const CAPABILITIES = {
     data_dir_env: 'DATA_DIR',
     durability: 'node_local',
     survives_redeploy: true,
+    // NEW: DATA_DIR is a host directory bind-mounted into the container,
+    // not the Nomad allocation's own ephemeral disk — so it now also
+    // survives the app being STOPPED, which the allocation-scoped version
+    // did not (Nomad garbage-collects a stopped job's alloc dir). This is
+    // what makes scale-to-zero safe for an app with a database.
+    survives_stop: true,
+    // Still node_local: a bind mount is a path on ONE box. Nothing here
+    // replicates, and an agent choosing where to put a database needs to
+    // know that before it writes the code rather than after the node is
+    // gone.
     survives_node_loss: false,
     backups: false,
   },

@@ -198,12 +198,16 @@ function buildNomadJobSpec({
   taskMemory,
   schedulingFloorMb,
   customDomains = [],
+  // Defaults to this app's own host data directory; callers never need
+  // to pass it, but it stays injectable for tests.
+  appDataPath = undefined,
   envVars = [],
   isOrphan = false,
   orphanExpiresAt,
   orphanLoginUrl,
 }) {
   const projectEnvLines = projectEnvVarLines(envVars);
+  const resolvedAppDataPath = appDataPath || appDataPathFor(appName);
   const tags = [
     'traefik.enable=true',
     ...securityHeadersMiddlewareTags(appName),
@@ -283,9 +287,11 @@ job "${appName}" {
       port "http" {}${sidecarNetworkPort}
     }
 
-    # Persists /alloc/data across redeploys by biasing the scheduler to reuse
-    # the same client node, and migrating the data if it ever can't.
-    # Apps that don't use DATA_DIR simply ignore this — it's opt-in.
+    # NOTE: this no longer backs DATA_DIR — that moved to a host bind mount
+    # (see appDataPathFor above and the volumes line below) so it survives
+    # the job being STOPPED, not just redeployed. Kept because it still
+    # sizes and node-biases the allocation's own scratch space, which
+    # Nomad uses regardless.
     ephemeral_disk {
       size    = 500
       sticky  = true
@@ -307,12 +313,23 @@ ${tagLines}
         image      = "${imageName}"
         ports      = ["${appPortLabel}"]
         force_pull = false # Use the local image we just built
+        # Host bind mount, NOT a Nomad volume — needs no host_volume
+        # declaration in nomad.hcl (the docker plugin there already sets
+        # `volumes { enabled = true }`), and gives each app its own
+        # directory rather than one shared mount every app can read.
+        # Deliberately mounted at /data rather than over /alloc/data:
+        # bind-mounting on top of Nomad's own allocation directory fights
+        # with how Nomad manages it.
+        volumes = ["${resolvedAppDataPath}:/data"]
       }
       env {
         PORT        = "\${NOMAD_PORT_${appPortLabel}}"
         APP_NAME    = "${appName}"
         APP_VERSION = "${appVersion}"
-        DATA_DIR    = "/alloc/data"
+        # Moved off /alloc/data — see appDataPathFor's comment. Apps read
+        # this variable rather than hardcoding a path (it is reserved, so
+        # a project cannot override it), so they follow automatically.
+        DATA_DIR    = "/data"
 ${projectEnvLines}
       }
       resources {
@@ -358,6 +375,45 @@ if (!process.env.ORIGIN_IP) {
   );
 }
 const ORIGIN_IP = process.env.ORIGIN_IP;
+
+// Where each app's DATA_DIR lives ON THE HOST, one directory per app.
+//
+// Before this existed, DATA_DIR pointed at /alloc/data — Nomad's own
+// ephemeral allocation directory, kept across redeploys only by
+// `ephemeral_disk { sticky = true }` biasing the scheduler back to the
+// same node. That is fine for a redeploy (the job stays alive, so the
+// new allocation can inherit the old one's disk) but NOT for stopping a
+// job: Nomad garbage-collects stopped jobs after job_gc_threshold (4h by
+// default), and the allocation directory goes with them. Any app with a
+// SQLite database under DATA_DIR would wake up empty — and, worse,
+// silently, since an app that finds no database usually just creates a
+// fresh one and looks perfectly healthy.
+//
+// A host path outside the allocation removes that entire class of
+// failure: the data is simply not owned by the thing being stopped. This
+// is the prerequisite for scale-to-zero (see
+// docs/scale-to-zero-gated-plan.md Step 0) — nothing may stop an app
+// until its data lives here.
+//
+// One directory per app, never a single shared Nomad host_volume: a
+// shared volume would let every app read every other app's database.
+if (!process.env.APP_DATA_ROOT) {
+  throw new Error(
+    'APP_DATA_ROOT environment variable is not set. This is the host directory ' +
+      "under which each app's DATA_DIR is stored (one subdirectory per app) — " +
+      'see server-setup.sh, which creates and exports it per environment.'
+  );
+}
+const APP_DATA_ROOT = process.env.APP_DATA_ROOT;
+
+// Exported so both the deploy path and the config-update path create the
+// directory before `nomad job run`, and so the delete path knows what to
+// remove. appName is already validated as /^[a-z0-9-]+$/ by every caller,
+// so it cannot traverse out of APP_DATA_ROOT.
+function appDataPathFor(appName) {
+  return `${APP_DATA_ROOT}/${appName}`;
+}
+module.exports.appDataPathFor = appDataPathFor;
 
 // Exported so any part of this codebase that needs the app's own default
 // domain shape has one place to derive it from.
