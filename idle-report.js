@@ -10,11 +10,24 @@
  *
  *   node idle-report.js
  *
+ * Run as the SAME user deploy-service runs as (ubuntu), not root:
+ * analytics/db.js's getDb() opens the database read-write (it sets WAL
+ * mode and runs CREATE TABLE IF NOT EXISTS), so running it as root can
+ * leave root-owned -wal/-shm files beside a ubuntu-owned database and
+ * break the running service's ability to write to it.
+ *
  * Step 1 of the plan ("record when each app was last requested") needed no
  * new code — analytics/access-log-tailer.js already writes one row per
  * request into request_log(app_name, ts), indexed on exactly (app_name,
  * ts). Last-seen is a MAX(ts) over that.
  */
+// Same absolute-path dotenv load as server.js — this script is run by
+// hand from wherever the operator happens to be standing, so the default
+// cwd-relative lookup would silently find nothing and the script would
+// (correctly, but unhelpfully) report that analytics is disabled.
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
