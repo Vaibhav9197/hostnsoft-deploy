@@ -314,9 +314,9 @@ ${tagLines}
         ports      = ["${appPortLabel}"]
         force_pull = false # Use the local image we just built
         # Host bind mount, NOT a Nomad volume — needs no host_volume
-        # declaration in nomad.hcl (the docker plugin there already sets
-        # `volumes { enabled = true }`), and gives each app its own
-        # directory rather than one shared mount every app can read.
+        # declaration in nomad.hcl (the docker plugin there already
+        # enables volumes), and gives each app its own directory rather
+        # than one shared mount every app can read.
         # Deliberately mounted at /data rather than over /alloc/data:
         # bind-mounting on top of Nomad's own allocation directory fights
         # with how Nomad manages it.
