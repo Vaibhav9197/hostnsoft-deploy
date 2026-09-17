@@ -23,7 +23,7 @@ completes it.
 | 1 | Request activity tracking | **Done** |
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
-| 4 | Activator (wake-on-request) | **In progress** |
+| 4 | Activator (wake-on-request) | **Built, not yet verified** |
 | 5 | Unattended 24-48h run | Not started |
 | 6 | A few real, consenting apps | Not started |
 | 7 | Opt-in via the deploy API | Not started |
@@ -247,6 +247,44 @@ then forwards the original request through.
 requests for `scale-to-zero-test-1`'s hostname through this new logic —
 every other app's traffic keeps flowing through Traefik exactly as
 today, completely untouched by this new component.
+
+**Status: built, not yet verified.** `deploy-service/activator.js`, its
+own pm2 process (`<env>-activator`, `127.0.0.1:4200+offset`) rather than
+an endpoint inside deploy-service — it holds visitor connections open for
+the length of a cold start and must not be able to take the deploy API
+down with it.
+
+**How a request reaches it.** App routers come from Traefik's Nomad
+provider, which only sees *running* services, so a stopped app has no
+router and its hostname 404s. `/opt/traefik/dynamic.yml` declares a
+fallback router per app at `priority: 1`. App routers set no explicit
+priority, so Traefik derives theirs from the rule's length (~44 for a
+`Host` rule) — a running app outranks the fallback by a wide margin and
+its traffic never touches the activator. One router per exact hostname,
+never a wildcard, which is what makes "no other app's traffic reaches
+this component" a fact about the config rather than a hope about the
+code.
+
+**What it does on a cold request**, in order: buffer the body (capped, so
+a large upload at a sleeping app can't be used to exhaust it) → verify
+the data directory against Step 3's `latest-manifest.json` → run the
+saved spec from `.specs/` → wait for Nomad's service registry to have an
+address → forward, retrying connection refusals until the app is actually
+listening.
+
+**The manifest check is the important one, and it runs BEFORE the start.**
+An app that wakes to a missing database does not crash — it creates a
+fresh one and reports itself healthy. Checking after the start would be
+too late: the app is already writing, and the evidence of what was lost
+goes with it. A mismatch is a hard 503, never a start-anyway. Sizes
+rather than checksums: the files are quiescent between stop and wake, so
+any difference at all is a problem, and this avoids reading a whole
+database on every cold start.
+
+**Deploying this needs `server-setup.sh`, not `redeploy.sh`** — the
+router lives in root-owned `/opt/traefik/dynamic.yml`, which only
+`server-setup.sh` generates. That run restarts Nomad, Docker and Traefik
+and briefly drops every customer app.
 
 **Verification before moving on**:
 - [ ] With the test app stopped (via Step 3), send it a real HTTP
