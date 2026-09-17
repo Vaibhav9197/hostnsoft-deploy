@@ -47,6 +47,7 @@ const execFileAsync = promisify(execFile);
 
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const { appDataPathFor } = require('./nomad-job-spec');
+const { isBotRequest } = require('./analytics/bot-filter');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -97,11 +98,47 @@ async function runningAppNames() {
     .sort();
 }
 
+// "Last REAL request", not "last request". A newly deployed app picks up
+// credential-scanner traffic within seconds of its first TLS certificate
+// (confirmed in production: ~2/min of /.env, /.git/config and friends),
+// which would otherwise keep it permanently non-idle — and under
+// scale-to-zero would wake it to serve those scans.
+//
+// Scans a bounded window of recent rows rather than MAX(ts): the answer
+// is the newest NON-bot row, which SQL alone can't pick without pushing
+// the whole classifier into a query. LOOKBACK_ROWS is generous enough
+// that an app whose recent traffic is entirely bots still resolves
+// correctly, and if every row in the window is a bot the app is
+// genuinely idle by any definition.
+const LOOKBACK_ROWS = 500;
+
 function lastSeenMsFor(db, appName) {
+  const rows = db
+    .prepare(
+      'SELECT ts, path, user_agent FROM request_log WHERE app_name = ? ORDER BY ts DESC LIMIT ?'
+    )
+    .all(appName, LOOKBACK_ROWS);
+
+  for (const row of rows) {
+    if (!isBotRequest({ userAgent: row.user_agent, path: row.path })) {
+      return Number(row.ts);
+    }
+  }
+  // Either no rows at all, or every row in the window was automated.
+  // Both mean "no real visit we know of" — reported as never-requested
+  // rather than silently treated as idle-since-forever.
+  return null;
+}
+
+// Reported alongside, so the operator can see WHY an app looks idle —
+// "no real traffic, but 340 bot hits" is a very different situation from
+// "nothing has touched this at all", and the two would otherwise be
+// indistinguishable in the output.
+function botOnlyCountFor(db, appName) {
   const row = db
-    .prepare('SELECT MAX(ts) AS lastSeen FROM request_log WHERE app_name = ?')
-    .get(appName);
-  return row && row.lastSeen ? Number(row.lastSeen) : null;
+    .prepare('SELECT COUNT(*) AS n FROM request_log WHERE app_name = ? AND ts >= ?')
+    .get(appName, Date.now() - 24 * 60 * 60 * 1000);
+  return row ? row.n : 0;
 }
 
 // A deploy in flight must never be interrupted. deploy-status.js holds
@@ -119,11 +156,14 @@ async function hasDeployInFlight(appName) {
   }
 }
 
+// Same bot exclusion as the idle calculation itself — otherwise a single
+// scanner hit inside the grace window would abort every stop, and the
+// busiest-scanned apps (the newest ones) could never sleep at all.
 function hadRecentTraffic(db, appName) {
-  const row = db
-    .prepare('SELECT COUNT(*) AS n FROM request_log WHERE app_name = ? AND ts >= ?')
-    .get(appName, Date.now() - RECENT_TRAFFIC_GRACE_SEC * 1000);
-  return Boolean(row && row.n > 0);
+  const rows = db
+    .prepare('SELECT path, user_agent FROM request_log WHERE app_name = ? AND ts >= ?')
+    .all(appName, Date.now() - RECENT_TRAFFIC_GRACE_SEC * 1000);
+  return rows.some((r) => !isBotRequest({ userAgent: r.user_agent, path: r.path }));
 }
 
 // Snapshot of what the app's data looked like at the moment it was
@@ -254,7 +294,9 @@ async function main() {
   for (const r of rows) {
     const name = r.appName.padEnd(width);
     if (r.idleMs === null) {
-      console.log(`${name}  never requested        (no action — needs investigation)`);
+      const bots = botOnlyCountFor(db, r.appName);
+      const suffix = bots > 0 ? `(${bots} automated hit(s) in 24h, no real traffic)` : '(no traffic at all)';
+      console.log(`${name}  no real requests      ${suffix}`);
     } else if (r.wouldStop) {
       console.log(`${name}  idle for ${formatIdle(Math.floor(r.idleMs / 60000))}`.padEnd(width + 26) + '  WOULD STOP');
     } else {

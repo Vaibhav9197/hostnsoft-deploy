@@ -86,6 +86,22 @@ function getDb() {
     );
   `);
 
+  // Additive migration rather than a change to the CREATE TABLE above:
+  // every existing deployment already has a request_log, so a new column
+  // in the CREATE statement would only ever apply to a fresh database.
+  //
+  // Left NULLABLE on purpose, and rows written before this existed stay
+  // NULL. analytics/bot-filter.js treats NULL as "unknown, assume real"
+  // — the alternative (defaulting to '') would make every historical
+  // request look like a bot with no User-Agent, which would make every
+  // app on the box appear instantly idle. That is exactly the kind of
+  // mistake that, downstream of scale-to-zero, stops a live app.
+  const requestLogColumns = db.prepare('PRAGMA table_info(request_log)').all();
+  if (!requestLogColumns.some((c) => c.name === 'user_agent')) {
+    db.exec('ALTER TABLE request_log ADD COLUMN user_agent TEXT');
+    logger.info('[analytics-db] migrated request_log: added user_agent');
+  }
+
   logger.info(`[analytics-db] opened ${dbPath}`);
   return db;
 }

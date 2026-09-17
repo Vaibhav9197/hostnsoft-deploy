@@ -95,6 +95,13 @@ function parseLine(line) {
     status,
     durationMs: durationNs / 1e6,
     path: typeof entry.RequestPath === 'string' ? entry.RequestPath : '',
+    // Traefik emits kept request headers as "request_<Header-Name>" (see
+    // server-setup.sh's --accesslog.fields.headers.names.User-Agent).
+    // Absent entirely on a Traefik that predates that flag, and '-' when
+    // Traefik saw no header at all — both are preserved as-is here so
+    // bot-filter.js can tell "unknown" (null) from "genuinely empty".
+    userAgent:
+      typeof entry['request_User-Agent'] === 'string' ? entry['request_User-Agent'] : null,
   };
 }
 
@@ -133,12 +140,12 @@ function tick(logPath) {
   const parsed = lines.map(parseLine).filter(Boolean);
 
   const insert = db.prepare(
-    'INSERT INTO request_log (app_name, ts, status, duration_ms, path) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO request_log (app_name, ts, status, duration_ms, path, user_agent) VALUES (?, ?, ?, ?, ?, ?)'
   );
   db.exec('BEGIN');
   try {
     for (const row of parsed) {
-      insert.run(row.appName, row.ts, row.status, row.durationMs, row.path);
+      insert.run(row.appName, row.ts, row.status, row.durationMs, row.path, row.userAgent);
     }
     db.prepare(
       'INSERT INTO tail_state (log_path, inode, byte_offset) VALUES (?, ?, ?) ' +
