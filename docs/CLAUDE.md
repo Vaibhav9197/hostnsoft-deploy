@@ -57,7 +57,7 @@ history first).
   app's source before building, and causes `server.js` to reject the
   deploy with a 422 rather than shipping something that will fail at
   runtime. Skips the scan entirely if the app already declares a real DB
-  dependency (`@electric-sql/pglite`, `better-sqlite3`, `sqlite3`).
+  dependency (`better-sqlite3`, `sqlite3`). PGlite is no longer supported.
 - **`app-registry.js`** — a **stopgap** flat-JSON-file record of what
   each app last deployed with (`version`, `dbType`, `memory`,
   `deployedAt`). This exists only because this service has no real
@@ -76,7 +76,8 @@ during a real production investigation (see session log for detail):
   oversubscription, the enforced number is the job spec's `memory_max`
   (256/512MB — the same value that used to be the flat reservation), NOT
   its `memory`, which is only what the scheduler bin-packs against
-  (32/128MB). Requires `nomad operator scheduler set-config
+  (32MB, universal — the higher embedded-DB tier was removed with PGlite).
+  Requires `nomad operator scheduler set-config
   -memory-oversubscription=true` cluster-wide, done by
   `Server-setup/server-setup.sh` — with it off Nomad silently ignores
   `memory_max` and the low floor becomes a hard cap instead. See

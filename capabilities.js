@@ -136,16 +136,15 @@ const CAPABILITIES = {
 
   // Only values the code actually enforces. See the header comment.
   limits: {
-    // Ceilings (Nomad `memory_max`), i.e. the most a task may use and the
-    // number it gets OOM-killed at — unchanged, and still the number that
-    // matters when sizing an app. Tasks are SCHEDULED against the much
-    // lower *_floor_* values below and burst up to the ceiling when the
-    // host has room, so memory above the floor is best-effort rather than
-    // reserved. See docs/Memory-oversubscription-req.md.
+    // Ceiling (Nomad `memory_max`), i.e. the most a task may use and the
+    // number it gets OOM-killed at — the number that matters when sizing
+    // an app. Tasks are SCHEDULED against the much lower floor below and
+    // burst up to the ceiling when the host has room, so memory above the
+    // floor is best-effort rather than reserved. One universal tier: the
+    // higher embedded-database tier existed only for PGlite, which is no
+    // longer supported. See docs/Memory-oversubscription-req.md.
     memory_mb_default: 256,
-    memory_mb_with_embedded_db: 512,
     memory_mb_scheduling_floor: 32,
-    memory_mb_scheduling_floor_with_embedded_db: 128,
     app_name_pattern: '^[a-z0-9-]+$',
     app_name_scope: 'platform_wide',
     app_name_min_length: 3,
@@ -167,7 +166,7 @@ const CAPABILITIES = {
       reason: 'Specific to the Claude Artifacts sandbox; does not exist here.',
       http_status: 422,
       code: 'unsupported_storage_pattern',
-      use_instead: ['better-sqlite3', '@electric-sql/pglite'],
+      use_instead: ['better-sqlite3'],
     },
   ],
 

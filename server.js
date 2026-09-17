@@ -59,21 +59,25 @@ const { requireInternalSecret } = require('./internal-auth');
 // Project.memoryMb) — no app's real limit changed. Only the number Nomad
 // bin-packs against got lower.
 //
-// The floors come from real `docker stats` data off the live server:
+// The floor comes from real `docker stats` data off the live server:
 // typical apps sit at 20-150MB against a 256MB reservation, so packing
 // against 256 was causing "resources exhausted" placement failures on a
-// box with plenty of free RAM. 32/128 deliberately sit at the LOW end of
+// box with plenty of free RAM. 32 deliberately sits at the LOW end of
 // that observed range rather than at its middle — the floor only has to
 // be enough to schedule against, since everything above it is available
 // as burst. A task that needs more still gets it, up to its ceiling.
+//
+// Both numbers are universal: there is no second, higher tier for
+// embedded-database apps any more. That tier existed solely for PGlite,
+// which is no longer supported (SQLite only — see detect-storage-usage.js).
+// SQLite is an in-process library rather than a separate database engine,
+// so a SQLite-backed app needs no more headroom than any other app.
 //
 // Applies to new deploys only. Already-running apps keep whatever job
 // spec they were last deployed with until their next deploy — nothing
 // needs to be restarted for this to take effect.
 const MEMORY_CEILING_MB = 256;
-const MEMORY_CEILING_EMBEDDED_DB_MB = 512;
 const SCHEDULING_FLOOR_MB = 32;
-const SCHEDULING_FLOOR_EMBEDDED_DB_MB = 128;
 
 // NEW: GET /internal/apps/:appName/status — real Nomad allocation status,
 // backing hostnsoft-api's project-health field (previously hardcoded to
@@ -374,46 +378,33 @@ app.post('/apps', upload.single('source'), async (req, res) => {
             "This app calls window.storage, an API specific to Claude Artifacts' sandbox. " +
             "It does not exist outside that environment and will fail at runtime if deployed " +
             "here as-is. Please update the app to persist data with a real database before " +
-            "redeploying: SQLite for simple key-value/document-style data, or PGlite " +
-            "(@electric-sql/pglite) for relational data needing joins or queries.",
+            "redeploying: use SQLite (better-sqlite3), writing under DATA_DIR.",
           filesDetected: storageUsage.files,
           docs: DOCS_URL,
         });
       }
     }
 
-    // 2c. Embedded DB (PGlite) needs more memory headroom than a plain
-    // static/Express app. Uses the same `deps` read above — no second
-    // package.json read.
+    // 2c. Memory sizing. There is no auto-detected tier any more: PGlite
+    // is no longer supported, and SQLite — the only remaining embedded
+    // option — is an in-process library that needs no extra headroom, so
+    // every app starts from the same 256MB ceiling.
     //
-    // NEW: takes the project's configured memoryMb (hostnsoft-api's
-    // PATCH .../memory — previously persisted but never actually reached
-    // here) as a floor-adjustable override rather than either ignoring it
-    // or letting it override outright: the auto-detected embedded-DB
-    // requirement is a hard technical minimum (that app WILL OOM below
-    // it), not something a lower configured value should be able to
-    // undercut — hostnsoft-api's schema defaults every project to 256MB
-    // whether or not memory was ever explicitly configured, so treating
-    // the configured value as authoritative outright would silently
-    // regress every embedded-DB app that never touched this setting.
-    // Math.max lets an explicit HIGHER value win, while the auto-detected
-    // minimum always still applies.
+    // The project's configured memoryMb (hostnsoft-api's PATCH
+    // .../memory) can RAISE that ceiling but never lower it below the
+    // platform default: hostnsoft-api's schema defaults every project to
+    // 256MB whether or not memory was ever explicitly configured, so
+    // treating a configured value as authoritative outright would let an
+    // untouched default silently undercut the baseline. Math.max lets an
+    // explicit higher value win while the default always still applies.
     //
-    // NEW: what this detection produces is now the task's memory_max
-    // CEILING rather than its flat reservation — same number, same
-    // Math.max-with-configured-value rule, unchanged. What's new is
-    // schedulingFloorMb alongside it: the much lower number Nomad's
-    // scheduler actually packs against. The floor is keyed off the same
-    // usesEmbeddedDb signal (an embedded DB has a genuinely higher
-    // baseline, not just a higher peak) and deliberately NOT off the
-    // configured memoryMb — raising a project's memory is a request for
-    // more headroom, not a promise to use it, so it should lift the
-    // ceiling without making the app harder to place.
-    const usesEmbeddedDb = Object.keys(deps).some(dep => dep.startsWith('@electric-sql/pglite'));
-    const autoDetectedMemory = usesEmbeddedDb ? MEMORY_CEILING_EMBEDDED_DB_MB : MEMORY_CEILING_MB;
-    const taskMemory = Math.max(autoDetectedMemory, claim.memoryMb || autoDetectedMemory);
-    const schedulingFloorMb = usesEmbeddedDb ? SCHEDULING_FLOOR_EMBEDDED_DB_MB : SCHEDULING_FLOOR_MB;
-    logger.info(`[${appName}] Embedded DB detected: ${usesEmbeddedDb} (min ${autoDetectedMemory}MB), configured: ${claim.memoryMb ?? 'none'}MB -> scheduling floor ${schedulingFloorMb}MB, burst ceiling ${taskMemory}MB`);
+    // schedulingFloorMb is deliberately NOT derived from the configured
+    // value — raising a project's memory is a request for more headroom,
+    // not a promise to use it, so it lifts the ceiling without making the
+    // app harder to place.
+    const taskMemory = Math.max(MEMORY_CEILING_MB, claim.memoryMb || MEMORY_CEILING_MB);
+    const schedulingFloorMb = SCHEDULING_FLOOR_MB;
+    logger.info(`[${appName}] Memory: configured ${claim.memoryMb ?? 'none'}MB -> scheduling floor ${schedulingFloorMb}MB, burst ceiling ${taskMemory}MB`);
 
     // NEW: from here on, the actual build (railpack, which can easily
     // take minutes for a fresh install) and the Nomad deploy run in the
@@ -744,18 +735,10 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   // — the version is whatever follows the first colon.
   const appVersion = imageTag.slice(imageTag.indexOf(':') + 1);
   const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : MEMORY_CEILING_MB;
-  // No build dir here (that's the whole point of this endpoint), so the
-  // embedded-DB dependency scan that picks the floor on a real deploy
-  // can't run. The ceiling is the surviving signal: hostnsoft-api keeps
-  // Project.memoryMb in sync with the memory actually applied on each
-  // successful deploy (see internalDeployments.routes.ts), and the only
-  // thing that pushes that to 512 by itself is embedded-DB detection.
-  // Inferring from it errs the safe way — a non-embedded-DB app whose
-  // owner configured >=512MB gets the higher 128MB floor, which merely
-  // packs slightly less aggressively; an embedded-DB app can never come
-  // out UNDER-floored, since its ceiling is always at least 512.
-  const schedulingFloorMb =
-    taskMemory >= MEMORY_CEILING_EMBEDDED_DB_MB ? SCHEDULING_FLOOR_EMBEDDED_DB_MB : SCHEDULING_FLOOR_MB;
+  // One universal floor, so unlike the ceiling there is nothing to infer
+  // here. This endpoint has no build dir and therefore no dependency
+  // scan, which used to matter when the floor had an embedded-DB tier.
+  const schedulingFloorMb = SCHEDULING_FLOOR_MB;
   const domain = defaultDomainFor(appName);
 
   // NEW: this endpoint now also backs one-click rollback (see

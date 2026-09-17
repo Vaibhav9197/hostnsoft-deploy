@@ -5,7 +5,7 @@
  * which doesn't exist outside that sandbox). Two things keep this fast:
  *
  * 1. SKIPPED ENTIRELY if the app already declares a real database
- *    dependency (PGlite or SQLite) — see hasRealDatabaseDependency().
+ *    dependency (SQLite) — see hasRealDatabaseDependency().
  *    An app with real persistence already in place doesn't need this
  *    check, so there's no reason to pay for a source scan.
  *
@@ -34,11 +34,14 @@ const { parse } = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
 const logger = require('./logger');
 
-const REAL_DB_PACKAGE_PREFIXES = ['@electric-sql/pglite', 'better-sqlite3', 'sqlite3'];
+const REAL_DB_PACKAGE_PREFIXES = ['better-sqlite3', 'sqlite3'];
 
 // Pass the already-parsed package.json `dependencies`+`devDependencies`
-// object — server.js already reads this once for memory sizing, no need
-// to read the file twice.
+// object — server.js already reads this once, no need to read the file
+// twice. PGlite was removed from this list when the platform narrowed to
+// SQLite-only: an app declaring it is no longer treated as having real
+// persistence, so it now correctly hits the window.storage rejection
+// path instead of being waved through.
 function hasRealDatabaseDependency(deps) {
   return Object.keys(deps).some(dep =>
     REAL_DB_PACKAGE_PREFIXES.some(prefix => dep.startsWith(prefix))
