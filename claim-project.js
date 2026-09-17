@@ -2,14 +2,22 @@
  * claim-project.js
  *
  * Confirms (and, on first sight, auto-creates) that an app name is
- * actually available to this token's company BEFORE any build/Nomad
+ * actually available to the deploying company BEFORE any build/Nomad
  * resources are spent on it — see hostnsoft-api's
- * src/routes/internalProjects.routes.ts. hostnsoft-api reads the owning
- * company directly off the token; no X-Company-Id involved.
+ * src/routes/internalProjects.routes.ts.
  *
- * `token` may be omitted entirely (pass `undefined`, not `null`) — see
- * docs/Anonymous-deploy-req.md. That creates/reuses an anonymous
- * ("orphan") project instead of requiring a company.
+ * `credential` comes from deploy-credential.js and says who's deploying:
+ * a deploy token (hostnsoft-api reads the owning company off the token
+ * itself), or a proxy_auth_token + companyId for a dashboard upload
+ * (2026-09-17 — hostnsoft-api verifies that pairing against proxy
+ * membership), or `null` for an anonymous deploy, which creates/reuses an
+ * ("orphan") project instead of requiring a company at all — see
+ * docs/Anonymous-deploy-req.md.
+ *
+ * This call is the single verification point for a proxy_auth_token:
+ * nothing upstream has checked it, so its rejections (401/403) are real
+ * auth answers to relay, not "couldn't verify" — which is why they're
+ * passed through below instead of being flattened into a 502.
  *
  * The app name doubles as the live subdomain (<appName>.app.hostnsoft.com)
  * and the Nomad job name, so it must be unique platform-wide. Previously
@@ -21,23 +29,32 @@
  * hostnsoft-api must never be treated as "any app name is fine".
  */
 const logger = require("./logger");
+const { credentialBody, credentialHeaders } = require("./deploy-credential");
 
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/validated by validate-deploy-token.js at startup
 
-async function claimProject(token, slug) {
+// Statuses that are hostnsoft-api's own considered answer about the
+// CALLER rather than a sign something went wrong between the services —
+// relayed with their own status and code so the person sees "your
+// session expired" or "you're not in that company", not a blanket "could
+// not verify app name availability". Everything else still becomes a 502
+// (fail closed), same as before.
+const RELAYED_STATUSES = new Set([400, 401, 403, 409]);
+
+async function claimProject(credential, slug) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/projects/claim`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, slug }),
+      headers: { 'Content-Type': 'application/json', ...credentialHeaders(credential) },
+      body: JSON.stringify({ ...credentialBody(credential), slug }),
     });
   } catch (e) {
     logger.error(`[claim-project] could not reach hostnsoft-api to claim "${slug}": ${e.message}`);
     return { ok: false, status: 502, code: 'app_name_check_failed', error: "Could not verify app name availability" };
   }
 
-  if (response.status === 409) {
+  if (RELAYED_STATUSES.has(response.status)) {
     const body = await response.json().catch(() => ({}));
     // Pass hostnsoft-api's own code through rather than assuming
     // "taken": a 409 here is also how a RESERVED name is refused
@@ -45,12 +62,17 @@ async function claimProject(token, slug) {
     // something different to the caller. "Taken" invites retrying the
     // same name later; "reserved" never becomes available, so an agent
     // told the wrong one retries forever. Falls back to app_name_taken
-    // so an older hostnsoft-api that sends no code still behaves as it did.
+    // so an older hostnsoft-api that sends no code still behaves as it did
+    // — which is also why that fallback is scoped to 409 specifically.
     return {
       ok: false,
-      status: 409,
-      code: body.code || 'app_name_taken',
-      error: body.error || `App name "${slug}" is already in use`,
+      status: response.status,
+      code: body.code || (response.status === 409 ? 'app_name_taken' : 'unauthorized'),
+      error:
+        body.error ||
+        (response.status === 409
+          ? `App name "${slug}" is already in use`
+          : "Not authorized to deploy this app"),
     };
   }
 

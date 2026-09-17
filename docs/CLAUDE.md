@@ -25,11 +25,15 @@ history first).
 - **`server.js`** — the deploy API itself (`POST /apps`, `GET /apps`).
   Currently the single entry point for everything: upload validation,
   Railpack build, Nomad job generation, deployment. **Auth changed
-  2026-08-26**: the single shared `PLATFORM_TOKEN` is gone. Every deploy
-  now sends `X-Company-Id: <companyId>` plus a company-scoped token via
-  `Authorization: Bearer <token>`, and `server.js` confirms that pair is
-  live by calling `hostnsoft-api`'s `POST /internal/deploy-tokens/validate`
-  (see `validate-deploy-token.js`) before doing anything else. Requires
+  2026-08-26**: the single shared `PLATFORM_TOKEN` is gone. A deploy now
+  sends a company-scoped token via `Authorization: Bearer <token>`, and
+  `server.js` confirms it's live by calling `hostnsoft-api`'s
+  `POST /internal/deploy-tokens/validate` (see `validate-deploy-token.js`)
+  before doing anything else. No `X-Company-Id` for that path — the token
+  is company-scoped at creation, so `hostnsoft-api` reads the company off
+  the token itself. (`X-Company-Id` is back as of 2026-09-17, but only for
+  the `proxy_auth_token` alternative below, which isn't company-scoped.)
+  Requires
   `HOSTNSOFT_API_URL` in the environment (fails fast at startup if unset,
   same pattern `PLATFORM_TOKEN` used to follow). **Since 2026-08-27**,
   loaded from a `.env` file next to `server.js` (via `dotenv`, path
@@ -52,6 +56,41 @@ history first).
   `hostnsoft-api` outage here only means this one deploy's outcome doesn't
   get recorded (logged to `pm2 logs`), it never changes the response
   already going back to whoever triggered the deploy.
+- **`deploy-credential.js`** (added 2026-09-17) — reads whichever
+  credential `POST /apps` presented and packages it for the two
+  `hostnsoft-api` calls a deploy makes. **This is where the deploy
+  endpoint gained a second accepted credential**: as well as a deploy
+  token, it now takes the dashboard's own `proxy_auth_token` plus
+  `X-Company-Id`, so the dashboard's upload button can deploy as the
+  logged-in person instead of making them mint a company-wide deploy token
+  first. Same move already made for `GET /apps/:appName/status`/`.../logs`
+  on 2026-09-13 (`verify-proxy-auth.js`), applied to the deploy path
+  itself — the SAME endpoint, not a parallel one.
+  - A deploy token still **wins** when both are somehow presented, so no
+    existing agent/CI caller's behavior can shift.
+  - A PAT isn't verified in this process at all: `claim-project.js`'s call
+    is the single verification point (`hostnsoft-api` checks the PAT and
+    its membership of `X-Company-Id`), which keeps it to one proxy
+    round-trip per deploy and makes it impossible for the two services to
+    reach different conclusions about the same request. That call already
+    ran before any build resource was spent, so a rejected PAT still costs
+    nothing.
+  - `hostnsoft-api` requires `X-Internal-Secret` on the PAT branch only —
+    a PAT is the credential that drives the whole dashboard, far more
+    powerful than a company-scoped deploy token, so relaying one proves it
+    came from this service. The deploy-token and anonymous branches send
+    no such header and are byte-for-byte unchanged.
+  - **The anonymous/orphan path is untouched.** Only a request with NO
+    credential at all deploys anonymously; a PAT that's present and fails
+    is a 401/403, never a silent downgrade — otherwise someone gets a
+    self-deleting app they believe is permanent. Nothing about the orphan
+    banner needed changing either: the `orphan-proxy` sidecar is keyed off
+    `claim.isOrphan`, and a PAT deploy claims under a real company, so it
+    comes back false on its own.
+  - **CORS** (`cors()` in `server.js`, new `FRONTEND_ORIGIN` env var) —
+    the dashboard is this service's first *browser* caller, so without it
+    the preflight fails before the upload ever reaches auth. Non-browser
+    callers send no `Origin` and are unaffected.
 - **`detect-storage-usage.js`** — detects `window.storage` usage
   (Claude Artifacts' sandbox API, which doesn't exist outside it) in an
   app's source before building, and causes `server.js` to reject the

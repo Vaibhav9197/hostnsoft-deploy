@@ -8,6 +8,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const tar = require('tar');
 const fs = require('fs-extra');
@@ -28,7 +29,10 @@ const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detec
 // NEW: every deploy now authenticates as a specific company via a
 // company-scoped token issued (and revocable/rotatable) by hostnsoft-api,
 // replacing the old single shared PLATFORM_TOKEN everyone used.
-const { validateDeployToken, validateDeployTokenWithCompany } = require('./validate-deploy-token');
+// (POST /apps validates its own token through deploy-credential.js below,
+// which has to handle the proxy_auth_token alternative too; this import is
+// only the status/logs path's company-resolving variant.)
+const { validateDeployTokenWithCompany } = require('./validate-deploy-token');
 
 // NEW: reports each deploy attempt's outcome back to hostnsoft-api so its
 // dashboard deployment history is actually populated.
@@ -38,6 +42,13 @@ const { recordDeployment } = require('./record-deployment');
 // build/Nomad resources are spent — the app name is also the live
 // subdomain, so it must be unique platform-wide.
 const { claimProject } = require('./claim-project');
+
+// NEW (2026-09-17): POST /apps also accepts the dashboard's own
+// proxy_auth_token (+ X-Company-Id), so the upload button in the UI can
+// deploy as the logged-in person instead of making them mint a
+// company-wide deploy token first. One module reads whichever credential
+// came in and packages it for the hostnsoft-api calls below.
+const { readDeployCredential, isIdentified } = require('./deploy-credential');
 
 // NEW: shared Nomad job spec builder — see docs/Customdomain-req.md. Used
 // here after a fresh build, and by the /internal/apps/:appName/config
@@ -127,6 +138,25 @@ const { CAPABILITIES_BODY, CAPABILITIES_ETAG } = require('./capabilities');
 // rather than take the extra redirect hop.
 const DOCS_URL = 'https://embarko.ai/docs';
 
+// Origins allowed to call this service from a BROWSER. Until the
+// dashboard's upload button (2026-09-17) every caller here was an agent,
+// a CI job or the CLI — none of which is subject to CORS at all, which is
+// why this service had none. Now the dashboard uploads a tarball to
+// POST /apps directly from the page, so without this the browser refuses
+// the preflight and the upload never reaches the auth check.
+//
+// Comma-separated allowlist rather than a wildcard. Not because a
+// wildcard would leak a credential — nothing here is cookie- or
+// ambient-authenticated, every credential is an explicit header a
+// cross-origin page would have to already possess — but because an
+// allowlist keeps the blast radius of a future cookie/session change
+// small, and makes "who is allowed to drive deploys from a browser" a
+// deployment decision rather than an implicit one.
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || 'http://localhost:3000')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 const app = express();
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -145,6 +175,42 @@ app.use((req, res, next) => {
     next();
   });
 });
+
+// Ahead of every route (but after the request-id middleware, so a
+// preflight is logged and carries X-Request-Id like anything else), so
+// preflights are answered for all of them.
+//
+// No `credentials: true` — this service reads credentials from explicit
+// headers only and never from a cookie, so allowing credentialed
+// cross-origin requests would grant nothing but would rule out ever
+// widening the allowlist.
+//
+// Requests with no Origin header at all (curl, the CLI, agents,
+// server-to-server) are unaffected: cors() passes them straight through,
+// which is what keeps every existing non-browser caller working exactly
+// as before.
+app.use(
+  cors({
+    origin: FRONTEND_ORIGINS,
+    // proxy_auth_token and x-company-id are the dashboard's upload
+    // credential; the rest are what POST /apps and the agent-facing
+    // endpoints already read. A header missing here is silently dropped
+    // by the browser, so the request arrives looking unauthenticated.
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'proxy_auth_token',
+      'X-Company-Id',
+      'X-App-Name',
+      'X-App-Version',
+      'X-Agent-Name',
+    ],
+    methods: ['GET', 'POST', 'OPTIONS'],
+    // So the dashboard can correlate a failed upload with this service's
+    // own logs without the user having to paste anything.
+    exposedHeaders: ['X-Request-Id'],
+  })
+);
 
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
@@ -179,7 +245,7 @@ async function ensureAppDataDir(appName) {
 // here instead.
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, taskMemory, schedulingFloorMb, hasValidToken, token, deploymentId,
+  claim, taskMemory, schedulingFloorMb, credential, deploymentId,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -227,9 +293,9 @@ async function performBuildAndDeploy({
     // to attribute history to until/unless the project is claimed.
     // deploymentId (from the in_progress call below) updates that same
     // row in place rather than creating a second one for this attempt.
-    if (hasValidToken) {
+    if (isIdentified(credential)) {
       await recordDeployment({
-        token,
+        credential,
         projectSlug: appName,
         appVersion,
         status: 'success',
@@ -255,9 +321,9 @@ async function performBuildAndDeploy({
     await fs.remove(buildDir).catch(() => {});
     await fs.remove(filePath).catch(() => {});
 
-    if (hasValidToken) {
+    if (isIdentified(credential)) {
       await recordDeployment({
-        token,
+        credential,
         projectSlug: appName,
         appVersion,
         status: 'failed',
@@ -290,8 +356,6 @@ app.get('/capabilities', (req, res) => {
 });
 
 app.post('/apps', upload.single('source'), async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.split(' ')[1];
   const appName = req.headers['x-app-name'];
 
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
@@ -303,35 +367,45 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     : `${Date.now()}`;
 
   // 1. Validation
-  // NEW: no X-Company-Id header — the deploy token is already company-
-  // scoped at creation (hostnsoft-api mints one per company), so which
-  // company this deploy belongs to is read off the token itself. One
-  // fewer thing for a caller to get right or send inconsistently.
+  // Which credential this deploy carries, if any — a deploy token, a
+  // dashboard proxy_auth_token + X-Company-Id, or nothing at all. See
+  // deploy-credential.js for the full reasoning, including why a deploy
+  // token still wins when both are somehow presented and why anonymous
+  // stays opt-in BY OMISSION ONLY: a MISSING credential opts into an
+  // anonymous ("orphan") deploy (docs/Anonymous-deploy-req.md), but one
+  // that's present and invalid is a hard error, never a silent fallback,
+  // so a typo'd/expired credential surfaces as an auth failure instead of
+  // masquerading as a feature.
   //
-  // NEW: a MISSING Authorization header opts into an anonymous ("orphan")
-  // deploy — see docs/Anonymous-deploy-req.md — but a header that's
-  // present and invalid is still a hard 401, never a silent fallback to
-  // anonymous. Anonymous is opt-in by omission only, so a typo'd/expired
-  // token surfaces as an auth error instead of masquerading as a feature.
-  let hasValidToken = false;
-  if (authHeader) {
-    if (!token || !(await validateDeployToken(token))) {
-      return res.status(401).json({ error: "Unauthorized", code: "unauthorized" });
-    }
-    hasValidToken = true;
+  // A deploy token is still company-scoped at creation (hostnsoft-api
+  // mints one per company), so it needs no X-Company-Id and ignores one
+  // if sent — a stale header can never re-point a token-authenticated
+  // deploy at a different company. Only a proxy_auth_token needs the
+  // header, because a PAT isn't scoped to one company.
+  const credentialResult = await readDeployCredential(req);
+  if (!credentialResult.ok) {
+    return res
+      .status(credentialResult.status)
+      .json({ error: credentialResult.error, code: credentialResult.code });
   }
+  const credential = credentialResult.credential;
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid or missing X-App-Name header. Use lowercase letters and dashes.", code: "invalid_app_name" });
   }
 
   // NEW: the app name is also the live subdomain and the Nomad job name —
-  // confirm it's either already this token's company's or free to claim
+  // confirm it's either already the deploying company's or free to claim
   // BEFORE spending any build time on it. No project needs to exist via
-  // the dashboard first; this auto-creates one on first sight. Passing
-  // `undefined` (not the invalid/absent token itself) when there's no
-  // valid token routes this to hostnsoft-api's anonymous/orphan path.
-  const claim = await claimProject(hasValidToken ? token : undefined, appName);
+  // the dashboard first; this auto-creates one on first sight. A null
+  // credential routes this to hostnsoft-api's anonymous/orphan path.
+  //
+  // For a proxy_auth_token this call is ALSO where that credential is
+  // actually verified (validity + membership in X-Company-Id) — it still
+  // runs before any build resource is spent, so a rejected PAT costs
+  // nothing, and keeping it to one call means the two services can't
+  // reach different conclusions about the same deploy.
+  const claim = await claimProject(credential, appName);
   if (!claim.ok) {
     return res.status(claim.status).json({ error: claim.error, code: claim.code });
   }
@@ -444,9 +518,9 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // below) and, for token-authenticated deploys, mirrored into
     // hostnsoft-api's own deployment history too.
     let deploymentId = null;
-    if (hasValidToken) {
+    if (isIdentified(credential)) {
       deploymentId = await recordDeployment({
-        token,
+        credential,
         projectSlug: appName,
         appVersion,
         status: 'in_progress',
@@ -526,7 +600,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     performBuildAndDeploy({
       appName, appVersion, imageName, domain,
       buildDir, filePath: req.file.path,
-      claim, taskMemory, schedulingFloorMb, hasValidToken, token, deploymentId,
+      claim, taskMemory, schedulingFloorMb, credential, deploymentId,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
@@ -537,9 +611,9 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // has its own error handling inside performBuildAndDeploy.
     logger.error(`[${appName}] Deploy request failed before accepting:`, error);
 
-    if (hasValidToken) {
+    if (isIdentified(credential)) {
       await recordDeployment({
-        token,
+        credential,
         projectSlug: appName,
         appVersion,
         status: 'failed',

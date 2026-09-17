@@ -11,6 +11,15 @@
  * deploymentId, so the SAME row is updated in place rather than a
  * second one being created).
  *
+ * `credential` is whatever the deploy authenticated with (see
+ * deploy-credential.js) — a deploy token, or a proxy_auth_token +
+ * companyId for a dashboard upload. Pass the SAME one that was sent to
+ * claim-project.js for this deploy: either resolves to the right company,
+ * but the history row is attributed to whoever the credential names, so
+ * mixing them would credit the wrong actor. Never called at all for an
+ * anonymous deploy — there's no company to attribute history to (see
+ * docs/Anonymous-deploy-req.md's out-of-scope list).
+ *
  * hostnsoft-api assigns the deployment's actual sequence number (v1, v2,
  * ...) itself — this only reports appVersion, whatever X-App-Version (or
  * this service's own Date.now() fallback) was used for the image tag.
@@ -26,11 +35,12 @@
  * its own new row instead of updating one, same as before this feature.
  */
 const logger = require("./logger");
+const { credentialBody, credentialHeaders } = require("./deploy-credential");
 
 const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/validated by validate-deploy-token.js at startup
 
 async function recordDeployment({
-  token,
+  credential,
   projectSlug,
   appVersion,
   status,
@@ -42,9 +52,9 @@ async function recordDeployment({
   try {
     const response = await fetch(`${HOSTNSOFT_API_URL}/internal/deployments/record`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...credentialHeaders(credential) },
       body: JSON.stringify({
-        token,
+        ...credentialBody(credential),
         projectSlug,
         appVersion,
         status,
