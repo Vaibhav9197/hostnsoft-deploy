@@ -22,8 +22,8 @@ completes it.
 | 0 | `DATA_DIR` on a host bind mount | **Shipped, live** — one GC check outstanding |
 | 1 | Request activity tracking | **Done** |
 | 2 | Idle detection, dry-run only | **Done** |
-| 3 | Real stop, one hardcoded test app | **Code shipped, NOT yet verified** — job-spec capture added |
-| 4 | Activator (wake-on-request) | Not started |
+| 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
+| 4 | Activator (wake-on-request) | **In progress** |
 | 5 | Unattended 24-48h run | Not started |
 | 6 | A few real, consenting apps | Not started |
 | 7 | Opt-in via the deploy API | Not started |
@@ -156,13 +156,22 @@ it would do. Nothing is actually stopped yet.
 
 ## Step 3: Actual stop — hardcoded to exactly one throwaway test app
 
-**Status: code shipped, NOT yet verified — this is the current step.**
-`idle-report.js --apply` is deployed and the safety rail is demonstrably
-doing work: a real apply run reported 19 idle apps under "Idle but NOT
-stoppable" and stopped **0** of them. But `scale-to-zero-test-1` has
-never actually been stopped, so the stop path, the snapshot and the
-manifest are all still unexercised. Nothing in Step 4 may start until
-this step's checklist below is ticked.
+**Status: done — verified in prod on 2026-09-17.** A real `--apply` run
+against 31 running apps: 22 idle apps listed under "Idle but NOT
+stoppable" and left alone, `scale-to-zero-test-1` the only one stopped.
+Afterwards `nomad job status` showed it as `dead (stopped)` — stopped,
+not purged, so the job is still registered — and every other app still
+`running`. Its spec was saved to `.specs/`, and the snapshot recorded 3
+files / 1,038,056 bytes.
+
+**The size split in that manifest is the point of the whole plan.**
+`visits.db` is 4,096 bytes; `visits.db-wal` is 1,001,192. Essentially all
+the data was in the write-ahead log, never checkpointed, because the
+container was killed rather than shut down cleanly. An implementation
+that persisted only the `.db` file would have looked entirely successful
+and lost everything. SQLite recovers from the WAL on next open, but only
+if all three files travel together — which is exactly what the host bind
+mount from Step 0 guarantees and an allocation directory did not.
 
 **What this builds**: the real "stop an idle app" action — but gated so
 it can *only ever* act on one explicitly named test app, hardcoded, not
@@ -214,16 +223,16 @@ real apps wants `server.js` persisting the spec at *deploy* time instead,
 so a spec exists before anything has ever tried to stop the app.
 
 **Verification before moving on**:
-- [ ] Let the test app sit idle past the threshold, run the script in
+- [x] Let the test app sit idle past the threshold, run the script in
       apply mode, confirm `nomad job status scale-to-zero-test-1` shows
       it stopped.
-- [ ] Confirm every other app is still running exactly as before —
+- [x] Confirm every other app is still running exactly as before —
       check the full `nomad job status` list, and `curl` a couple of
       real apps directly to confirm they still respond normally.
 - [x] Confirm the safety rail is actually doing work: the apply output
       must list other idle apps under "Idle but NOT stoppable". If no
       other app is idle, that line proves nothing — check again later.
-- [ ] Confirm the test app's data is STILL on disk after the stop, and
+- [x] Confirm the test app's data is STILL on disk after the stop, and
       that a snapshot plus `latest-manifest.json` were written.
 
 ---
