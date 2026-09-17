@@ -73,12 +73,23 @@ function dockerGet(path) {
 
 // The most recently created allocation still actually running for this
 // job — during a redeploy there can briefly be more than one.
-async function findRunningAllocId(jobId) {
+async function findRunningAlloc(jobId) {
   const allocs = await nomadGet(`/v1/job/${encodeURIComponent(jobId)}/allocations`);
   const running = allocs.filter((a) => a.ClientStatus === 'running');
   if (running.length === 0) return null;
   running.sort((a, b) => (b.CreateIndex || 0) - (a.CreateIndex || 0));
-  return running[0].ID;
+  const alloc = running[0];
+
+  // Task name comes from the allocation itself rather than an assumption.
+  // TaskStates is keyed by task name; prefer "server" when present (every
+  // customer app, and the app task in an orphan deploy that also runs an
+  // orphan-proxy sidecar) so a sidecar can never be sampled in place of
+  // the app it fronts.
+  const taskNames = Object.keys(alloc.TaskStates || {});
+  const taskName = taskNames.includes('server') ? 'server' : taskNames[0];
+  if (!taskName) return null;
+
+  return { allocId: alloc.ID, taskName };
 }
 
 // Nomad's own Docker task driver names every container "<task>-<allocID>"
@@ -86,9 +97,22 @@ async function findRunningAllocId(jobId) {
 // containers (`docker ps`) while diagnosing the Nomad-stats gap above.
 // Docker's stats endpoint accepts a container NAME here just as well as
 // an ID, so no separate "look up the container ID" round trip is needed.
-function containerNameFor(allocId) {
-  return `server-${allocId}`;
+//
+// The task name was previously hardcoded to "server". That is right for
+// every customer app (nomad-job-spec.js always names the task "server"),
+// but WRONG for any platform job whose task is called something else —
+// notably traefik, which therefore 404'd on every single tick and filled
+// the error log with "No such container" once a minute, forever. Noise
+// that alarming is not harmless: it was read as a platform outage during
+// a real incident on 2026-09-17 while nothing was actually wrong.
+function containerNameFor(allocId, taskName) {
+  return `${taskName}-${allocId}`;
 }
+
+// Platform jobs, not customer apps. Skipped outright rather than merely
+// named correctly: their CPU/memory is not per-app analytics and nothing
+// reads it, so sampling them is wasted work either way.
+const PLATFORM_JOBS = new Set(['traefik']);
 
 // Same formula `docker stats` itself uses: percent of ONE core, so a
 // container actively using 2 full cores reports ~200%, not capped at
@@ -125,10 +149,12 @@ function memoryMbFrom(stats) {
 }
 
 async function sampleApp(jobId) {
-  const allocId = await findRunningAllocId(jobId);
-  if (!allocId) return null;
+  const alloc = await findRunningAlloc(jobId);
+  if (!alloc) return null;
 
-  const stats = await dockerGet(`/containers/${containerNameFor(allocId)}/stats?stream=false`);
+  const stats = await dockerGet(
+    `/containers/${containerNameFor(alloc.allocId, alloc.taskName)}/stats?stream=false`
+  );
   const cpuPercent = cpuPercentFrom(stats);
   const memoryMb = memoryMbFrom(stats);
   if (cpuPercent === null && memoryMb === null) return null;
@@ -153,13 +179,25 @@ async function tick() {
   const now = Date.now();
 
   for (const job of runningJobs) {
+    if (PLATFORM_JOBS.has(job.ID)) continue;
     try {
       const sample = await sampleApp(job.ID);
       if (sample) {
         insert.run(job.ID, now, sample.cpuPercent, sample.memoryMb);
       }
     } catch (e) {
-      logger.warn(`[resource-poller] could not sample "${job.ID}" this tick: ${e.message}`);
+      // A 404 means the container went away between Nomad listing the
+      // allocation and Docker being asked about it — ordinary churn
+      // during a redeploy or restart, which corrects itself on the next
+      // tick. Deliberately info, not warn: warn goes to pm2's ERROR log,
+      // where a once-a-minute "No such container" reads as a platform
+      // outage. It was read exactly that way during a real incident on
+      // 2026-09-17. Anything that is not a 404 still warns.
+      if (/returned HTTP 404/.test(e.message)) {
+        logger.info(`[resource-poller] "${job.ID}" container not present this tick (likely restarting)`);
+      } else {
+        logger.warn(`[resource-poller] could not sample "${job.ID}" this tick: ${e.message}`);
+      }
     }
   }
 }
