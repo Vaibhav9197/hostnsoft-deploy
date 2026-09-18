@@ -170,9 +170,21 @@ async function runSavedSpec(appName) {
   await fsp.access(specPath).catch(() => {
     throw new Error(`no saved job spec at ${specPath} — cannot wake ${appName}`);
   });
+  // -detach matters. Without it `nomad job run` MONITORS the deployment
+  // and does not return until it has completed, so the activator would
+  // sit blocked on the CLI while the thing it actually cares about — an
+  // address to forward to — became available much earlier. It also made
+  // a cold start look like a hang: nothing is logged for the whole
+  // monitoring period, and a visitor gave up long before the request was
+  // ever forwarded.
+  //
+  // waitForAddress below is the real wait, and it is the right one: it
+  // polls the same service registry Traefik reads, at 500ms, and returns
+  // the moment there is somewhere to send the request.
+  //
   // `nomad job inspect` writes {"Job": {...}}, which `job run -json`
   // reads back directly.
-  await execFileAsync('nomad', ['job', 'run', '-json', specPath]);
+  await execFileAsync('nomad', ['job', 'run', '-detach', '-json', specPath]);
 }
 
 /**
@@ -215,11 +227,17 @@ async function wake(appName) {
     return waitForAddress(appName, deadline);
   }
 
+  // Logged phase by phase, not just at the ends. A cold start is the one
+  // path here that legitimately takes tens of seconds, so "no output yet"
+  // and "wedged" look identical from outside — and that is exactly how
+  // the blocking `nomad job run` above went unnoticed.
+  const t0 = Date.now();
   log(`${appName}: cold start requested`);
   await verifyDataAgainstManifest(appName);
   await runSavedSpec(appName);
+  log(`${appName}: job submitted (+${Date.now() - t0}ms), waiting for an address`);
   const addr = await waitForAddress(appName, deadline);
-  log(`${appName}: awake at ${addr.host}:${addr.port}`);
+  log(`${appName}: awake at ${addr.host}:${addr.port} (+${Date.now() - t0}ms)`);
   return addr;
 }
 
@@ -313,12 +331,28 @@ const server = http.createServer(async (req, res) => {
   }
 
   const started = Date.now();
+  // A visitor who gives up mid-cold-start (or a curl that is Ctrl-C'd)
+  // is not a failure of this component, but it produces a write-to-dead-
+  // socket error that reads exactly like one. Tracked so the log says
+  // which happened.
+  let clientGone = false;
+  req.on('aborted', () => {
+    clientGone = true;
+  });
+  res.on('close', () => {
+    if (!res.writableFinished) clientGone = true;
+  });
+
   try {
     const body = await readBody(req);
     const addr = await ensureAwake(appName);
     await forwardWhenReady(req, res, addr, body, started + WAKE_TIMEOUT_MS);
     log(`${appName}: ${req.method} ${req.url} served in ${Date.now() - started}ms`);
   } catch (e) {
+    if (clientGone) {
+      log(`${appName}: client disconnected after ${Date.now() - started}ms during ${req.method} ${req.url} (the wake itself continues)`);
+      return;
+    }
     log(`${appName}: FAILED ${req.method} ${req.url} after ${Date.now() - started}ms — ${e.message}`);
     if (res.headersSent) {
       res.destroy();

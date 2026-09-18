@@ -281,6 +281,15 @@ rather than checksums: the files are quiescent between stop and wake, so
 any difference at all is a problem, and this avoids reading a whole
 database on every cold start.
 
+**Known limit — custom domains are not covered.** The fallback router
+matches only the app's default `<app>.<APPS_DOMAIN_SUFFIX>` hostname.
+`nomad-job-spec.js` also emits a router per custom domain, and those
+disappear with the job like any other Nomad-provider router — so a
+stopped app with a custom domain still 404s on that domain. Harmless
+while the only stoppable app is a throwaway test app with no custom
+domain, but it MUST be fixed before Step 6 puts a real app on this: a
+customer's own domain going dark is the most visible possible failure.
+
 **Deploying this needs `server-setup.sh`, not `redeploy.sh`** — the
 router lives in root-owned `/opt/traefik/dynamic.yml`, which only
 `server-setup.sh` generates. That run restarts Nomad, Docker and Traefik
