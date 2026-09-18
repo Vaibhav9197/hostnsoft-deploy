@@ -281,6 +281,40 @@ rather than checksums: the files are quiescent between stop and wake, so
 any difference at all is a problem, and this avoids reading a whole
 database on every cold start.
 
+**The blocker found on the first real wake: Nomad was deleting the
+image.** The Docker plugin in `nomad.hcl` carried no `gc` block, so the
+driver's defaults applied — `gc.image = true`, `image_delay = "3m"`. Once
+a stopped job's allocations were garbage collected, Nomad deleted the
+image itself. App images are built locally by railpack, pushed to no
+registry, and referenced with `force_pull = false`, so this destroyed the
+only copy in existence. Stopping an app quietly made it unrecoverable
+three minutes later.
+
+It surfaced as `pull access denied for scale-to-zero-test-1, repository
+does not exist or may require 'docker login'` — which reads as a registry
+credentials problem and is nothing of the sort. The deployment then
+burned four allocations against its restart policy and failed on the
+progress deadline, seven minutes later.
+
+Three changes, in order of what actually fixes it:
+
+1. `nomad.hcl` now sets `gc { image = false }` in the docker plugin.
+   Off rather than a longer `image_delay`, because deploy-service already
+   owns image lifecycle completely — `pruneOldImages()` keeps
+   `IMAGE_RETAIN_COUNT` versions per app after each deploy, and teardown
+   removes an app's images on delete. Nomad's GC was a second,
+   uncoordinated policy on top of that, and it could also delete the
+   image behind an older `imageTag` that one-click rollback depends on.
+2. `idle-report.js` verifies every image in the captured spec is present
+   before stopping, and aborts the stop if any is missing — the same rule
+   as capturing the spec itself: **do not stop what you cannot restart**.
+3. `activator.js` checks the same thing before submitting, so a missing
+   image is an immediate, accurate error rather than a seven-minute
+   deployment failure blaming Docker credentials.
+
+**Requires a `server-setup.sh` run**, since `nomad.hcl` changing means
+Nomad restarts.
+
 **Known limit — custom domains are not covered.** The fallback router
 matches only the app's default `<app>.<APPS_DOMAIN_SUFFIX>` hostname.
 `nomad-job-spec.js` also emits a router per custom domain, and those

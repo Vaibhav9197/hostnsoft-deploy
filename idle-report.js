@@ -48,6 +48,7 @@ const execFileAsync = promisify(execFile);
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const { appDataPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
+const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -255,6 +256,20 @@ async function captureJobSpec(appName) {
     throw new Error(`inspect returned no Job for "${appName}"`);
   }
 
+  // The spec is worthless without the images it references. App images
+  // are built locally and pushed to no registry, and Nomad's own docker
+  // GC used to delete them ~3m after the job's allocations were
+  // collected (now disabled in nomad.hcl) — so an app stopped with its
+  // image already gone could never be started again, and the failure
+  // surfaced as "pull access denied", nowhere near the real cause.
+  //
+  // Checked here, before the stop, and fatal: exactly the same rule as
+  // saving the spec. Do not stop what you cannot restart.
+  const missing = await missingImages(imagesFromSpec(parsed));
+  if (missing.length > 0) {
+    throw new Error(`image(s) not present on this host: ${missing.join(', ')}`);
+  }
+
   await fsp.mkdir(specDir, { recursive: true });
   await fsp.writeFile(dest, stdout);
   return dest;
@@ -378,7 +393,7 @@ async function main() {
       const specPath = await captureJobSpec(row.appName);
       console.log(`  job spec saved -> ${specPath}`);
     } catch (e) {
-      console.log(`  ABORT — could not save job spec (${e.message}); refusing to stop an app we may not be able to restart`);
+      console.log(`  ABORT — ${e.message}; refusing to stop an app we may not be able to restart`);
       continue;
     }
 

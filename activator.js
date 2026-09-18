@@ -36,6 +36,7 @@ const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
 const { appDataPathFor, defaultDomainFor } = require('./nomad-job-spec');
+const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
@@ -182,6 +183,23 @@ async function runSavedSpec(appName) {
   // polls the same service registry Traefik reads, at 500ms, and returns
   // the moment there is somewhere to send the request.
   //
+  // Check the images BEFORE submitting. Nomad's failure mode for a
+  // missing local image is to retry the pull, exhaust its restart
+  // attempts and fail the deployment minutes later, reporting `pull
+  // access denied ... repository does not exist` — which reads as a
+  // registry auth problem and is nothing of the sort. idle-report.js now
+  // refuses to stop an app in this state, so this should be
+  // unreachable; it is here because "should be unreachable" is exactly
+  // what was assumed about the image surviving a stop.
+  const spec = JSON.parse(await fsp.readFile(specPath, 'utf8'));
+  const missing = await missingImages(imagesFromSpec(spec));
+  if (missing.length > 0) {
+    throw new Error(
+      `image(s) missing on this host: ${missing.join(', ')} — these are built locally and pushed to no ` +
+        `registry, so ${appName} cannot be started without redeploying it`
+    );
+  }
+
   // `nomad job inspect` writes {"Job": {...}}, which `job run -json`
   // reads back directly.
   await execFileAsync('nomad', ['job', 'run', '-detach', '-json', specPath]);
