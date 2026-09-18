@@ -214,6 +214,48 @@ app.use(
 
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
+/**
+ * A job that is registered but DEAD must be purged before it can be
+ * deployed over.
+ *
+ * Nomad versions a job by the content of its spec. Redeploying the same
+ * app version produces a byte-identical spec (only the image tag and
+ * APP_VERSION vary per deploy), so Nomad creates no new version and
+ * starts no new deployment — and `nomad job run` then monitors the
+ * PREVIOUS deployment. If that one failed, the CLI exits non-zero and
+ * the deploy is reported as a failure although nothing was even
+ * attempted. The job's Submit Date gives it away: unchanged.
+ *
+ * That makes the most natural recovery action — retry the failed deploy
+ * with the same version number — permanently impossible, with an error
+ * ("Command failed: nomad job run ...") that says nothing about the
+ * actual cause. Hit for real on 2026-09-18.
+ *
+ * Only a job with no running allocations is purged, so this cannot
+ * disturb a live app: a running job takes the normal update path, where
+ * an identical spec correctly means "nothing to do". A stopped job is
+ * also purged — that includes one parked by scale-to-zero, where a
+ * deploy should plainly bring the app back rather than silently no-op.
+ */
+async function purgeIfNotRunning(appName) {
+  let status;
+  try {
+    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
+    status = JSON.parse(stdout).Job;
+  } catch {
+    return; // not registered at all — nothing to purge, the run registers it
+  }
+  if (!status || (status.Status === 'running' && status.Stop !== true)) return;
+
+  logger.info(`[${appName}] Existing job is ${status.Stop ? 'stopped' : status.Status} — purging before deploy`);
+  await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+    // Not fatal: the run below may still succeed (it will, whenever the
+    // new spec actually differs). Failing the deploy here would turn a
+    // recoverable case into an outage.
+    logger.warn(`[${appName}] Purge of dead job failed (continuing): ${e.message}`);
+  });
+}
+
 
 // Creates this app's host data directory before Nomad is asked to bind
 // mount it. Docker would otherwise create a missing bind-mount source
@@ -276,6 +318,9 @@ async function performBuildAndDeploy({
     await fs.writeFile(nomadFilePath, nomadJobSpec);
 
     logger.info(`[${appName}] Deploying to Nomad...`);
+    // See purgeIfNotRunning: without this, redeploying the same app
+    // version over a dead job is a silent no-op reported as a failure.
+    await purgeIfNotRunning(appName);
     await execPromise(`nomad job run ${nomadFilePath}`);
 
     // Best-effort, after the deploy that matters has already succeeded —

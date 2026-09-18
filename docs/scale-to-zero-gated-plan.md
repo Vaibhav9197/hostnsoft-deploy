@@ -23,8 +23,8 @@ completes it.
 | 1 | Request activity tracking | **Done** |
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
-| 4 | Activator (wake-on-request) | **Built, not yet verified** |
-| 5 | Unattended 24-48h run | Not started |
+| 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
+| 5 | Unattended 24-48h run | **Next** |
 | 6 | A few real, consenting apps | Not started |
 | 7 | Opt-in via the deploy API | Not started |
 
@@ -248,7 +248,32 @@ requests for `scale-to-zero-test-1`'s hostname through this new logic —
 every other app's traffic keeps flowing through Traefik exactly as
 today, completely untouched by this new component.
 
-**Status: built, not yet verified.** `deploy-service/activator.js`, its
+**Status: done — verified in prod on 2026-09-18.** A real request to a
+stopped app:
+
+```
+cold start requested → data verified (3 file(s), 1046296 bytes)
+job submitted (+315ms) → awake at 156.238.99.173:28025 (+832ms)
+GET / served in 4796ms          (curl: status=200 total=5.049436s)
+```
+
+**~5 seconds end to end**, of which the app's own boot is nearly all of
+it — Nomad placement was under a second. That is the number Step 5 needs
+in order to pick an idle threshold: the cold-start cost is small enough
+that a fairly aggressive threshold is defensible.
+
+Also confirmed on the same cycle: the manifest grew 1,038,056 →
+1,046,296 bytes across stop → GC → wake, so the app is writing to data
+that genuinely survived all three.
+
+The other three checks: 10 simultaneous requests to a stopped app all
+returned 200 and produced exactly ONE `cold start requested` — the
+single-flight guard holds. An app whose image was removed returned 503 in
+0.14s with an accurate message, rather than the seven-minute `pull access
+denied` this used to produce. And no request for any other app ever
+reached the activator.
+
+ `deploy-service/activator.js`, its
 own pm2 process (`<env>-activator`, `127.0.0.1:4200+offset`) rather than
 an endpoint inside deploy-service — it holds visitor connections open for
 the length of a cold start and must not be able to take the deploy API
@@ -315,6 +340,26 @@ Three changes, in order of what actually fixes it:
 **Requires a `server-setup.sh` run**, since `nomad.hcl` changing means
 Nomad restarts.
 
+**Known gap found on 2026-09-18 — the post-stop blackout window.**
+Traefik's Nomad provider polls on a refresh interval (15s by default).
+Between an app being stopped and Traefik noticing, Traefik still holds
+that app's OWN router, pointing at a dead allocation — so a request in
+that window gets a fast 502 and never falls through to the priority-1
+activator router that would have woken it. Observed directly: 10 requests
+sent seconds after a stop all failed, and the activator logged nothing at
+all.
+
+`server-setup.sh` now sets `--providers.nomad.refreshInterval=5s`, which
+shortens the window; nothing can close it, because Traefik's view of a
+stopped job can never be instantaneous. Two things follow:
+
+- Any test of wake behaviour must wait past the refresh interval after a
+  stop, or it is testing the stale router instead.
+- Step 5 should MEASURE this rather than assume 5s — it is the one
+  remaining case where a real visitor sees an error rather than a slow
+  page, and it is the strongest argument for a generous idle threshold
+  (fewer stops means fewer windows).
+
 **Known limit — custom domains are not covered.** The fallback router
 matches only the app's default `<app>.<APPS_DOMAIN_SUFFIX>` hostname.
 `nomad-job-spec.js` also emits a router per custom domain, and those
@@ -330,17 +375,17 @@ router lives in root-owned `/opt/traefik/dynamic.yml`, which only
 and briefly drops every customer app.
 
 **Verification before moving on**:
-- [ ] With the test app stopped (via Step 3), send it a real HTTP
+- [x] With the test app stopped (via Step 3), send it a real HTTP
       request — confirm the request is held (not an immediate error),
       the app cold-starts, and the *original* request gets a correct
       response (not just "app started," the actual expected content).
-- [ ] Send several requests simultaneously during a cold start — confirm
+- [x] Send several requests simultaneously during a cold start — confirm
       this doesn't trigger multiple redundant `nomad job run` calls for
       the same app.
-- [ ] Deliberately break the test app so it can't start — confirm the
+- [x] Deliberately break the test app so it can't start — confirm the
       activator returns a clean error after a reasonable timeout,
       instead of hanging forever.
-- [ ] Confirm no other app's traffic ever passes through this new proxy
+- [x] Confirm no other app's traffic ever passes through this new proxy
       component at all.
 
 ---
