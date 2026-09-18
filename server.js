@@ -73,6 +73,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
+const { renameApp } = require('./rename-app');
 
 // ---------------------------------------------------------------------------
 // Memory policy — see docs/Memory-oversubscription-req.md.
@@ -1170,6 +1171,76 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   } catch (error) {
     logger.error(`[${appName}] Applying config update failed:`, error);
     res.status(500).json({ error: "Applying config update failed", details: error.message });
+  }
+});
+
+/**
+ * Moves an app to a new name — see rename-app.js for the sequence and
+ * why it has to be that sequence.
+ *
+ * Synchronous, and deliberately slow: it does not answer until the app
+ * is live and holding a real certificate under the new name, or until
+ * everything has been put back. There is no wildcard certificate for the
+ * platform zone, so the new hostname needs its own ACME order and that
+ * is minutes, not milliseconds. Callers must allow for it. Answering
+ * early would mean reporting a rename that can still roll back, and
+ * hostnsoft-api would have already renamed its own record by then.
+ *
+ * Takes the same {imageTag, memoryMb, customDomains, envVars} the config
+ * endpoint above does — hostnsoft-api owns all four, and the job spec
+ * has to be rebuilt from scratch under the new name anyway.
+ */
+app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  const { newName, imageTag, memoryMb, customDomains, envVars } = req.body || {};
+
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name", code: 'invalid_app_name' });
+  }
+  if (typeof newName !== 'string' || !/^[a-z0-9-]+$/.test(newName)) {
+    return res.status(400).json({ error: "newName must be lowercase letters, digits and hyphens", code: 'invalid_app_name' });
+  }
+  if (customDomains !== undefined && (!Array.isArray(customDomains) || !customDomains.every((d) => typeof d === 'string'))) {
+    return res.status(400).json({ error: "customDomains must be an array of strings", code: 'invalid_config' });
+  }
+  if (envVars !== undefined && (!Array.isArray(envVars) || !envVars.every((v) => v && typeof v.key === 'string' && typeof v.value === 'string'))) {
+    return res.status(400).json({ error: "envVars must be an array of {key, value} strings", code: 'invalid_config' });
+  }
+
+  const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : MEMORY_CEILING_MB;
+
+  try {
+    const result = await renameApp(appName, newName, {
+      imageTag,
+      taskMemory,
+      // Same universal floor the config endpoint applies: no build dir
+      // here either, so there is no dependency scan to infer one from.
+      schedulingFloorMb: SCHEDULING_FLOOR_MB,
+      customDomains: customDomains || [],
+      envVars: envVars || [],
+    });
+
+    // The in-memory deploy state is keyed by app name, so carry it over
+    // or GET /apps/<newName>/status reports "unknown" for an app that
+    // just deployed successfully.
+    const previous = getDeployState(appName);
+    if (previous) setDeployState(newName, { ...previous, imageTag: result.imageTag });
+
+    logger.info(`[${appName}] Renamed to "${newName}"`);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    // renameApp rolls back before it throws, so by here the app is
+    // either still under its old name or the log says exactly what was
+    // left behind.
+    const status = error.code === 'app_not_found' ? 404
+      : error.code === 'app_name_taken' ? 409
+      : error.code === 'app_not_renameable' ? 409
+      : error.code === 'image_unavailable' ? 404
+      : error.code === 'certificate_timeout' ? 504
+      : error.code === 'invalid_app_name' || error.code === 'invalid_config' ? 400
+      : 500;
+    logger.error(`[${appName}] Rename to "${newName}" failed: ${error.message}`);
+    res.status(status).json({ error: error.message, code: error.code || 'rename_failed' });
   }
 });
 
