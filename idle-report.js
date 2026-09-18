@@ -221,6 +221,67 @@ async function snapshotAppData(appName) {
   return { dest, manifest };
 }
 
+/**
+ * Every `server` task's DATA_DIR, from a `nomad job inspect` payload.
+ *
+ * An app deployed before the host bind mount landed still has
+ * DATA_DIR=/alloc/data — Nomad's own allocation directory, which Nomad
+ * garbage collects along with a STOPPED job. An app only moves onto the
+ * bind mount on its next deploy, so "the platform was fixed" and "this
+ * app is safe to stop" are different statements, and on 2026-09-18 they
+ * were different for 28 of 36 running apps.
+ *
+ * A missing DATA_DIR is fine and reported as such: the app declares no
+ * persistent storage, so there is nothing a stop could lose.
+ */
+function dataDirsFromSpec(spec) {
+  const dirs = [];
+  for (const group of spec?.Job?.TaskGroups || []) {
+    for (const task of group.Tasks || []) {
+      if (task?.Name !== 'server') continue;
+      if (task?.Env && 'DATA_DIR' in task.Env) dirs.push(task.Env.DATA_DIR);
+    }
+  }
+  return dirs;
+}
+
+/**
+ * Filenames directly under the running allocation's /alloc/data, or null
+ * if that cannot be determined.
+ *
+ * Via Nomad's client filesystem API rather than the filesystem: allocation
+ * directories are root-owned and mode 0700, and this script deliberately
+ * runs as the deploy-service user (running it as root would leave
+ * root-owned SQLite -wal/-shm files beside the analytics database and
+ * break the running service's ability to write to it).
+ *
+ * null means "could not tell", which every caller must treat as unsafe.
+ * A 404 for a path that does not exist is NOT an error, though — Nomad
+ * returns one when an app never created /alloc/data at all, and that is
+ * the emptiest case there is.
+ */
+async function allocDataDirContents(appName) {
+  try {
+    const allocs = await nomadGet(`/v1/job/${encodeURIComponent(appName)}/allocations`);
+    const running = allocs
+      .filter((a) => a.ClientStatus === 'running')
+      .sort((a, b) => a.CreateIndex - b.CreateIndex)
+      .pop();
+    if (!running) return null;
+
+    const res = await fetch(
+      `${NOMAD_ADDR}/v1/client/fs/ls/${running.ID}?path=${encodeURIComponent('alloc/data')}`
+    );
+    if (res.status === 404) return [];
+    if (!res.ok) return null;
+    const entries = await res.json();
+    if (!Array.isArray(entries)) return null;
+    return entries.map((e) => e.Name).filter((n) => n && n !== '.' && n !== '..');
+  } catch {
+    return null;
+  }
+}
+
 // Capture the app's Nomad job spec to disk BEFORE stopping it.
 //
 // This is a hard prerequisite for Step 4, not a nicety. deploy-service
@@ -268,6 +329,49 @@ async function captureJobSpec(appName) {
   const missing = await missingImages(imagesFromSpec(parsed));
   if (missing.length > 0) {
     throw new Error(`image(s) not present on this host: ${missing.join(', ')}`);
+  }
+
+  // The third "do not stop what you cannot restart" check, and the only
+  // one whose failure costs a customer their DATA rather than just
+  // uptime.
+  //
+  // An app still on DATA_DIR=/alloc/data writes into Nomad's allocation
+  // directory, which Nomad garbage collects along with a stopped job. It
+  // would come back with nothing — and NOT crash: most app code, SQLite
+  // included, simply creates a fresh empty database and reports itself
+  // perfectly healthy. Nothing alerts, and by the time anyone notices the
+  // empty database has been the real one for hours.
+  //
+  // But an old DATA_DIR is not by itself a reason to refuse: most apps
+  // never write to it at all. On 2026-09-18, 28 of 36 running apps were
+  // still on /alloc/data and only 4 of those had a single file in it.
+  // Refusing all 28 would block Step 6 on redeploying two dozen apps that
+  // have nothing to lose. So the question is not which path DATA_DIR
+  // points at, it is whether anything is actually THERE.
+  //
+  // Read over Nomad's client filesystem API, not off disk: allocation
+  // directories are root-owned and mode 0700, and this runs as the
+  // deploy-service user. A direct read would fail, and the honest
+  // handling of "cannot tell" is to refuse — which would put us straight
+  // back to blocking all 28.
+  const badDataDirs = dataDirsFromSpec(parsed).filter((d) => d !== '/data');
+  if (badDataDirs.length > 0) {
+    const contents = await allocDataDirContents(appName);
+    if (contents === null) {
+      throw new Error(
+        `DATA_DIR is ${badDataDirs.join(', ')} (not /data) and its allocation directory could not be ` +
+          `read, so whether stopping this app would destroy data is unknown — refusing`
+      );
+    }
+    if (contents.length > 0) {
+      throw new Error(
+        `DATA_DIR is ${badDataDirs.join(', ')}, not /data, and holds ${contents.length} file(s) ` +
+          `(${contents.slice(0, 3).join(', ')}${contents.length > 3 ? ', ...' : ''}). Nomad garbage ` +
+          `collects that directory with a stopped job. Migrate and redeploy first — see ` +
+          `Server-setup/migrate-app-data.sh, and note a plain redeploy is NOT enough`
+      );
+    }
+    logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
   }
 
   await fsp.mkdir(specDir, { recursive: true });

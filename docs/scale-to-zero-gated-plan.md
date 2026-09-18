@@ -24,7 +24,7 @@ completes it.
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
-| 5 | Unattended 24-48h run | **Next** |
+| 5 | Unattended 24-48h run | **Soak running** since 2026-09-18 11:35 UTC |
 | 6 | A few real, consenting apps | Not started |
 | 7 | Opt-in via the deploy API | Not started |
 
@@ -90,9 +90,62 @@ network namespace — same discovery as `ORIGIN_IP` in
       directory 0777 as it creates it).
 - [ ] Confirm deleting an app removes its data directory, and that
       nothing else does.
-- [ ] Check whether any existing app has data in an old alloc dir that
+- [x] Check whether any existing app has data in an old alloc dir that
       needs a one-time copy:
       `ls -la /opt/nomad/data/alloc/*/alloc/data/ 2>/dev/null`
+      **Audited 2026-09-18** — see "Migration status" below.
+
+### Migration status as of 2026-09-18 — most apps are NOT migrated
+
+`migrate-app-data.sh` (dry run) plus a per-app read of the running spec:
+
+- **28 of 36 running apps still have `DATA_DIR=/alloc/data`** and no bind
+  mount. An app only moves onto the host directory on its NEXT deploy, so
+  "the platform was fixed" and "this app is safe to stop" are different
+  statements — and for most apps the second is still false.
+- **8 are migrated**: `commonground-campus-9f2d`, `demo-python`, `focus`,
+  `frontend`, `pushpendra-agrawal`, `recall-brain-delta-457666`,
+  `scale-to-zero-test-1`, `viasocket-embed`.
+- **5 have real files in an allocation directory**: `assetdesk`,
+  `assetdesk-v2`, `embarko-site`, `hostnsoft-panel-test` (all still on
+  `/alloc/data`) and `focus` (migrated; its allocation copy is stale
+  leftovers, and its destination is correctly newer and larger).
+- The four unmigrated ones already have a byte-identical copy at
+  `$APP_DATA_ROOT/<app>` from an earlier `--copy` run. That copy is
+  current only because none of them has written since 8-11 September.
+
+**Nothing is at risk today**: an allocation directory is only collected
+when its job STOPS, `STOPPABLE_APPS` contains one throwaway test app, and
+all 36 are running.
+
+**It is a hard precondition for Step 6.** Adding any `/alloc/data` app to
+the allowlist would destroy its data on the first stop — silently, because
+an app that wakes to a missing database does not crash, it creates a fresh
+one and reports itself healthy.
+
+Two things follow:
+
+1. `idle-report.js` now refuses to stop an app whose old `DATA_DIR`
+   actually **contains** something. An old `DATA_DIR` is not by itself a
+   reason to refuse: 28 apps are on `/alloc/data` and only 4 have a single
+   file between them, so a blanket refusal would block Step 6 on
+   redeploying two dozen apps that have nothing to lose. The question is
+   not which path `DATA_DIR` points at, it is whether anything is there.
+   Read over Nomad's client filesystem API, since allocation directories
+   are root-owned 0700 and this runs as the deploy-service user; "could
+   not tell" is treated as unsafe. A human reviewing a list of app names
+   for the allowlist cannot see any of this; the code can.
+2. Migrating an app is **not** just a redeploy. The existing copies are
+   point-in-time, so anything written between the copy and the redeploy
+   stays in the old location and is lost. The sequence is
+   `--copy` -> `nomad job stop <app>` -> `--copy --force` -> redeploy, per
+   that script's own header.
+
+`migrate-app-data.sh` also gained a guard while doing this audit: run
+without sudo it could not read the root-owned, 0700 allocation
+directories, every read swallowed its own error, and every app was
+reported as having nothing to migrate. A confident all-clear over stranded
+customer data. It now refuses to run rather than produce that.
 
 ---
 
@@ -398,6 +451,77 @@ stability, not adding features.
 **Deliverable**: idle-detection runs on a schedule (cron/systemd timer)
 for the one test app, cycling automatically through
 idle → stop → request → wake → serve → idle, with no manual intervention.
+
+**Status: soak running in prod since 2026-09-18 11:35 UTC.** Started with
+`scale-to-zero-soak.sh prod`; both timers confirmed scheduled via
+`systemctl list-timers`.
+
+Three bugs in the harness itself had to be fixed first, all of them
+systemd/bash subtleties that pass `bash -n` and fail only at runtime:
+
+- `OnUnitActiveSec` on a `Type=oneshot` whose run can last 150s left no
+  computable next elapse. Now `OnUnitInactiveSec`, which also gives the
+  interval its intended meaning: 45 minutes of idleness AFTER a request.
+- `OnBootSec` is measured from boot, so on a long-running box its deadline
+  is permanently past and produces no trigger — leaving a freshly
+  installed timer with nothing to anchor to at all. Now `OnActiveSec`,
+  relative to when the timer itself starts. The production idle timer had
+  the same latent bug and escaped it only by luck.
+- `systemctl list-unit-files | grep -q` under `set -o pipefail`: `grep -q`
+  exits on first match, the still-writing upstream takes SIGPIPE and exits
+  141, and the pipeline reports 141 — so a SUCCESSFUL match reads as a
+  failure. It passed initially (the listing fit in the 64KB pipe buffer)
+  and began failing permanently once two more unit files pushed it over.
+  Worth remembering as a shape: worked in testing, then failed for reasons
+  unrelated to any code change.
+
+
+Two things this step needs that the plan did not call out:
+
+- **Synthetic traffic.** `scale-to-zero-test-1` has no real users, so on a
+  schedule it would stop once and stay stopped — exercising the stop path
+  and never the wake path, which is the half that can lose data.
+- **A deliberately short threshold.** Production is 6 hours; at that rate
+  a 24h soak gives about four cycles, far too few to shake out a race.
+
+`server-setup.sh` installs the production watcher as a systemd timer
+(`embarko-idle-<env>`, every 10 min, `IDLE_THRESHOLD_MIN` default 360,
+running as APP_USER so it cannot leave root-owned WAL files beside the
+analytics database). `scale-to-zero-soak.sh <env>` layers the test
+instruments on top: a drop-in shortening the threshold to 15 min, and a
+timer requesting the test app every 45 min — about 30 full cycles a day.
+`--remove` takes both away and restores the real threshold without a
+re-provision. A drop-in rather than an edit so `server-setup.sh` can never
+bake the test value into production.
+
+**Scheduling does not widen what may be stopped.** That is still
+`STOPPABLE_APPS`, frozen in `idle-report.js`. At a 15-minute threshold
+nearly every app on the box reports as idle and every one of them is still
+left running — which is itself part of what the soak tests.
+
+**The threshold: 360 minutes (6 hours).** Chosen around the cost of
+STOPPING, not waking. Waking is graceful — ~5s, a slow page then correct
+content. Stopping is not: for a few seconds afterwards Traefik still
+routes to the dead allocation and a request gets a hard 502. So what
+matters is how OFTEN an app stops, not how long it stays stopped. Observed
+working-day gaps run 4-6 hours (`viasocket` 4h11, `socket-ux` 5h42,
+`embarko-homepage-prototype` 5h50), so a shorter threshold makes apps
+cycle during office hours, putting 502 windows exactly where the users
+are. 6 hours pushes almost every stop into the night. Of 31 live apps, 22
+were idle over 1h and 9 over 6h — so 6h gives up the evening savings to
+avoid daytime churn, and recovers most of it overnight anyway.
+
+Worth revisiting later, in this order: time-of-day awareness (6h by day,
+1h between 22:00-06:00) recovers the evening window; and routing
+scale-to-zero apps through the activator PERMANENTLY, proxying straight
+through while the app runs, removes the blackout window altogether and
+would allow a genuinely aggressive threshold. The latter costs a hop and
+makes the activator an availability dependency — a Step 6 decision.
+
+**What the soak is measuring**, beyond "no errors": the number of 502s
+against the number of cycles. That ratio is the blackout window's real
+cost, and it is the one number that should decide whether Step 6 needs the
+always-front proxy first.
 
 **Verification before moving on**:
 - [ ] Let this run unattended for 24-48 hours.
