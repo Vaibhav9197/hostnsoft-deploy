@@ -24,8 +24,8 @@ completes it.
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
-| 5 | Unattended 24-48h run | **Soak passed** — blackout window still unmeasured |
-| 6 | A few real, consenting apps | Not started |
+| 5 | Unattended 24-48h run | **Done** — soak passed, blackout window closed |
+| 6 | A few real, consenting apps | **Next** |
 | 7 | Opt-in via the deploy API | Not started |
 
 A step is "Done" only when every box in its own verification checklist is
@@ -549,6 +549,49 @@ The result that matters:
 Unbroken since before any of this — 803 visits across 31 stops, a Nomad
 job GC, an image deletion, a failed deploy and a version bump. The data
 directory grew 1,062,776 -> 4,181,472 bytes. No loss at any point.
+
+### The blackout window: measured, then closed
+
+Measured 2026-09-19 by stopping the app and requesting within a second,
+repeatedly: **roughly one in three attempts returned `502` in ~0.07s** —
+an instant hard error, never reaching the activator, never waking
+anything. The window is real, not theoretical.
+
+Closed by routing allowlisted apps through the activator
+**permanently** rather than only once stopped: `dynamic.yml`'s per-app
+router moves from `priority: 1` (below the ~44 Traefik derives from an
+app router's rule length) to `priority: 500` (above any possible
+rule-length value, far below the platform's own 10000/10100). Traefik
+then never points at an allocation for these apps, so there is no moment
+when it can point at a dead one. Narrowing `refreshInterval` shrinks the
+window; only this removes it.
+
+`activator.js` needed three things to be a proxy rather than a wake-up
+hook that happens to forward:
+
+- **An address cache** (30s TTL *and* failure-driven invalidation) so the
+  hot path makes no Nomad calls. A stale entry self-heals: a connection
+  error drops it and falls through to the full resolve-and-wake path,
+  which is safe to retry because nothing has been written back yet.
+- **A keep-alive agent**, so an app's whole traffic doesn't open and tear
+  down a TCP connection per request.
+- **Upgrade (WebSocket) proxying.** Not a bonus — while this only handled
+  stopped apps, upgrades never reached it and worked because nothing was
+  in the way. Routed here permanently, an activator that cannot proxy an
+  upgrade breaks them silently: the page loads, the socket never
+  connects.
+
+**The cost, stated plainly:** the activator is now an availability
+dependency for allowlisted apps, not just for waking them. It already had
+to be up for a stopped app to return; this extends that to serving a
+running one. That is the trade for removing the only hard-error path in
+the design.
+
+**This also weakens the case for a 6-hour threshold**, which was chosen
+around how often an app stops precisely because stopping was harmful. A
+stop now costs only a ~5s cold start on the next request. 6 hours stays
+as a conservative starting point for Step 6 — first real users — and
+should be revisited with data rather than left there by inertia.
 
 **What the soak did NOT test: the blackout window.** It requests every 45
 minutes and the watcher stops the app 15-25 minutes before each request,
