@@ -24,7 +24,7 @@ completes it.
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
-| 5 | Unattended 24-48h run | **Soak running** since 2026-09-18 11:35 UTC |
+| 5 | Unattended 24-48h run | **Soak passed** — blackout window still unmeasured |
 | 6 | A few real, consenting apps | Not started |
 | 7 | Opt-in via the deploy API | Not started |
 
@@ -135,7 +135,17 @@ Two things follow:
    are root-owned 0700 and this runs as the deploy-service user; "could
    not tell" is treated as unsafe. A human reviewing a list of app names
    for the allowlist cannot see any of this; the code can.
-2. Migrating an app is **not** just a redeploy. The existing copies are
+2. **Four apps need migrating** before they could join the allowlist:
+   `assetdesk`, `assetdesk-v2`, `embarko-site`, `hostnsoft-panel-test`.
+   `focus` does not — it is already on the bind mount, and
+   `migrate-app-data.sh` now skips apps whose running spec says `/data`
+   rather than listing them as candidates. That listing was dangerous, not
+   merely noisy: `--copy --force` on `focus` would have rsync'd a
+   five-day-old allocation copy over live data, and an old `-wal` written
+   over a newer `.db` can corrupt the database rather than just roll it
+   back. The script now also refuses any copy where the destination is
+   newer than the source, whatever `--force` says.
+3. Migrating an app is **not** just a redeploy. The existing copies are
    point-in-time, so anything written between the copy and the redeploy
    stays in the old location and is lost. The sequence is
    `--copy` -> `nomad job stop <app>` -> `--copy --force` -> redeploy, per
@@ -523,12 +533,51 @@ against the number of cycles. That ratio is the blackout window's real
 cost, and it is the one number that should decide whether Step 6 needs the
 always-front proxy first.
 
+### Soak results — 20 hours, 2026-09-18 11:35 to 2026-09-19 05:00 UTC
+
+**31 stop/wake cycles. 25 requests, all `200`. Zero 502s, zero aborts,
+zero errors of any kind.** Cold starts held at 4.1-6.4s with no upward
+drift across the run. The activator ran 16h with `unstable restarts 0`.
+
+The result that matters:
+
+```
+"visits": 803,
+"firstVisitEver": "2026-09-17T09:16:53.131Z"
+```
+
+Unbroken since before any of this — 803 visits across 31 stops, a Nomad
+job GC, an image deletion, a failed deploy and a version bump. The data
+directory grew 1,062,776 -> 4,181,472 bytes. No loss at any point.
+
+**What the soak did NOT test: the blackout window.** It requests every 45
+minutes and the watcher stops the app 15-25 minutes before each request,
+so every request arrived half an hour outside the window. 0/25 was
+structurally guaranteed and says nothing about the risk. Measuring it
+needs a request issued within seconds of a stop, repeated — still to do,
+and still the gate on Step 6.
+
+**A real problem the soak did find: snapshots grow without limit.** 36
+snapshots, 127MB, from one trivial app in 20 hours. Every stop copies the
+whole data directory and nothing removed the old ones. At the production
+6h threshold a real app stops about four times a day, so a 500MB database
+would write 2GB/day forever — and the first symptom would be a full disk
+taking every app on the box down at once. `idle-report.js` now keeps
+`SNAPSHOT_RETAIN_COUNT` (default 3) and prunes older ones, matched
+narrowly by directory-name pattern so `latest-manifest.json` and the app's
+own data cannot be caught by it.
+
+Worth watching, not yet a problem: of that 4.1MB, `visits.db` is 28KB and
+`visits.db-wal` is 4.1MB. The WAL is never checkpointed because the
+container is killed rather than shut down, so it only grows. Fine at this
+scale; for a long-lived real app it is a disk-growth question of its own.
+
 **Verification before moving on**:
-- [ ] Let this run unattended for 24-48 hours.
+- [x] Let this run unattended for 24-48 hours.
 - [ ] Confirm the test app's memory usage graph actually shows the
       expected pattern — near-zero during idle windows, normal during
       active windows.
-- [ ] Confirm zero errors, zero effect on any other app, over the whole
+- [x] Confirm zero errors, zero effect on any other app, over the whole
       observation window.
 
 ---

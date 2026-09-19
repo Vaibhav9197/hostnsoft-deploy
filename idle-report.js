@@ -71,6 +71,20 @@ const STOPPABLE_APPS = Object.freeze(['scale-to-zero-test-1']);
 // the stop, which the threshold's own resolution would miss.
 const RECENT_TRAFFIC_GRACE_SEC = Number(process.env.RECENT_TRAFFIC_GRACE_SEC) || 60;
 
+// How many past snapshots to keep per app. Same soft-override-with-a-
+// default convention as IMAGE_RETAIN_COUNT.
+//
+// Every stop copies the whole data directory, so without a bound this
+// grows without limit: 20 hours of soak on ONE trivial test app produced
+// 36 snapshots and 127MB. At the production 6h threshold a real app stops
+// about four times a day, so a 500MB database would write 2GB/day
+// forever, and the first symptom would be a full disk taking every app on
+// the box down at once.
+//
+// 3 rather than 1: the point of keeping any is to have somewhere to go
+// back to when the most recent copy turns out to be the damaged one.
+const SNAPSHOT_RETAIN_COUNT = Number(process.env.SNAPSHOT_RETAIN_COUNT) || 3;
+
 // Nomad jobs that are part of the platform itself, not a customer app.
 // Traefik is the only one that runs as a Nomad job (deploy-service and
 // api-service run under pm2, so they never appear in /v1/jobs at all) —
@@ -218,6 +232,7 @@ async function snapshotAppData(appName) {
   // cp -a, not a delete-then-copy: nothing in this file removes anything.
   await execFileAsync('cp', ['-a', `${dataDir}/.`, dest]);
   await fsp.writeFile(`${snapshotRoot}/latest-manifest.json`, JSON.stringify(manifest, null, 2));
+  await pruneSnapshots(snapshotRoot);
   return { dest, manifest };
 }
 
@@ -377,6 +392,55 @@ async function captureJobSpec(appName) {
   await fsp.mkdir(specDir, { recursive: true });
   await fsp.writeFile(dest, stdout);
   return dest;
+}
+
+/**
+ * Keep the newest SNAPSHOT_RETAIN_COUNT snapshots, remove older ones.
+ *
+ * This file's standing rule is that nothing here deletes app data, and
+ * that rule is not being relaxed. What is removed lives under
+ * $APP_DATA_ROOT/.snapshots/<app>/, which is OUR copy, written by the
+ * function above. The app's own data at $APP_DATA_ROOT/<app>/ is never
+ * touched by anything in this file, and removing it belongs to exactly
+ * one place: server.js's DELETE endpoint.
+ *
+ * Deliberately narrow so that stays true even if something upstream is
+ * wrong. Only entries directly inside the snapshot root are considered,
+ * only directories, and only those whose names match the timestamp format
+ * `snapshotAppData` generates. Anything else — most importantly
+ * latest-manifest.json, which Step 4's integrity check depends on — is
+ * left alone rather than merely happening not to match.
+ *
+ * Best-effort: a failed prune is a disk-usage problem, never a reason to
+ * fail a stop that already succeeded.
+ */
+const SNAPSHOT_DIR_PATTERN = /^\d{4}-\d{2}-\d{2}T[\d-]+Z$/;
+
+async function pruneSnapshots(snapshotRoot) {
+  let entries;
+  try {
+    entries = await fsp.readdir(snapshotRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const snapshots = entries
+    .filter((e) => e.isDirectory() && SNAPSHOT_DIR_PATTERN.test(e.name))
+    .map((e) => e.name)
+    // The timestamp format sorts lexicographically in chronological
+    // order, so this is oldest-first without parsing any dates.
+    .sort();
+
+  const doomed = snapshots.slice(0, Math.max(0, snapshots.length - SNAPSHOT_RETAIN_COUNT));
+  for (const name of doomed) {
+    try {
+      await fsp.rm(`${snapshotRoot}/${name}`, { recursive: true, force: true });
+    } catch (e) {
+      logger(`  ! could not prune old snapshot ${name}: ${e.message}`);
+    }
+  }
+  if (doomed.length > 0) {
+    logger(`  pruned ${doomed.length} old snapshot(s), keeping ${SNAPSHOT_RETAIN_COUNT}`);
+  }
 }
 
 async function stopApp(appName) {
