@@ -26,6 +26,13 @@ const { runWithRequestId } = require('./request-context');
 // for apps that already declare a real database dependency.
 const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
 
+// NEW: confirms the extracted upload actually has a manifest (or
+// index.html) at buildDir's own root — Railpack only looks there. Catches
+// the "app files nested in an extra wrapping folder" upload before any
+// build time is spent on it, instead of letting Railpack fail deep inside
+// the build with a cryptic error that never names the real cause.
+const { resolveBuildRoot } = require('./detect-manifest-root');
+
 // NEW: every deploy now authenticates as a specific company via a
 // company-scoped token issued (and revocable/rotatable) by hostnsoft-api,
 // replacing the old single shared PLATFORM_TOKEN everyone used.
@@ -522,6 +529,35 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       file: req.file.path,
       cwd: buildDir
     });
+
+    // NEW 2a-pre. Confirm there's actually something buildable at
+    // buildDir's own root before spending any build time — see
+    // detect-manifest-root.js. Auto-flattens the common single-wrapping-
+    // folder case (matching what the dashboard's own upload flow already
+    // does client-side in pack.ts's stripCommonRoot, so both paths behave
+    // identically) and only hard-fails when flattening wouldn't help.
+    const rootCheck = await resolveBuildRoot(buildDir);
+    if (rootCheck.flattened) {
+      logger.info(`[${appName}] Auto-flattened a wrapping folder ('${rootCheck.flattened}') to reach the app root`);
+    }
+    if (!rootCheck.ok) {
+      logger.info(`[${appName}] Rejected: no buildable manifest at the archive root${rootCheck.hint ? ` (found one nested at ${rootCheck.hint})` : ''}`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(422).json({
+        error: "No buildable app found at the archive root",
+        code: "no_manifest_at_root",
+        detail:
+          "No package.json, requirements.txt, pyproject.toml, go.mod, Gemfile, composer.json, " +
+          "Cargo.toml, or index.html was found at the top level of the uploaded archive" +
+          (rootCheck.hint ? `, but one was found nested at '${rootCheck.hint}'` : "") +
+          ". Railpack only looks at the archive root — re-package so the app's manifest (or " +
+          "index.html for a static site) sits at the top level, not inside an extra wrapping " +
+          "folder, then redeploy.",
+        foundNestedAt: rootCheck.hint || null,
+        docs: DOCS_URL,
+      });
+    }
 
     // NEW 2a. Read package.json once, up front — shared by the embedded-DB
     // memory check below AND to decide whether the window.storage scan is
