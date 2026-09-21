@@ -56,7 +56,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 // APPS_DOMAIN_SUFFIX's fail-fast check now lives inside this module (see
 // its defaultDomainFor) rather than here, since both this file and the
 // config endpoint below need it.
-const { buildNomadJobSpec, defaultDomainFor, appDataPathFor } = require('./nomad-job-spec');
+const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
 // ---------------------------------------------------------------------------
@@ -215,6 +215,42 @@ app.use(
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
 /**
+ * Save the app's Nomad job spec so it can be woken after a stop.
+ *
+ * Nomad's own copy is not enough: `job_gc_threshold` (4h) collects a
+ * STOPPED job out of Nomad's state entirely, taking the spec with it, and
+ * the spec rendered here is written to a temp build directory that is
+ * deleted moments later.
+ *
+ * idle-report.js already captures this immediately before it stops an
+ * app, which covers the apps scale-to-zero itself stops. That is not
+ * sufficient for a real app: it means the ONLY thing that ever creates
+ * the spec is the first stop, so between an app joining the allowlist and
+ * its first stop there is no saved spec at all — and any failure in that
+ * first capture leaves an app that cannot be woken. Writing it at deploy
+ * time means the spec exists from the moment the app does.
+ *
+ * Best-effort, and deliberately after the deploy has already succeeded: a
+ * failure here costs the ability to scale that app to zero, which is an
+ * opt-in feature. Failing the deploy over it would trade a working
+ * deployment for a missing optional file.
+ */
+async function saveJobSpec(appName) {
+  try {
+    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
+    // Parsed before writing so a truncated or error response cannot
+    // overwrite a good spec with something that only fails at wake time.
+    const parsed = JSON.parse(stdout);
+    if (!parsed.Job || parsed.Job.ID !== appName) throw new Error('inspect returned no matching Job');
+    const dest = specPathFor(appName);
+    await fs.ensureDir(path.dirname(dest));
+    await fs.writeFile(dest, stdout);
+  } catch (e) {
+    logger.warn(`[${appName}] Could not save Nomad job spec (scale-to-zero wake would fail): ${e.message}`);
+  }
+}
+
+/**
  * A job that is registered but DEAD must be purged before it can be
  * deployed over.
  *
@@ -322,6 +358,7 @@ async function performBuildAndDeploy({
     // version over a dead job is a silent no-op reported as a failure.
     await purgeIfNotRunning(appName);
     await execPromise(`nomad job run ${nomadFilePath}`);
+    await saveJobSpec(appName);
 
     // Best-effort, after the deploy that matters has already succeeded —
     // never lets a retention hiccup affect the response/state below.
@@ -947,6 +984,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
         await execPromise(`nomad job run ${nomadFilePath}`);
+        await saveJobSpec(appName);
         await fs.remove(nomadFilePath);
         logger.info(`[${appName}] Config update applied.`);
         await reportConfigPushResult(deploymentId, { success: true });
@@ -964,6 +1002,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
     await execPromise(`nomad job run ${nomadFilePath}`);
+    await saveJobSpec(appName);
     await fs.remove(nomadFilePath);
     res.json({ success: true });
   } catch (error) {
@@ -1028,7 +1067,7 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     // DELETED app is worse than clutter: it is a complete, runnable
     // description of an app the user asked us to remove, sitting exactly
     // where the activator looks. Removed here so deletion stays final.
-    const appSpecFile = `${appDataPathFor('.specs')}/${appName}.json`;
+    const appSpecFile = specPathFor(appName);
     await fs.remove(appSpecFile).catch((e) => {
       logger.warn(`[${appName}] Could not remove saved job spec ${appSpecFile}: ${e.message}`);
     });

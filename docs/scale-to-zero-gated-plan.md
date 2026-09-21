@@ -24,7 +24,7 @@ completes it.
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
-| 5 | Unattended 24-48h run | **Done** — soak passed, blackout window closed |
+| 5 | Unattended 24-48h run | **Done** — 2026-09-21, window closed and verified |
 | 6 | A few real, consenting apps | **Next** |
 | 7 | Opt-in via the deploy API | Not started |
 
@@ -566,6 +566,11 @@ then never points at an allocation for these apps, so there is no moment
 when it can point at a dead one. Narrowing `refreshInterval` shrinks the
 window; only this removes it.
 
+**Verified 2026-09-21**: the same stop-then-request-immediately loop that
+produced a 502 in one attempt out of three now returns `200` every time,
+at 4.4-5.3s — the request is held through the cold start instead of being
+refused. `priority: 500` confirmed live in `dynamic.yml`.
+
 `activator.js` needed three things to be a proxy rather than a wake-up
 hook that happens to forward:
 
@@ -622,6 +627,34 @@ scale; for a long-lived real app it is a disk-growth question of its own.
       active windows.
 - [x] Confirm zero errors, zero effect on any other app, over the whole
       observation window.
+
+### Step 6 preconditions
+
+1. **Restore the production idle threshold.** The soak drop-in still
+   holds `IDLE_THRESHOLD_MIN=15`. Real apps on a 15-minute threshold would
+   cycle through working hours, which is exactly what 360 exists to
+   prevent. `scale-to-zero-soak.sh prod --remove` restores it.
+2. **Job specs are now saved at DEPLOY time** (`server.js`'s
+   `saveJobSpec`), not only immediately before a stop. Stop-time capture
+   alone means the first stop is the only thing that ever creates the
+   spec, so an app has no saved spec between joining the allowlist and
+   stopping for the first time — and any failure in that one capture
+   leaves an app that cannot be woken. Best-effort and after the deploy
+   has succeeded: losing it costs the ability to scale that app to zero,
+   which is opt-in, and failing a working deploy over a missing optional
+   file would be the worse trade. The path now has a single definition,
+   `specPathFor` in `nomad-job-spec.js`, since three files touch it and a
+   disagreement would surface only as "cannot be woken", at the moment
+   someone is waiting.
+3. **Choose candidates with no custom domain.** The activator's routers
+   cover only `<app>.app.<suffix>`; a stopped app with a custom domain
+   still 404s on that domain. Sidestepped rather than fixed for now —
+   fixing it properly needs the activator to resolve custom domain -> app
+   via api-service.
+4. **Candidates must already be on `DATA_DIR=/data`.** `idle-report.js`
+   enforces this, but choosing an app that is already migrated avoids
+   needing user-visible downtime to migrate it first. 28 of 36 apps were
+   still on `/alloc/data` as of 2026-09-18.
 
 ---
 

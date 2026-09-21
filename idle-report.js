@@ -46,7 +46,7 @@ const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
-const { appDataPathFor } = require('./nomad-job-spec');
+const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 
@@ -320,8 +320,7 @@ async function allocDataDirContents(appName) {
 // `nomad job inspect` emits `{"Job": {...}}`, which is exactly what
 // `nomad job run -json` accepts back, so no transformation is needed.
 async function captureJobSpec(appName) {
-  const specDir = appDataPathFor('.specs');
-  const dest = `${specDir}/${appName}.json`;
+  const dest = specPathFor(appName);
   const { stdout } = await execFileAsync('nomad', ['job', 'inspect', appName]);
 
   // Guard against writing an empty or unparseable file over a good one:
@@ -389,7 +388,7 @@ async function captureJobSpec(appName) {
     logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
   }
 
-  await fsp.mkdir(specDir, { recursive: true });
+  await fsp.mkdir(path.dirname(dest), { recursive: true });
   await fsp.writeFile(dest, stdout);
   return dest;
 }

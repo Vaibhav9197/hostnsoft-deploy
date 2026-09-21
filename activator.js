@@ -58,7 +58,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
-const { appDataPathFor, defaultDomainFor } = require('./nomad-job-spec');
+const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-spec');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
@@ -223,7 +223,7 @@ async function verifyDataAgainstManifest(appName) {
  * is the normal case here, not the edge case.
  */
 async function runSavedSpec(appName) {
-  const specPath = `${appDataPathFor('.specs')}/${appName}.json`;
+  const specPath = specPathFor(appName);
   await fsp.access(specPath).catch(() => {
     throw new Error(`no saved job spec at ${specPath} — cannot wake ${appName}`);
   });
