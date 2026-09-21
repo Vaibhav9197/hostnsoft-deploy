@@ -71,6 +71,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 // its defaultDomainFor) rather than here, since both this file and the
 // config endpoint below need it.
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
+const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
 
 // ---------------------------------------------------------------------------
@@ -337,7 +338,7 @@ async function ensureAppDataDir(appName) {
 // here instead.
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+  claim, taskMemory, schedulingFloorMb, credential, deploymentId, scaleToZeroOptIn,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -384,6 +385,23 @@ async function performBuildAndDeploy({
     await purgeIfNotRunning(appName);
     await execPromise(`nomad job run ${nomadFilePath}`);
     await saveJobSpec(appName);
+
+    // AFTER saveJobSpec, which is what the router generation reads
+    // hostnames from — including any custom domain, which is the case a
+    // name alone cannot tell you about.
+    //
+    // Best-effort, like saveJobSpec: scale-to-zero is opt-in, and failing
+    // a working deployment because an optional registration did not stick
+    // would be the worse trade. The app simply stays always-on, which is
+    // the behaviour its owner had before asking.
+    if (scaleToZeroOptIn) {
+      try {
+        const result = await scaleToZero.optIn(appName);
+        logger.info(`[${appName}] Opted into scale-to-zero (${result.routers} router(s) across ${result.apps} app(s))`);
+      } catch (e) {
+        logger.warn(`[${appName}] Could not register for scale-to-zero (app stays always-on): ${e.message}`);
+      }
+    }
 
     // Best-effort, after the deploy that matters has already succeeded —
     // never lets a retention hiccup affect the response/state below.
@@ -481,6 +499,13 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
   // Never fall back to "latest" — Nomad's Docker driver always re-pulls :latest tags
   // and ignores the locally built image, even with force_pull = false.
+  // Step 7 opt-in. Absent — the default for every existing and future
+  // deploy — behaves exactly as before. Only an explicit "true" counts:
+  // anything else is treated as not opting in rather than guessed at,
+  // since the failure mode of a wrong guess is an app that sleeps when
+  // its owner never asked it to.
+  const scaleToZeroOptIn = String(req.headers['x-scale-to-zero'] || '').toLowerCase() === 'true';
+
   const rawVersion = req.headers['x-app-version'];
   const appVersion = (rawVersion && /^[a-zA-Z0-9._-]+$/.test(rawVersion))
     ? rawVersion
@@ -776,7 +801,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     performBuildAndDeploy({
       appName, appVersion, imageName, domain,
       buildDir, filePath: req.file.path,
-      claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+      claim, taskMemory, schedulingFloorMb, credential, deploymentId, scaleToZeroOptIn,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
@@ -1170,6 +1195,13 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     // After the job stop, not before: removing a running container's bind
     // mount source out from under it is how you corrupt a database rather
     // than delete one.
+    // Before the data and spec are removed: the router file is generated
+    // from those, and a deleted app left in the registry would keep a
+    // router pointing at the activator for a hostname nothing serves.
+    await scaleToZero.optOut(appName).catch((e) => {
+      logger.warn(`[${appName}] Could not remove from the scale-to-zero registry: ${e.message}`);
+    });
+
     const appDataDir = appDataPathFor(appName);
     await fs.remove(appDataDir).catch((e) => {
       // Best-effort, same posture as the not-found handling above — an

@@ -61,15 +61,39 @@ const execFileAsync = promisify(execFile);
 const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-spec');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
+const { allApps, hostnamesFor } = require('./scale-to-zero-registry');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
 
-// THE SAFETY RAIL — the same list idle-report.js stops from, defined
-// once in scale-to-zero-apps.js. One definition rather than two constants
-// kept in step by hand: an app stoppable but not wakeable is an app taken
+// THE SAFETY RAIL — the same set idle-report.js stops from: the code seed
+// plus whatever opted in at deploy time. Derived from one place so the two
+// cannot disagree; an app stoppable but not wakeable is an app taken
 // offline permanently.
-const WAKEABLE_APPS = SCALE_TO_ZERO_APPS;
+//
+// Refreshed rather than read once, because this process is long-lived and
+// an app can opt in at any moment. Until the refresh lands, a newly
+// opted-in app is simply not wakeable yet — the safe direction to fail.
+const WAKEABLE_TTL_MS = Number(process.env.WAKEABLE_TTL_MS) || 30000;
+let wakeable = { hosts: new Map(), names: new Set(SCALE_TO_ZERO_APPS), at: 0 };
+
+async function wakeableNow() {
+  if (Date.now() - wakeable.at < WAKEABLE_TTL_MS) return wakeable;
+  try {
+    const names = await allApps();
+    const hosts = new Map();
+    for (const name of names) {
+      for (const host of await hostnamesFor(name)) hosts.set(host.toLowerCase(), name);
+    }
+    wakeable = { hosts, names: new Set(names), at: Date.now() };
+  } catch (e) {
+    // Keep serving the previous set rather than emptying it: a transient
+    // read failure must not make every allowlisted app unreachable.
+    log(`could not refresh the wakeable set (keeping previous): ${e.message}`);
+    wakeable.at = Date.now();
+  }
+  return wakeable;
+}
 
 // How long to hold a visitor's request while the app cold-starts before
 // giving up. A container pull is already local (force_pull = false), so
@@ -320,12 +344,14 @@ async function wake(appName) {
 // Proxying
 // ---------------------------------------------------------------------
 
-function appNameFromHost(hostHeader) {
+// Hostname -> app, via the same spec-derived map the routers are generated
+// from, so the two cannot drift. A custom domain resolves here exactly
+// like a default one; parsing the app name out of the hostname would not
+// work for a custom domain at all.
+async function appNameFromHost(hostHeader) {
   const host = String(hostHeader || '').split(':')[0].toLowerCase();
-  // Matched against each app's own canonical domain rather than parsed
-  // out of the hostname: it is the same helper that generated the
-  // Traefik rule, so the two cannot drift.
-  return WAKEABLE_APPS.find((name) => defaultDomainFor(name) === host) || null;
+  const { hosts } = await wakeableNow();
+  return hosts.get(host) || null;
 }
 
 function readBody(req) {
@@ -399,7 +425,7 @@ async function forwardWhenReady(req, res, addr, body, deadline) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const appName = appNameFromHost(req.headers.host);
+  const appName = await appNameFromHost(req.headers.host);
   if (!appName) {
     // Nothing should ever reach here: Traefik only routes hostnames that
     // have a fallback router in dynamic.yml. A 404 rather than a proxy
@@ -495,7 +521,7 @@ server.on('upgrade', async (req, clientSocket, head) => {
   // app — down with it.
   clientSocket.on('error', () => clientSocket.destroy());
 
-  const appName = appNameFromHost(req.headers.host);
+  const appName = await appNameFromHost(req.headers.host);
   if (!appName) {
     clientSocket.destroy();
     return;
@@ -580,5 +606,7 @@ server.requestTimeout = WAKE_TIMEOUT_MS + 30000;
 server.headersTimeout = WAKE_TIMEOUT_MS + 30000;
 
 server.listen(PORT, '127.0.0.1', () => {
-  log(`listening on 127.0.0.1:${PORT}, wakeable: ${WAKEABLE_APPS.join(', ')}`);
+  wakeableNow().then(({ names }) =>
+    log(`listening on 127.0.0.1:${PORT}, wakeable: ${[...names].join(', ')}`)
+  );
 });

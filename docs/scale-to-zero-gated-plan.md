@@ -26,7 +26,7 @@ completes it.
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
 | 5 | Unattended 24-48h run | **Done** — 2026-09-21, window closed and verified |
 | 6 | A few real, consenting apps | **In progress** — 2 real apps added |
-| 7 | Opt-in via the deploy API | Not started |
+| 7 | Opt-in via the deploy API | **Built, not yet verified** |
 
 A step is "Done" only when every box in its own verification checklist is
 ticked. "Code shipped" is deliberately not the same thing: Step 3's code
@@ -791,6 +791,48 @@ at deploy time, instead of needing manual allowlist edits.
 with the idle-watcher and activator. When absent — the default,
 unchanged for every existing and future app that doesn't ask for
 this — behavior is identical to today.
+
+**Status: built 2026-09-21, not yet verified.**
+`X-Scale-To-Zero: true` on `POST /apps`. Absent — the default for every
+existing and future deploy — nothing changes. Only a literal `true`
+counts; anything else is treated as not opting in rather than guessed at,
+because the cost of a wrong guess is an app that sleeps when its owner
+never asked.
+
+**The allowlist becomes data, and that is a real reduction in the rail.**
+Three things compensate:
+
+- The code seed (`scale-to-zero-apps.js`) still exists and is still code.
+  The registry can only ADD to it, never remove from it.
+- Opting in requires an authenticated deploy *for that app*. There is no
+  endpoint that adds an arbitrary name.
+- Being listed only means "may be considered". `idle-report.js` still
+  re-checks, per stop, that the image exists, the spec was saved, and
+  `DATA_DIR` is not an allocation directory. The registry cannot waive
+  any of those.
+
+**Traefik moved from a single file to a directory provider**
+(`--providers.file.directory=/etc/traefik/dynamic`). `server-setup.sh`
+owns `platform.yml` there; deploy-service owns `scale-to-zero.yml` and
+rewrites it in full from the registry, which Traefik hot-reloads within
+seconds. That is what lets an app opt in without a re-provision, and it
+was the only way to do it: `dynamic.yml` is generated before the repo is
+even pulled.
+
+**Routers are now generated per HOSTNAME, from the saved job spec** — so
+custom domains are covered and `focus` becomes eligible. That gap is what
+kept it out of Step 6, and it had been noted twice as "handle before Step
+6" without being handled, because a noted risk is not a check.
+
+Registration happens AFTER `saveJobSpec`, which is what hostnames are read
+from, and is best-effort: a failed registration leaves the app always-on,
+which is the behaviour its owner had before asking. Deleting an app
+removes it from the registry before its data and spec go, so no router is
+left pointing at a hostname nothing serves.
+
+**Still to do once verified**: advertise the header in `capabilities.js`.
+That file's rule is to state only what the platform actually does, so it
+gets updated in the commit that proves this works, not before.
 
 **Verification before moving on**:
 - [ ] Deploy a brand-new test app *with* the header — confirm
