@@ -31,7 +31,14 @@ const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detec
 // the "app files nested in an extra wrapping folder" upload before any
 // build time is spent on it, instead of letting Railpack fail deep inside
 // the build with a cryptic error that never names the real cause.
-const { resolveBuildRoot } = require('./detect-manifest-root');
+const { resolveBuildRoot, detectDelegatingRoot } = require('./detect-manifest-root');
+
+// NEW: keeps a failed build's actual output (which used to be discarded
+// entirely) and turns the exit codes with an unambiguous meaning into a
+// stated cause. See build-diagnostics.js.
+const {
+  setBuildLog, getBuildLog, describeBuildFailure, BUILD_OUTPUT_MAX_BUFFER,
+} = require('./build-diagnostics');
 
 // NEW: every deploy now authenticates as a specific company via a
 // company-scoped token issued (and revocable/rotatable) by hostnsoft-api,
@@ -336,7 +343,18 @@ async function performBuildAndDeploy({
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
     // Railpack's CLI takes the directory as a positional arg and the
     // image tag via --name.
-    await execPromise(`cd ${buildDir} && railpack build . --name ${imageName}`);
+    //
+    // The output is CAPTURED, not discarded: railpack names the actual
+    // failing command in it, and that was previously thrown away — a
+    // failed build produces no Nomad allocation, so GET .../logs had
+    // nothing to serve either and the failure was undiagnosable. The
+    // raised maxBuffer matters for the same reason (exec's 1MB default
+    // truncates a cold-cache build). See build-diagnostics.js.
+    const buildResult = await execPromise(
+      `cd ${buildDir} && railpack build . --name ${imageName}`,
+      { maxBuffer: BUILD_OUTPUT_MAX_BUFFER },
+    );
+    setBuildLog(appName, buildResult);
 
     // Before the job spec is applied, not after — Nomad's bind mount
     // needs this to exist and be writable at container start.
@@ -403,6 +421,19 @@ async function performBuildAndDeploy({
   } catch (error) {
     logger.error(`[${appName}] Deployment failed:`, error);
 
+    // Keep whatever the failed command managed to write BEFORE the build
+    // directory is removed below — on an exec rejection these two fields
+    // carry railpack's own output, which is the only place the actual
+    // failing command is ever named. Retrievable afterwards via
+    // GET /apps/:appName/logs, which now falls back to it.
+    setBuildLog(appName, error);
+
+    // A stated cause for the exit codes that have one, appended to the
+    // raw error rather than replacing it — nothing that was reported
+    // before stops being reported.
+    const failure = describeBuildFailure(error);
+    const errorDetail = failure.hint ? `${error.message}\n\n${failure.hint}` : error.message;
+
     // Unlike before this became a background step, cleanup on failure
     // matters here too — a build that keeps failing (bad Dockerfile,
     // flaky dependency) would otherwise leave a build dir + upload behind
@@ -416,14 +447,14 @@ async function performBuildAndDeploy({
         projectSlug: appName,
         appVersion,
         status: 'failed',
-        errorDetail: error.message,
+        errorDetail,
         deploymentId,
       });
     }
     setDeployState(appName, {
       status: 'failed',
       finishedAt: new Date().toISOString(),
-      errorDetail: error.message,
+      errorDetail,
     });
   }
 }
@@ -555,6 +586,33 @@ app.post('/apps', upload.single('source'), async (req, res) => {
           "index.html for a static site) sits at the top level, not inside an extra wrapping " +
           "folder, then redeploy.",
         foundNestedAt: rootCheck.hint || null,
+        docs: DOCS_URL,
+      });
+    }
+
+    // NEW 2a-pre2. The root looks buildable, but only because a wrapper
+    // package.json sits on top of the real app — see
+    // detect-manifest-root.js's detectDelegatingRoot. railpack installs at
+    // the archive root only, so the delegated build dies on a missing
+    // binary (exit 127) minutes from now. Reject it in seconds, naming the
+    // subdirectory to deploy instead.
+    const delegating = await detectDelegatingRoot(buildDir);
+    if (delegating) {
+      logger.info(`[${appName}] Rejected: root package.json delegates its build to '${delegating.subdir}/'`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(422).json({
+        error: "The app to deploy is in a subdirectory, not at the archive root",
+        code: "app_nested_in_subdirectory",
+        detail:
+          `The package.json at the archive root declares no dependencies of its own and hands its ` +
+          `build to '${delegating.subdir}/'` +
+          (delegating.script ? ` (${delegating.script})` : '') +
+          `. Only the archive root is installed, so '${delegating.subdir}/node_modules' would never ` +
+          `be created and the build would fail on a missing command (exit code 127). Deploy the ` +
+          `'${delegating.subdir}' directory directly — upload that folder, or point the deploy ` +
+          `script at it — instead of the folder above it.`,
+        deployThisInstead: delegating.subdir,
         docs: DOCS_URL,
       });
     }
@@ -863,6 +921,30 @@ app.get('/apps/:appName/logs', async (req, res) => {
 
   const stream = req.query.stream === 'stderr' ? 'stderr' : 'stdout';
   const result = await getAppLogs(appName, { stream });
+
+  // NEW: Nomad allocation logs only exist once something has actually been
+  // scheduled, so a build that FAILED has none — which used to mean the
+  // one case people reach for logs hardest returned nothing at all. Fall
+  // back to the most recent build's own output (build-diagnostics.js),
+  // which is where the real failure is named. Runtime logs still win
+  // whenever they exist, so nothing about a healthy app's response
+  // changes.
+  if (!result.available) {
+    const buildLog = getBuildLog(appName);
+    if (buildLog) {
+      return res.json({
+        available: true,
+        source: 'build',
+        stream: 'combined',
+        logs: buildLog.output,
+        capturedAt: buildLog.capturedAt,
+        note:
+          "Runtime logs aren't available for this app yet, so these are its most recent BUILD " +
+          'logs instead. If the deploy failed, the cause is in here.',
+      });
+    }
+  }
+
   res.json(result);
 });
 

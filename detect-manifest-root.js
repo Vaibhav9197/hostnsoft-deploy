@@ -26,6 +26,15 @@ const MANIFEST_FILES = [
 ];
 const IGNORED_ENTRIES = new Set(['node_modules', '.git', '.next', 'dist', 'venv', '__pycache__']);
 
+// Ways a package.json script hands the real work to a subdirectory. Each
+// pattern captures the directory it delegates into.
+const DELEGATION_PATTERNS = [
+  /--prefix[= ]+(\S+)/,                  // npm --prefix frontend run build
+  /--cwd[= ]+(\S+)/,                     // yarn --cwd frontend build
+  /--dir[= ]+(\S+)/,                     // pnpm --dir frontend build
+  /(?:^|&&|;|\|)\s*cd\s+([^\s&;|]+)/,    // cd frontend && npm run build
+];
+
 async function hasManifestAt(dir) {
   for (const name of MANIFEST_FILES) {
     if (await fs.pathExists(path.join(dir, name))) return true;
@@ -89,4 +98,75 @@ async function resolveBuildRoot(buildDir) {
   return { ok: false, hint: null };
 }
 
-module.exports = { resolveBuildRoot, MANIFEST_FILES };
+// The case resolveBuildRoot above CANNOT catch: a root package.json that
+// exists (so the root looks buildable, and railpack duly picks its Node
+// provider) but declares no dependencies of its own and hands the build
+// to a subdirectory — the "wrapper root" of a frontend/backend split:
+//
+//   { "scripts": { "build": "npm --prefix frontend run build" } }
+//
+// railpack installs at the ARCHIVE ROOT only, so frontend/node_modules is
+// never created and the delegated build dies on a missing binary (exit
+// 127) minutes later, naming nothing useful. Detected here in seconds
+// instead.
+//
+// Deliberately narrow, because a false positive would block a working
+// deploy: it fires only when the root declares ZERO dependencies AND a
+// script delegates somewhere AND that somewhere really does hold its own
+// package.json. A root with its own dependencies installs and builds
+// normally, whatever else its scripts do, so it never reaches the checks
+// below.
+async function detectDelegatingRoot(buildDir) {
+  const pkgPath = path.join(buildDir, 'package.json');
+  if (!(await fs.pathExists(pkgPath))) return null;
+
+  let pkg;
+  try {
+    pkg = await fs.readJson(pkgPath);
+  } catch {
+    // An unparseable root package.json is a different (and self-evident)
+    // problem — let railpack be the one to report it rather than guessing.
+    return null;
+  }
+
+  const depCount =
+    Object.keys(pkg.dependencies || {}).length +
+    Object.keys(pkg.devDependencies || {}).length;
+  if (depCount > 0) return null;
+
+  const candidates = [];
+  const scripts = pkg.scripts || {};
+  for (const scriptName of ['build', 'start']) {
+    const text = scripts[scriptName];
+    if (typeof text !== 'string') continue;
+    for (const pattern of DELEGATION_PATTERNS) {
+      const match = pattern.exec(text);
+      if (match) candidates.push({ dir: match[1], script: `"${scriptName}": "${text}"` });
+    }
+  }
+
+  // npm/yarn workspaces describe the same shape declaratively. A glob
+  // ("packages/*") is left alone on purpose — it names no single
+  // directory to point someone at, and the confirmation below would
+  // fail on it anyway.
+  const workspaces = Array.isArray(pkg.workspaces)
+    ? pkg.workspaces
+    : (pkg.workspaces && Array.isArray(pkg.workspaces.packages) ? pkg.workspaces.packages : []);
+  for (const entry of workspaces) {
+    if (typeof entry === 'string') candidates.push({ dir: entry, script: null });
+  }
+
+  for (const candidate of candidates) {
+    const dir = candidate.dir.replace(/^\.\//, '').replace(/\/+$/, '');
+    // Nothing escaping the build directory, and nothing that just points
+    // back at the root — neither would be the nested app we're after.
+    if (!dir || dir === '.' || dir.includes('..') || path.isAbsolute(dir)) continue;
+    if (await fs.pathExists(path.join(buildDir, dir, 'package.json'))) {
+      return { subdir: dir, script: candidate.script };
+    }
+  }
+
+  return null;
+}
+
+module.exports = { resolveBuildRoot, detectDelegatingRoot, MANIFEST_FILES };
