@@ -25,7 +25,7 @@ completes it.
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
 | 5 | Unattended 24-48h run | **Done** — 2026-09-21, window closed and verified |
-| 6 | A few real, consenting apps | **Next** |
+| 6 | A few real, consenting apps | **In progress** — 2 real apps added |
 | 7 | Opt-in via the deploy API | Not started |
 
 A step is "Done" only when every box in its own verification checklist is
@@ -667,6 +667,46 @@ default.
 
 **Deliverable**: 2-3 real (but non-critical) apps added to the
 allowlist, with their owners informed beforehand.
+
+**Status: two real apps added, not yet exercised.** `demo-python` and
+`pushpendra-agrawal`, alongside the existing test app. Both were already
+on `DATA_DIR=/data`, so neither needed a migration with user-visible
+downtime first.
+
+**`focus` was chosen and then rejected by the pre-flight check** — it also
+serves `focus.walkover.uk`. The activator's routers cover only
+`<app>.<APPS_DOMAIN_SUFFIX>`, so once stopped it would have 404'd on a
+real customer domain: no wake, no warning, nothing in any log explaining
+why. The custom-domain gap had been noted twice as "a thing to handle
+before Step 6" and would have shipped anyway without a check that
+actually looks:
+
+```
+nomad job inspect <app> | grep -o 'Host(`[^`]*`)' | sort -u
+```
+
+An app on this list must return exactly one hostname. `focus` becomes a
+good candidate once Step 7 generates routers per HOSTNAME rather than per
+app.
+
+**The allowlist is now one list**, `deploy-service/scale-to-zero-apps.js`,
+read by both `idle-report.js` (what may be stopped) and `activator.js`
+(what may be woken). They were separate frozen constants in separate
+files: an app stoppable but not wakeable is an app taken offline
+permanently, which is much worse than the reverse, and two hand-synced
+lists is how that happens.
+
+A third copy remains — the Traefik routers in `dynamic.yml`, without which
+no request for a stopped app reaches the activator. `server-setup.sh` now
+generates them from a bash array rather than a hand-copied block per app,
+but it still cannot read the JS list: `dynamic.yml` is written before the
+repo is pulled. Step 7 replaces this.
+
+**Saved specs are refreshed on every watcher pass**, not only immediately
+before a stop. Stop-time capture alone leaves a real app with no saved
+spec between joining the allowlist and stopping for the first time, and
+makes that single capture the only thing between it and being unwakeable.
+One `nomad job inspect` per allowlisted app per run removes the gap.
 
 **Verification before moving on**:
 - [ ] Same checklist as Step 5, now for these specific apps.

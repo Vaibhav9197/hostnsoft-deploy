@@ -60,16 +60,16 @@ const execFileAsync = promisify(execFile);
 
 const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-spec');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
+const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
 
-// THE SAFETY RAIL, and deliberately the same shape as idle-report.js's
-// STOPPABLE_APPS: hardcoded and frozen, so widening it is a reviewed code
-// change rather than a config edit. These two lists must agree — an app
-// that can be stopped but not woken is an app we have taken offline
-// permanently. Step 6 is where both grow together.
-const WAKEABLE_APPS = Object.freeze(['scale-to-zero-test-1']);
+// THE SAFETY RAIL — the same list idle-report.js stops from, defined
+// once in scale-to-zero-apps.js. One definition rather than two constants
+// kept in step by hand: an app stoppable but not wakeable is an app taken
+// offline permanently.
+const WAKEABLE_APPS = SCALE_TO_ZERO_APPS;
 
 // How long to hold a visitor's request while the app cold-starts before
 // giving up. A container pull is already local (force_pull = false), so

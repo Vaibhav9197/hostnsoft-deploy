@@ -49,6 +49,7 @@ const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
+const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -59,12 +60,10 @@ const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 // from actual traffic patterns.
 const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 30;
 
-// THE SAFETY RAIL. Hardcoded and frozen deliberately: an allowlist read
-// from the environment or a config file could be widened by accident, or
-// by a deploy that ships the wrong file. Adding a real app here is a
-// code change that has to be reviewed and deployed — which is exactly
-// the friction Step 3 of the plan asks for. Step 6 is where this grows.
-const STOPPABLE_APPS = Object.freeze(['scale-to-zero-test-1']);
+// THE SAFETY RAIL — see scale-to-zero-apps.js, which is the single list
+// this and activator.js both read. Kept as a local alias so every
+// refusal below still reads as "not in STOPPABLE_APPS".
+const STOPPABLE_APPS = SCALE_TO_ZERO_APPS;
 
 // A last-moment re-check window. The idle threshold is measured in tens
 // of minutes; this catches a request that landed between the report and
@@ -503,6 +502,27 @@ async function main() {
       wouldStop: idleMs !== null && idleMs >= thresholdMs,
     };
   });
+
+  // Keep every allowlisted RUNNING app's spec on disk and current, not
+  // just the one about to be stopped.
+  //
+  // captureJobSpec runs immediately before a stop, which was enough while
+  // the only allowlisted app was a throwaway. For a real app it leaves a
+  // gap: between joining the allowlist and stopping for the first time
+  // there is no saved spec at all, and that single capture is then the
+  // only thing standing between the app and being unwakeable. Refreshing
+  // it on every pass costs one `nomad job inspect` per allowlisted app
+  // per run and removes the gap entirely.
+  //
+  // Failures are logged and ignored — this is a background refresh, not a
+  // precondition for anything. The capture before an actual stop is still
+  // there, still fatal to that stop, and remains the real guarantee.
+  for (const row of rows) {
+    if (!STOPPABLE_APPS.includes(row.appName)) continue;
+    await captureJobSpec(row.appName).catch((e) =>
+      logger(`  ! could not refresh saved spec for ${row.appName}: ${e.message}`)
+    );
+  }
 
   const apply = process.argv.includes('--apply');
   console.log(
