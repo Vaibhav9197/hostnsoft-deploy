@@ -708,6 +708,35 @@ spec between joining the allowlist and stopping for the first time, and
 makes that single capture the only thing between it and being unwakeable.
 One `nomad job inspect` per allowlisted app per run removes the gap.
 
+**Cold starts verified 2026-09-21**: `pushpendra-agrawal` 3.58s,
+`socket-ux` 5.43s, both from `dead (stopped)`, both returning identical
+content. `socket-ux` is a Next.js app, so this is also the first real app
+cold-starting through the always-front activator.
+
+### A category the plan never considered: in-memory state
+
+`demo-python` is a Todo app whose snapshot is **0 files, 0 bytes**. It
+writes nothing to `DATA_DIR` — its todos live in memory. Scale-to-zero
+will empty them every time it sleeps.
+
+This is not data loss in the sense the plan has been guarding against: we
+never had the data, and nothing we do destroys a file. It is something
+else, and arguably worse because none of the existing guards can see it —
+the spec check, the image check, the DATA_DIR check and the manifest
+comparison all pass an app that persists nothing at all. What changes is
+the app's BEHAVIOUR: it used to run indefinitely and accumulate state, and
+now it restarts every six hours.
+
+A content hash before and after will not catch it either. `demo-python`
+compared identical because an empty todo list looks exactly like an empty
+todo list.
+
+So Step 6's "owners have explicitly agreed to the cold-start tradeoff"
+has to mean more than tolerating a slow first request. **Before an app
+joins the allowlist, put real state into it, stop it, wake it, and check
+the state is still there.** If it is not, the owner has to accept that
+their app now forgets, or the app comes off the list.
+
 **Verification before moving on**:
 - [ ] Same checklist as Step 5, now for these specific apps.
 - [ ] Confirm every app *not* on the allowlist remains completely

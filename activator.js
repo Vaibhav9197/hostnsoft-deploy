@@ -539,6 +539,24 @@ server.on('upgrade', async (req, clientSocket, head) => {
       log(`${appName}: upgraded ${req.url}`);
     });
 
+    // The upstream may answer an upgrade request with an ORDINARY
+    // response instead of 101 — most often because the path simply is
+    // not a WebSocket endpoint. Without this the 'upgrade' handler above
+    // never fires, nothing is ever written back, and the client hangs
+    // until something times it out. Relay the real response instead, so
+    // "this path does not upgrade" reaches the client as the plain
+    // answer it is.
+    upstream.on('response', (upRes) => {
+      let head = `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n`;
+      for (let i = 0; i < upRes.rawHeaders.length; i += 2) {
+        head += `${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}\r\n`;
+      }
+      clientSocket.write(`${head}\r\n`);
+      upRes.pipe(clientSocket);
+      upRes.on('end', () => clientSocket.end());
+      log(`${appName}: upgrade request answered ${upRes.statusCode} (not a WebSocket endpoint)`);
+    });
+
     upstream.on('error', (e) => {
       // A stale cached address shows up here too, and the client will
       // reconnect — so drop the entry rather than serve the same dead
