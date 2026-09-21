@@ -50,6 +50,7 @@ const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
+const { allApps } = require('./scale-to-zero-registry');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -60,10 +61,14 @@ const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 // from actual traffic patterns.
 const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 30;
 
-// THE SAFETY RAIL — see scale-to-zero-apps.js, which is the single list
-// this and activator.js both read. Kept as a local alias so every
-// refusal below still reads as "not in STOPPABLE_APPS".
-const STOPPABLE_APPS = SCALE_TO_ZERO_APPS;
+// THE SAFETY RAIL. The code seed in scale-to-zero-apps.js plus anything
+// that opted in at deploy time (scale-to-zero-registry.js). Loaded once
+// per run in main(), before anything can consult it.
+//
+// Being on this list only means "may be considered". Every stop still has
+// to pass the spec, image and DATA_DIR checks below, none of which this
+// list can waive.
+let STOPPABLE_APPS = SCALE_TO_ZERO_APPS;
 
 // A last-moment re-check window. The idle threshold is measured in tens
 // of minutes; this catches a request that landed between the report and
@@ -477,6 +482,11 @@ async function main() {
     );
     process.exit(1);
   }
+
+  // Registry first: an app that opted in at deploy time is not in the code
+  // seed, and reading it after the report was built would silently exclude
+  // exactly the apps Step 7 exists to include.
+  STOPPABLE_APPS = await allApps();
 
   const db = getDb();
   const apps = await runningAppNames();
