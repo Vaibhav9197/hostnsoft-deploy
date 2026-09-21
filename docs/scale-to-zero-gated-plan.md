@@ -656,6 +656,41 @@ scale; for a long-lived real app it is a disk-growth question of its own.
    needing user-visible downtime to migrate it first. 28 of 36 apps were
    still on `/alloc/data` as of 2026-09-18.
 
+### Disk: orphaned anonymous volumes (2026-09-21)
+
+Found at 92% of a 124GB disk, twelve hours from taking every app down at
+once, with nothing in any log to say so — `df` was the only symptom.
+
+**74.66GB across 25 orphaned Docker volumes**, one of them 40.3GB. An
+image that declares `VOLUME` gets a fresh ANONYMOUS volume per container,
+and nothing reuses the old one: every redeploy, reschedule, and
+scale-to-zero stop-and-wake orphans another. Nomad's docker driver
+collects containers but not these. Reclaiming them took the disk to 30%.
+
+Two things worth recording because both guesses before measuring were
+wrong. It was not images — those are ~20GB of unique size and nearly all
+in use — and it was not BuildKit's cache, which reported 0B. `du` and
+`docker system df -v` gave the answer in minutes; three rounds of
+inference from `docker images` output did not.
+
+**Scale-to-zero makes this worse, not better**: every sleep/wake cycle is
+another container and therefore another orphan. `server-setup.sh` now
+installs a daily `embarko-docker-gc-<env>` timer (`docker volume prune`
+plus dangling images only). Safe because app data lives in BIND MOUNTS,
+which never appear in `docker volume ls`, and because an anonymous volume
+never survived its container being replaced — so nothing could have been
+relying on one.
+
+A related gap, not the cause of this one: `pruneOldImages()` runs only as
+part of a deploy, so an app deployed once and never again keeps every
+image it has ever had. Nomad's own image GC used to reap those as a side
+effect, and turning it off (necessary — it was deleting stopped apps'
+images) removed that without replacing it. `prune-app-images.sh` fills it,
+deliberately manual and dry-run by default: it protects images in use, and
+images named in a saved job spec, which are exactly the ones a stopped
+app needs to wake and which no "remove what nothing is running" rule
+would spare.
+
 ---
 
 ## Step 6: Expand to a small number of real, consenting apps
