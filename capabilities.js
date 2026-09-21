@@ -133,10 +133,17 @@ const CAPABILITIES = {
     env_vars: { status: 'available', via: ['agent', 'dashboard'] },
     rollback: { status: 'available', via: ['agent', 'dashboard'] },
     deployment_history: { status: 'available', via: ['agent', 'dashboard'] },
-    custom_domains: { status: 'available', via: ['dashboard'] },
+    // The register/verify/delete calls are agent-callable; creating the
+    // actual DNS record still requires a human at their own registrar,
+    // so an agent can drive most of this flow but not all of it.
+    custom_domains: { status: 'available', via: ['agent', 'dashboard'] },
+    rename_app: { status: 'available', via: ['agent', 'dashboard'] },
     memory_config: { status: 'available', via: ['dashboard'] },
-    delete_app: { status: 'available', via: ['dashboard'] },
-    analytics: { status: 'available', via: ['dashboard'] },
+    // Irreversible with no backup. Agent path requires the caller to
+    // resend the app's own name as confirmation — a deploy token alone
+    // (requestable by email, no further verification) isn't enough.
+    delete_app: { status: 'available', via: ['agent', 'dashboard'] },
+    analytics: { status: 'available', via: ['agent', 'dashboard'] },
     secrets: { status: 'unavailable' },
     scheduled_jobs: { status: 'unavailable' },
     background_workers: { status: 'unavailable' },
