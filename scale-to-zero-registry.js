@@ -97,6 +97,13 @@ async function hostnamesFor(appName) {
   return [...hosts].sort();
 }
 
+// A backtick as a plain constant rather than an escape inside a template
+// literal. Traefik's Host() rule requires backticks, and escaping one
+// inside a template literal is exactly the mistake that has now broken
+// this codebase twice — once in an HCL comment that silently terminated a
+// template literal and took deploy-service down, and once here.
+const BT = String.fromCharCode(96);
+
 function routerBlock(name, host, service) {
   // Custom domains are not in this platform's Cloudflare zone, so they can
   // only be issued over HTTP-01 — the same split the app's own router uses.
@@ -106,7 +113,7 @@ function routerBlock(name, host, service) {
       : HTTP01_CERT_RESOLVER;
   return [
     `    ${name}:`,
-    `      rule: "Host(\\`${host}\\`)"`,
+    `      rule: "Host(${BT}${host}${BT})"`,
     '      entryPoints:',
     '        - websecure',
     `      service: ${service}`,
