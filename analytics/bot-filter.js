@@ -39,6 +39,18 @@ const BOT_UA_PATTERN =
 const SCAN_PATH_PATTERN =
   /^\/(\.env|\.git\/|\.aws\/|\.ssh\/|\.DS_Store|wp-admin|wp-login|wp-content|xmlrpc\.php|phpmyadmin|trace\.axd|v2\/_catalog|actuator|config\.json|\.vscode\/|\.idea\/|vendor\/|server-status|cgi-bin\/|admin\.php|shell\.php|eval-stdin\.php)/i;
 
+// The same probes, but nested under some directory rather than at the
+// root: /nest/.env, /mail/.env, /htdocs/.env, /tmp/phpinfo.php. The
+// anchored pattern above misses all of these, and in 24h of real Step 6
+// traffic the nested form was the COMMON one — so scanner hits were
+// counting as genuine usage and keeping apps awake.
+//
+// Deliberately a much shorter list than the anchored one. Anchoring at
+// the root is what makes an entry like `vendor/` or `admin.php` safe;
+// unanchored, those would match real paths (`/assets/vendor/x.js`). Only
+// names no application serves from any directory belong here.
+const NESTED_SCAN_PATTERN = /\/(\.env(\.|$|\/)|\.git\/config|phpinfo\.php|eval-stdin\.php|wp-login\.php)/i;
+
 // A request with NO User-Agent at all. Browsers and real HTTP clients
 // always send one; bulk scanners frequently don't.
 //
@@ -49,6 +61,7 @@ const SCAN_PATH_PATTERN =
 // would appear idle. Only an explicitly empty string counts as missing.
 function isBotRequest({ userAgent, path }) {
   if (typeof path === 'string' && SCAN_PATH_PATTERN.test(path)) return true;
+  if (typeof path === 'string' && NESTED_SCAN_PATTERN.test(path)) return true;
 
   if (userAgent === null || userAgent === undefined) return false; // unknown -> treat as real
   if (userAgent === '' || userAgent === '-') return true;
@@ -56,4 +69,4 @@ function isBotRequest({ userAgent, path }) {
   return BOT_UA_PATTERN.test(userAgent);
 }
 
-module.exports = { isBotRequest, BOT_UA_PATTERN, SCAN_PATH_PATTERN };
+module.exports = { isBotRequest, BOT_UA_PATTERN, SCAN_PATH_PATTERN, NESTED_SCAN_PATTERN };

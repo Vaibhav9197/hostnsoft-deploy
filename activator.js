@@ -62,6 +62,7 @@ const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-s
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
 const { allApps, hostnamesFor } = require('./scale-to-zero-registry');
+const { isBotRequest } = require('./analytics/bot-filter');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
@@ -437,6 +438,34 @@ const server = http.createServer(async (req, res) => {
   }
 
   const started = Date.now();
+
+  // Automated traffic must not COLD START a sleeping app.
+  //
+  // idle-report.js already ignores scanner hits when deciding to stop, but
+  // nothing filtered the decision to WAKE — so an app would sleep, a
+  // scanner would probe /.env, and it burned a cold start and stayed up
+  // for another full idle threshold. Observed repeatedly in Step 6's first
+  // 24 hours: /.git/config and /.env woke real apps, and every new
+  // hostname attracts this within seconds of its first certificate because
+  // scanners watch Certificate Transparency logs.
+  //
+  // Only the COLD START is refused. A running app still serves these
+  // normally — there is nothing to protect once it is up, and answering
+  // differently depending on whether the app happens to be awake would be
+  // a behaviour change its owner never asked for.
+  //
+  // 404, not 503: it is what most apps return for these paths anyway, and
+  // it tells a scanner nothing about whether the host exists.
+  if (isBotRequest({ userAgent: req.headers['user-agent'] || null, path: req.url.split('?')[0] })) {
+    if (!cachedAddr(appName) && !(await jobIsRunning(appName).catch(() => true))) {
+      req.resume(); // drain rather than buffer a scanner's body
+      log(`${appName}: not waking for automated ${req.method} ${req.url}`);
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('Not found\n');
+      return;
+    }
+  }
+
   // A visitor who gives up mid-cold-start (or a curl that is Ctrl-C'd)
   // is not a failure of this component, but it produces a write-to-dead-
   // socket error that reads exactly like one. Tracked so the log says

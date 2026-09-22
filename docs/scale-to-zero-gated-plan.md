@@ -25,7 +25,7 @@ completes it.
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
 | 5 | Unattended 24-48h run | **Done** — 2026-09-21, window closed and verified |
-| 6 | A few real, consenting apps | **In progress** — 2 real apps added |
+| 6 | A few real, consenting apps | **Verified** 2026-09-22 — one efficiency fix pending |
 | 7 | Opt-in via the deploy API | **Built, not yet verified** |
 
 A step is "Done" only when every box in its own verification checklist is
@@ -772,9 +772,57 @@ joins the allowlist, put real state into it, stop it, wake it, and check
 the state is still there.** If it is not, the owner has to accept that
 their app now forgets, or the app comes off the list.
 
+### Step 6 results — 24 hours, 2026-09-21 06:00 to 2026-09-22 06:00 UTC
+
+**19 stops. 9 cold starts. Zero failures.** No `FAILED` line in the
+activator log at any point. Wake latency was flat all day: Nomad placement
+780-1228ms, full response 3.8-8.8s.
+
+**3 aborts, all `a deploy is in flight`** — the guard doing its job, not a
+fault. Every other app on the box was untouched; the watcher reports 36-43
+apps per pass and stopped only allowlisted ones.
+
+Docker GC ran and reclaimed 0B, so nothing regrew. Disk went 30% -> 32%,
+entirely from newly deployed apps.
+
+### The finding: scanners were cold-starting sleeping apps
+
+```
+demo-python:          GET /.git/config   served in 5916ms   <- woke it
+scale-to-zero-test-1: GET /.env          served in 3872ms   <- woke it
+pushpendra-agrawal:   GET /htdocs/.env, /psnlink/.env, /tmp/phpinfo.php
+scale-to-zero-test-1: GET /nest/.env
+demo-python:          GET /mail/.env
+```
+
+Two separate bugs, both now fixed:
+
+1. **The activator had no bot filter at all.** `idle-report.js` ignores
+   scanner traffic when deciding to STOP, but nothing filtered the decision
+   to WAKE. An app would sleep, a scanner would probe `/.env`, and it burned
+   a cold start and stayed up for another full six hours. The activator now
+   refuses to cold-start for automated traffic and returns 404 — only the
+   cold start, though: a RUNNING app still serves these normally, because
+   answering differently depending on whether an app happens to be awake
+   would be a behaviour change its owner never asked for.
+
+2. **`SCAN_PATH_PATTERN` was anchored at `^/`**, so it caught `/.env` but
+   missed `/nest/.env`, `/mail/.env`, `/htdocs/.env` and `/tmp/phpinfo.php`
+   — and in real traffic the NESTED form was the common one. So scanner
+   hits were counting as genuine usage and keeping apps awake even for idle
+   detection. A second, deliberately much shorter unanchored pattern now
+   covers them; anchoring is what makes entries like `vendor/` safe, so
+   only names no application serves from any directory were added.
+
+Neither is a correctness failure — no request was mishandled and no data
+was at risk — but together they undercut the economics the feature exists
+for. 19 stops in a day across four apps is roughly five per app, well above
+the 1-4 a 6-hour threshold should produce, because apps kept being woken by
+background scanning and then re-idling.
+
 **Verification before moving on**:
-- [ ] Same checklist as Step 5, now for these specific apps.
-- [ ] Confirm every app *not* on the allowlist remains completely
+- [x] Same checklist as Step 5, now for these specific apps.
+- [x] Confirm every app *not* on the allowlist remains completely
       unaffected — this is the most important check in this step,
       since it's the first time the mechanism runs against real traffic
       it wasn't purpose-built around.
