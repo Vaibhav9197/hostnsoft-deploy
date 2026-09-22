@@ -26,6 +26,16 @@
 const fs = require('fs-extra');
 const path = require('path');
 
+// BEFORE requiring nomad-job-spec, which fail-fasts at REQUIRE time on
+// APPS_DOMAIN_SUFFIX/APP_DATA_ROOT. Loading dotenv further down — inside
+// the require.main block at the bottom — is too late: the throw happens
+// while this file's own requires are still being evaluated. Only when run
+// directly; every caller loads its own .env first, and dotenv never
+// overrides an already-set variable.
+if (require.main === module) {
+  require('dotenv').config({ path: path.join(__dirname, '.env') });
+}
+
 const { appDataPathFor, specPathFor, defaultDomainFor, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
 const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
@@ -196,12 +206,11 @@ function isSeedApp(appName) {
 }
 
 // Run directly to rewrite the router file: `node scale-to-zero-registry.js`.
-// server-setup.sh calls this after pulling the repo and generating .env, so
-// a freshly provisioned box has routers for the code seed before anything
-// has opted in. dotenv here because nomad-job-spec fails fast without
-// APP_DATA_ROOT and APPS_DOMAIN_SUFFIX, and `sudo -u` drops the environment.
+// Called by both server-setup.sh and redeploy.sh after .env exists, so the
+// routers are regenerated on every deploy rather than only on a
+// re-provision. dotenv is loaded at the TOP of this file — see the note
+// there for why it cannot live in this block.
 if (require.main === module) {
-  require('dotenv').config({ path: path.join(__dirname, '.env') });
   regenerateRouters()
     .then((r) => console.log(`scale-to-zero: ${r.routers} router(s) for ${r.apps} app(s) -> ${ROUTER_FILE}`))
     .catch((e) => {
