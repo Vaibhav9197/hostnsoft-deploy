@@ -67,6 +67,10 @@ const { isBotRequest } = require('./analytics/bot-filter');
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
 
+// Obscure enough that no real app serves it, and only ever answered for a
+// request whose Host matches no app. See the handler.
+const HEALTH_PATH = '/__activator/health';
+
 // THE SAFETY RAIL — the same set idle-report.js stops from: the code seed
 // plus whatever opted in at deploy time. Derived from one place so the two
 // cannot disagree; an app stoppable but not wakeable is an app taken
@@ -427,6 +431,30 @@ async function forwardWhenReady(req, res, addr, body, deadline) {
 
 const server = http.createServer(async (req, res) => {
   const appName = await appNameFromHost(req.headers.host);
+
+  // Health, for the watchdog. Answered ONLY when the Host header matches
+  // no app, so no app's own /__activator/health is ever shadowed — the
+  // watchdog calls 127.0.0.1 directly, which never matches one.
+  //
+  // Deliberately cheap and deliberately SILENT: no Nomad call, no disk
+  // read, nothing logged. At one check every two minutes, logging here
+  // would add ~720 lines a day to a log we only just started rotating,
+  // and a health check that costs anything is a health check that becomes
+  // the problem.
+  if (!appName && req.url === HEALTH_PATH) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        uptimeSec: Math.round(process.uptime()),
+        wakeable: wakeable.names.size,
+        inFlight: inFlight.size,
+        cachedAddrs: addrCache.size,
+      })
+    );
+    return;
+  }
+
   if (!appName) {
     // Nothing should ever reach here: Traefik only routes hostnames that
     // have a fallback router in dynamic.yml. A 404 rather than a proxy
