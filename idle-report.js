@@ -24,7 +24,7 @@ const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
-const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
+const { SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
 const { allApps } = require('./scale-to-zero-registry');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
@@ -432,7 +432,11 @@ async function main() {
   const stoppable = rows.filter((r) => r.wouldStop).length;
 
   if (!apply) {
-    console.log(`\n${rows.length} app(s) checked, ${stoppable} would be stopped, 0 actually touched.`);
+    const eligible = rows.filter((r) => r.wouldStop && STOPPABLE_APPS.includes(r.appName)).length;
+    console.log(
+      `\n${rows.length} app(s) checked, ${stoppable} idle past the threshold, ` +
+        `${eligible} of those eligible (mode: ${SCALE_TO_ZERO_MODE}), 0 actually touched.`
+    );
     return;
   }
 
