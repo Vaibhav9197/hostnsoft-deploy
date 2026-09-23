@@ -27,6 +27,13 @@ const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
 const { allApps } = require('./scale-to-zero-registry');
 
+// `node idle-report.js | head -3` closes stdout mid-write; without this
+// Node throws an unhandled EPIPE and the run looks like a crash.
+process.stdout.on('error', (e) => {
+  if (e.code === 'EPIPE') process.exit(0);
+  throw e;
+});
+
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
 // How long without a request before an app counts as idle. Same
@@ -240,7 +247,7 @@ async function allocDataDirContents(appName) {
 // rendered spec after running it, so Nomad's own state is the only copy —
 // and job_gc_threshold (4h) collects a STOPPED job out of it, at which
 // point the app can never be woken. A capture failure ABORTS the stop.
-async function captureJobSpec(appName) {
+async function captureJobSpec(appName, { quiet = false } = {}) {
   const dest = specPathFor(appName);
   const { stdout } = await execFileAsync('nomad', ['job', 'inspect', appName]);
 
@@ -292,7 +299,9 @@ async function captureJobSpec(appName) {
           `already at APP_DATA_ROOT, copy it first with migrate-app-data.sh`
       );
     }
-    logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
+    if (!quiet) {
+      logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
+    }
   }
 
   await fsp.mkdir(path.dirname(dest), { recursive: true });
@@ -411,7 +420,7 @@ async function main() {
   const blocked = [];
   for (const row of rows) {
     if (!STOPPABLE_APPS.includes(row.appName)) continue;
-    await captureJobSpec(row.appName).catch((e) => blocked.push([row.appName, e.message]));
+    await captureJobSpec(row.appName, { quiet: true }).catch((e) => blocked.push([row.appName, e.message]));
   }
   if (blocked.length > 0) {
     const unmigrated = blocked.filter(([, m]) => m.includes('DATA_DIR'));
