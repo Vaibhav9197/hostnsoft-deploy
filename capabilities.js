@@ -23,7 +23,7 @@
 const crypto = require('crypto');
 
 const CAPABILITIES = {
-  capabilities_version: '2026-09-15',
+  capabilities_version: '2026-09-23',
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -119,10 +119,41 @@ const CAPABILITIES = {
     backups: false,
   },
 
+  // Opt-in at deploy time via `X-Scale-To-Zero: true` on POST /apps.
+  //
+  // Stated here because an agent has to decide BEFORE writing the app
+  // whether a cold start is acceptable for what it is building — a
+  // cron-driven webhook receiver, say, is a very different answer from a
+  // live dashboard. Absent the header nothing changes, which is why the
+  // default is spelled out rather than implied.
+  //
+  // The listed constraints are the ones actually enforced by
+  // idle-report.js before every single stop, not aspirations: an app
+  // failing any of them is reported and left running.
+  scale_to_zero: {
+    supported: true,
+    opt_in_header: 'X-Scale-To-Zero: true',
+    default: 'always_on',
+    idle_threshold_minutes: Number(process.env.IDLE_THRESHOLD_MIN) || 360,
+    // Measured in production, 2026-09-21/22: ~0.8s for Nomad to place the
+    // allocation, 3.5-9s to a complete first response. The request is HELD
+    // through the cold start, never refused.
+    typical_cold_start_seconds: '4-9',
+    requirements: [
+      'writes any persistent state under DATA_DIR (see persistence above)',
+      'tolerates the process restarting between requests — in-memory state is lost',
+    ],
+    notes: [
+      'Automated traffic (credential scanners, crawlers) will NOT wake a sleeping app; it gets a 404.',
+      'A stopped app is woken by the first real request, which is held until the app answers.',
+    ],
+  },
+
   // status: available | preview | unavailable
   // via:    who can actually invoke it today
   features: {
     deploy: { status: 'available', via: ['agent', 'dashboard'] },
+    scale_to_zero: { status: 'available', via: ['agent'] },
     redeploy: { status: 'available', via: ['agent', 'dashboard'] },
     deploy_status: { status: 'available', via: ['agent', 'dashboard'] },
     logs: { status: 'available', via: ['agent', 'dashboard'] },

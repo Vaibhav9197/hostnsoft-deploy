@@ -26,7 +26,7 @@ completes it.
 | 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
 | 5 | Unattended 24-48h run | **Done** — 2026-09-21, window closed and verified |
 | 6 | A few real, consenting apps | **Verified** 2026-09-22 — one efficiency fix pending |
-| 7 | Opt-in via the deploy API | **Built, not yet verified** |
+| 7 | Opt-in via the deploy API | **Done** — verified in prod 2026-09-23 |
 
 A step is "Done" only when every box in its own verification checklist is
 ticked. "Code shipped" is deliberately not the same thing: Step 3's code
@@ -77,14 +77,19 @@ network namespace — same discovery as `ORIGIN_IP` in
 - [x] Deploy a test app that writes a SQLite database under `DATA_DIR`,
       confirm the file appears under `$APP_DATA_ROOT/<appName>/` on the
       host.
-- [ ] Redeploy it — confirm the data is still there (no regression on
+- [x] Redeploy it — confirm the data is still there (no regression on
       the guarantee that already existed).
-- [ ] `nomad job stop` it, wait past `job_gc_threshold`, re-run the job —
+- [x] `nomad job stop` it, wait past `job_gc_threshold`, re-run the job —
       confirm the data is STILL there. This is the whole point of the
       step; if this check fails, nothing after it is safe. Re-run it from
       the spec `idle-report.js` saved under `$APP_DATA_ROOT/.specs/`, NOT
       from Nomad: by the time this check is due, Nomad has GC'd the
       stopped job and no longer has the spec (see Step 3).
+      **Verified the hard way on 2026-09-18**: `nomad job status` reported
+      "No job(s) with prefix or ID found" — the job was entirely gone from
+      Nomad's state — and the activator restored it from the saved spec
+      with the visit counter unbroken. Also verified across 1.0.0 -> 1.0.1
+      -> 1.0.2 redeploys: 803 -> 1134 visits, `firstVisitEver` unchanged.
 - [x] Confirm the container can actually write to the mount (Railpack
       images don't all run as root — deploy-service chmods each app's
       directory 0777 as it creates it).
@@ -840,7 +845,11 @@ with the idle-watcher and activator. When absent — the default,
 unchanged for every existing and future app that doesn't ask for
 this — behavior is identical to today.
 
-**Status: built 2026-09-21, not yet verified.**
+**Status: done — verified in prod 2026-09-23.** A deploy carrying
+`X-Scale-To-Zero: true` wrote the app into the registry and regenerated the
+router file from 4 to 5 entries, with no re-provision. A deploy without the
+header changed nothing.
+
 `X-Scale-To-Zero: true` on `POST /apps`. Absent — the default for every
 existing and future deploy — nothing changes. Only a literal `true`
 counts; anything else is treated as not opting in rather than guessed at,
@@ -883,12 +892,68 @@ That file's rule is to state only what the platform actually does, so it
 gets updated in the commit that proves this works, not before.
 
 **Verification before moving on**:
-- [ ] Deploy a brand-new test app *with* the header — confirm
+- [x] Deploy a brand-new test app *with* the header — confirm
       scale-to-zero works out of the box, no manual config needed.
-- [ ] Deploy a brand-new test app *without* the header — confirm it
+- [x] Deploy a brand-new test app *without* the header — confirm it
       behaves exactly like every other app today (always-on).
-- [ ] Confirm every existing already-deployed app is completely
+- [x] Confirm every existing already-deployed app is completely
       unaffected by this change to `deploy-service`.
+
+---
+
+## The bot-wake fix, verified 2026-09-23
+
+The Step 6 finding, confirmed fixed in production:
+
+```
+scanner: 404 in 0.11s   -> app still `dead (stopped)`
+         activator log: "not waking for automated GET /.env"
+real:    200 in 3.91s   -> cold start requested, served in 3828ms
+```
+
+The split is exactly right: a credential scanner gets a cheap 404 and the
+app stays asleep; the next genuine request wakes it and is held through the
+cold start.
+
+## Where this leaves the plan
+
+All seven steps are built and running in production, and the mechanism is
+proven: apps sleep when idle, wake on a real request, and lose nothing in
+between — `scale-to-zero-test-1` passed 1134 visits across roughly forty
+stop/wake cycles with `firstVisitEver` unchanged since 2026-09-17.
+
+**Two checklist boxes are still genuinely open**, and neither should be
+ticked by assumption:
+
+1. **The memory saving has never been measured.** Step 5's box asks for the
+   idle memory pattern and it was never checked. That is the entire
+   economic justification for this work — every other number here is about
+   correctness, and correctness without the saving means the feature costs
+   cold starts and buys nothing. Mechanically the container is gone when
+   the job stops, so the RSS must be freed, but "must be" is not a
+   measurement.
+2. **Deleting an app has never been tested end to end.** Step 0 asks that
+   deletion removes the data directory and that nothing else does. The
+   delete path now also removes the saved spec and the registry entry, and
+   none of that has been exercised — so the one path that is *supposed* to
+   destroy data is the least tested one here.
+
+Worth carrying forward, none of which the plan anticipated:
+
+- **`IDLE_THRESHOLD_MIN` of 360 was chosen when stopping was harmful.**
+  The 502 window is closed and a stop now costs only a cold start, so the
+  argument for six hours is weaker than when it was picked. Revisit it with
+  Step 6/7 data rather than leaving it there by inertia.
+- **In-memory state is invisible to every guard here.** The spec, image,
+  `DATA_DIR` and manifest checks all pass an app that persists nothing at
+  all. Before adding an app, put real state into it, stop it, wake it, and
+  check the state survived.
+- **Three lists still have to agree** — the code seed, the registry, and
+  the routers. The routers are generated now, which removes the worst of
+  it, but the seed and registry are still separate concepts.
+- **Nomad is unpinned.** `server-setup.sh` installs whatever HashiCorp's
+  checkpoint API currently returns; it silently moved prod 2.0.6 -> 2.0.7
+  on 2026-09-21. Same risk the BuildKit pin exists to prevent.
 
 ---
 
