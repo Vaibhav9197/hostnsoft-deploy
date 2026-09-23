@@ -38,7 +38,11 @@ if (require.main === module) {
 
 const { appDataPathFor, specPathFor, defaultDomainFor, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
-const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
+const {
+  SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, WEBSOCKET_LOOKBACK_DAYS, isAlwaysFront,
+} = require('./scale-to-zero-apps');
+
+const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
 const REGISTRY_PATH = `${appDataPathFor('.scale-to-zero')}/apps.json`;
 
@@ -79,10 +83,89 @@ async function writeRegistry(reg) {
   await fs.rename(tmp, REGISTRY_PATH);
 }
 
-/** Every app allowed to scale to zero: the code seed plus the registry. */
+/**
+ * Apps that have served an HTTP 101 recently — WebSocket apps, which must
+ * never be put to sleep automatically.
+ *
+ * This is the failure mode universal mode introduces that the allowlist
+ * never exposed. Idle detection reads Traefik's access log, and Traefik
+ * logs a WebSocket request only when the connection CLOSES. So an app with
+ * a room full of users connected for six hours produces NO log line at all
+ * and reads as completely idle. Stopping it drops every live connection.
+ *
+ * Returns null if analytics is unavailable — which callers must treat as
+ * "cannot tell", not "none".
+ */
+function websocketApps() {
+  try {
+    // Required lazily: analytics is optional, and a box without it must
+    // still be able to load this module.
+    const { getDb, isAnalyticsEnabled } = require('./analytics/db');
+    if (!isAnalyticsEnabled()) return null;
+    const since = Date.now() - WEBSOCKET_LOOKBACK_DAYS * 86400000;
+    const rows = getDb()
+      .prepare('SELECT DISTINCT app_name FROM request_log WHERE status = 101 AND ts >= ?')
+      .all(since);
+    return new Set(rows.map((r) => r.app_name));
+  } catch {
+    return null;
+  }
+}
+
+async function runningJobNames() {
+  const res = await fetch(`${NOMAD_ADDR}/v1/jobs`);
+  if (!res.ok) throw new Error(`Nomad /v1/jobs -> ${res.status}`);
+  const jobs = await res.json();
+  return jobs.filter((j) => j.Status === 'running' && j.Stop !== true).map((j) => j.ID);
+}
+
+/**
+ * Every app allowed to scale to zero.
+ *
+ * allowlist mode: the code seed plus anything that opted in.
+ * universal mode: every running app, minus the exclusions.
+ *
+ * The seed is always included and can never be excluded by data — it is
+ * the floor, and the only part of this that a bad registry or an
+ * unreachable Nomad cannot take away.
+ */
 async function allApps() {
   const reg = await readRegistry();
-  return [...new Set([...SCALE_TO_ZERO_APPS, ...Object.keys(reg.apps)])].sort();
+  const optedIn = Object.entries(reg.apps).filter(([, v]) => !v.optedOut).map(([k]) => k);
+  const base = new Set([...SCALE_TO_ZERO_APPS, ...optedIn]);
+
+  if (SCALE_TO_ZERO_MODE !== 'universal') return [...base].sort();
+
+  const ws = websocketApps();
+  if (ws === null) {
+    // Cannot tell which apps hold WebSocket connections, so cannot safely
+    // enrol anything new. Falls back to exactly what allowlist mode would
+    // do rather than guessing — the alternative is dropping live
+    // connections on an app nobody opted in.
+    logger('universal mode: analytics unavailable, falling back to the allowlist');
+    return [...base].sort();
+  }
+
+  let running;
+  try {
+    running = await runningJobNames();
+  } catch (e) {
+    logger(`universal mode: could not list jobs (${e.message}), falling back to the allowlist`);
+    return [...base].sort();
+  }
+
+  const optedOut = new Set(Object.entries(reg.apps).filter(([, v]) => v.optedOut).map(([k]) => k));
+  for (const name of running) {
+    if (EXCLUDED_APPS.includes(name)) continue;
+    if (optedOut.has(name)) continue;
+    if (ws.has(name)) continue;
+    base.add(name);
+  }
+  return [...base].sort();
+}
+
+function logger(line) {
+  console.log(`${new Date().toISOString()} [scale-to-zero] ${line}`);
 }
 
 /**
@@ -114,7 +197,7 @@ async function hostnamesFor(appName) {
 // template literal and took deploy-service down, and once here.
 const BT = String.fromCharCode(96);
 
-function routerBlock(name, host, service) {
+function routerBlock(name, host, service, alwaysFront) {
   // Custom domains are not in this platform's Cloudflare zone, so they can
   // only be issued over HTTP-01 — the same split the app's own router uses.
   const resolver =
@@ -127,11 +210,18 @@ function routerBlock(name, host, service) {
     '      entryPoints:',
     '        - websecure',
     `      service: ${service}`,
-    // 500: above anything Traefik derives from an app router's rule length
-    // (so the activator stays in front even while the app runs, which is
-    // what closes the post-stop 502 window), far below the platform's
-    // 10000/10100 (so it can never capture ship.<domain> or /api).
-    '      priority: 500',
+    // 500 keeps the activator PERMANENTLY in front, closing the post-stop
+    // 502 window entirely — but it also puts the activator in the path of
+    // that app's every request. Reserved for the seed apps, which have run
+    // that way since 2026-09-21 and are proven.
+    //
+    // 1 is BELOW the ~25-44 Traefik derives from an app router's rule
+    // length, so a running app is reached directly and the activator only
+    // catches the hostname once the app is stopped. That reintroduces a
+    // ~5s window after each stop where Traefik still points at a dead
+    // allocation, and is the deliberate trade for not making the activator
+    // the front door for the whole fleet.
+    alwaysFront ? '      priority: 500' : '      priority: 1',
     '      tls:',
     `        certResolver: ${resolver}`,
     '',
@@ -163,7 +253,9 @@ async function regenerateRouters() {
     for (const host of await hostnamesFor(appName)) {
       // Router names must be unique across the whole file provider, and a
       // hostname can contain dots which read badly in Traefik's dashboard.
-      lines.push(routerBlock(`wake-${host.replace(/[^a-z0-9-]/gi, '-')}`, host, ACTIVATOR_SERVICE));
+      lines.push(
+        routerBlock(`wake-${host.replace(/[^a-z0-9-]/gi, '-')}`, host, ACTIVATOR_SERVICE, isAlwaysFront(appName))
+      );
       count += 1;
     }
   }
@@ -193,7 +285,27 @@ async function optIn(appName) {
   return regenerateRouters();
 }
 
-async function optOut(appName) {
+/**
+ * Mark an app as never eligible, for `X-Scale-To-Zero: false`.
+ *
+ * A RECORD, not a deletion. In universal mode an app is eligible by
+ * default, so removing its entry would silently re-enrol it on the next
+ * pass — the opposite of what its owner asked for. The entry has to
+ * persist to say "no".
+ */
+async function setOptedOut(appName) {
+  const reg = await readRegistry();
+  reg.apps[appName] = { optedOut: true, optedOutAt: new Date().toISOString() };
+  await writeRegistry(reg);
+  return regenerateRouters();
+}
+
+/**
+ * Forget an app entirely, for a DELETED app. Distinct from setOptedOut:
+ * this one means "gone", and leaving an entry behind would keep a router
+ * pointing at a hostname nothing serves.
+ */
+async function forget(appName) {
   const reg = await readRegistry();
   if (!(appName in reg.apps)) return null;
   delete reg.apps[appName];
@@ -227,6 +339,7 @@ module.exports = {
   hostnamesFor,
   regenerateRouters,
   optIn,
-  optOut,
+  setOptedOut,
+  forget,
   isSeedApp,
 };

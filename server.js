@@ -338,7 +338,8 @@ async function ensureAppDataDir(appName) {
 // here instead.
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, taskMemory, schedulingFloorMb, credential, deploymentId, scaleToZeroOptIn,
+  claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+  scaleToZeroOptIn, scaleToZeroOptOut,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -394,12 +395,24 @@ async function performBuildAndDeploy({
     // a working deployment because an optional registration did not stick
     // would be the worse trade. The app simply stays always-on, which is
     // the behaviour its owner had before asking.
-    if (scaleToZeroOptIn) {
+    if (scaleToZeroOptIn || scaleToZeroOptOut) {
       try {
-        const result = await scaleToZero.optIn(appName);
-        logger.info(`[${appName}] Opted into scale-to-zero (${result.routers} router(s) across ${result.apps} app(s))`);
+        const result = scaleToZeroOptIn
+          ? await scaleToZero.optIn(appName)
+          : await scaleToZero.setOptedOut(appName);
+        logger.info(
+          `[${appName}] scale-to-zero ${scaleToZeroOptIn ? 'opt-IN' : 'opt-OUT'} recorded ` +
+            `(${result.routers} router(s) across ${result.apps} app(s))`
+        );
       } catch (e) {
-        logger.warn(`[${appName}] Could not register for scale-to-zero (app stays always-on): ${e.message}`);
+        // An opt-IN failure leaves the app always-on, which is safe. An
+        // opt-OUT failure is NOT: in universal mode the app stays
+        // eligible, so its owner's "leave mine alone" did not take. Said
+        // plainly rather than folded into a generic warning.
+        logger.warn(
+          `[${appName}] Could not record scale-to-zero ${scaleToZeroOptIn ? 'opt-in' : 'OPT-OUT'}: ${e.message}` +
+            (scaleToZeroOptOut ? ' — THIS APP MAY STILL BE PUT TO SLEEP' : ' (app stays always-on)')
+        );
       }
     }
 
@@ -504,7 +517,12 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // anything else is treated as not opting in rather than guessed at,
   // since the failure mode of a wrong guess is an app that sleeps when
   // its owner never asked it to.
-  const scaleToZeroOptIn = String(req.headers['x-scale-to-zero'] || '').toLowerCase() === 'true';
+  const scaleToZeroHeader = String(req.headers['x-scale-to-zero'] || '').toLowerCase();
+  const scaleToZeroOptIn = scaleToZeroHeader === 'true';
+  // An explicit "false" is a real instruction, not just the absence of
+  // one. In universal mode an app is eligible by default, so "leave mine
+  // alone" has to be RECORDED — otherwise the next pass re-enrols it.
+  const scaleToZeroOptOut = scaleToZeroHeader === 'false';
 
   const rawVersion = req.headers['x-app-version'];
   const appVersion = (rawVersion && /^[a-zA-Z0-9._-]+$/.test(rawVersion))
@@ -801,7 +819,8 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     performBuildAndDeploy({
       appName, appVersion, imageName, domain,
       buildDir, filePath: req.file.path,
-      claim, taskMemory, schedulingFloorMb, credential, deploymentId, scaleToZeroOptIn,
+      claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+      scaleToZeroOptIn, scaleToZeroOptOut,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
@@ -1198,7 +1217,7 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     // Before the data and spec are removed: the router file is generated
     // from those, and a deleted app left in the registry would keep a
     // router pointing at the activator for a hostname nothing serves.
-    await scaleToZero.optOut(appName).catch((e) => {
+    await scaleToZero.forget(appName).catch((e) => {
       logger.warn(`[${appName}] Could not remove from the scale-to-zero registry: ${e.message}`);
     });
 
