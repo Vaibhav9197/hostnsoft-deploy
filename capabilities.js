@@ -23,7 +23,7 @@
 const crypto = require('crypto');
 
 const CAPABILITIES = {
-  capabilities_version: '2026-09-15',
+  capabilities_version: '2026-09-22',
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -58,6 +58,30 @@ const CAPABILITIES = {
     dockerfile: 'rejected',
     builder: 'railpack',
     detects: ['node', 'python', 'go', 'ruby', 'php', 'rust', 'java', 'static'],
+  },
+
+  // A plain static site — Railpack's "staticfile" provider: an index.html
+  // at the upload root, a public/ directory, or a Staticfile — is not
+  // built into an image and does not run as a container. Its files are
+  // published to a shared static file server behind Traefik and are live
+  // seconds after the upload is accepted (see docs/Static-apps-req.md).
+  // Everything under `runtime` and `persistence` is about a SERVER app
+  // and does not apply to it: nothing listens on PORT, DATA_DIR does not
+  // exist, env vars are accepted by the control plane but reach nothing.
+  // A build-time SPA (Vite, CRA, ...) is still built and served in a
+  // container today. The deploy response and status carry `kind`.
+  static_apps: {
+    served_directly: ['staticfile'],
+    detected_by: 'railpack',
+    build: false,
+    container: false,
+    env_vars_apply: false,
+    data_dir: false,
+    // A server app may be redeployed as a static site (its job is
+    // retired). A static site can NOT be redeployed as a server app: that
+    // upload is refused before anything is built — use a new app name.
+    server_to_static: 'allowed',
+    static_to_server: { http_status: 422, code: 'app_kind_changed', fix: 'use a new X-App-Name' },
   },
 
   // How an agent obtains and keeps a credential. `file` is the convention

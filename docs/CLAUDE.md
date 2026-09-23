@@ -97,6 +97,20 @@ history first).
   deploy with a 422 rather than shipping something that will fail at
   runtime. Skips the scan entirely if the app already declares a real DB
   dependency (`better-sqlite3`, `sqlite3`). PGlite is no longer supported.
+- **`build-plan.js`**, **`static-site.js`**, **`traefik-router-file.js`**,
+  **`app-kind.js`**, **`static-server/`** (added 2026-09-22) — the static
+  fast path, see `docs/Static-apps-req.md`. A plain static site (Railpack's
+  `staticfile` provider, decided by `railpack info`, not by us) is not
+  built into an image or run as a Nomad job: its files go under
+  `STATIC_SITES_ROOT/<app>/versions/<version>/` with a `current` symlink,
+  one shared Caddy (`static-server/Caddyfile`, a Nomad system job from
+  server-setup.sh) serves them all, and Traefik reaches it through a
+  per-app file-provider router in `TRAEFIK_DYNAMIC_DIR`. **The
+  `manifest.json` in that directory is how every other endpoint tells a
+  static app from a Nomad job** — hostnsoft-api never sends the kind. A
+  server app may be redeployed as a static site (its job is retired); a
+  static site can NOT become a server app — refused with 422
+  `app_kind_changed`. Four new required env vars — see `.env.example`.
 - **`app-registry.js`** — a **stopgap** flat-JSON-file record of what
   each app last deployed with (`version`, `dbType`, `memory`,
   `deployedAt`). This exists only because this service has no real

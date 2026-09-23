@@ -59,6 +59,20 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor } = require('./nomad-job-spec');
 const { requireInternalSecret } = require('./internal-auth');
 
+// NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
+// asks Railpack whether an upload is a plain static site; if so it is
+// published as files (static-site.js) behind a Traefik file-provider
+// router (traefik-router-file.js) instead of being built into an image
+// and run as a Nomad job. app-kind.js says which of the two an existing
+// app already is, since an app name keeps its kind for life.
+const { inspectBuildPlan } = require('./build-plan');
+const {
+  isStaticApp, hasStaticVersion, publishStaticVersion, switchCurrentVersion,
+  updateManifest, pruneOldStaticVersions, removeStaticApp,
+} = require('./static-site');
+const { writeStaticRouterFile, removeStaticRouterFile } = require('./traefik-router-file');
+const { resolveAppKind } = require('./app-kind');
+
 // ---------------------------------------------------------------------------
 // Memory policy — see docs/Memory-oversubscription-req.md.
 //
@@ -237,6 +251,62 @@ async function ensureAppDataDir(appName) {
   return dir;
 }
 
+// Shared tail of every background deploy, container or static: reports
+// the outcome to hostnsoft-api so its dashboard deployment history is
+// actually populated, and to this process's own deploy-status.js.
+// Skipped for anonymous deploys — see docs/Anonymous-deploy-req.md's
+// "out of scope": there's no company to attribute history to
+// until/unless the project is claimed. deploymentId (from the
+// in_progress call in the request handler) updates that same row in
+// place rather than creating a second one for this attempt.
+async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId }) {
+  if (isIdentified(credential)) {
+    await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'success',
+      imageTag: imageName,
+      memoryMb: taskMemory,
+      deploymentId,
+    });
+  }
+  setDeployState(appName, {
+    status: 'success',
+    finishedAt: new Date().toISOString(),
+    errorDetail: null,
+    imageTag: imageName,
+  });
+  logger.info(`[${appName}] Deployment complete.`);
+}
+
+async function finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error }) {
+  logger.error(`[${appName}] Deployment failed:`, error);
+
+  // Unlike before this became a background step, cleanup on failure
+  // matters here too — a build that keeps failing (bad Dockerfile,
+  // flaky dependency) would otherwise leave a build dir + upload behind
+  // on every single retry, forever, with nothing to ever remove them.
+  await fs.remove(buildDir).catch(() => {});
+  await fs.remove(filePath).catch(() => {});
+
+  if (isIdentified(credential)) {
+    await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'failed',
+      errorDetail: error.message,
+      deploymentId,
+    });
+  }
+  setDeployState(appName, {
+    status: 'failed',
+    finishedAt: new Date().toISOString(),
+    errorDetail: error.message,
+  });
+}
+
 // Runs the actually-slow part of a deploy (railpack build + `nomad job
 // run`) — split out of the request handler below so it can continue
 // AFTER the response is already sent (see the handler's own comment for
@@ -287,55 +357,76 @@ async function performBuildAndDeploy({
     await fs.remove(buildDir);
     await fs.remove(filePath);
 
-    // Reports the outcome to hostnsoft-api so its dashboard deployment
-    // history is actually populated. Skipped for anonymous deploys — see
-    // docs/Anonymous-deploy-req.md's "out of scope": there's no company
-    // to attribute history to until/unless the project is claimed.
-    // deploymentId (from the in_progress call below) updates that same
-    // row in place rather than creating a second one for this attempt.
-    if (isIdentified(credential)) {
-      await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'success',
-        imageTag: imageName,
-        memoryMb: taskMemory,
-        deploymentId,
-      });
-    }
-    setDeployState(appName, {
-      status: 'success',
-      finishedAt: new Date().toISOString(),
-      errorDetail: null,
-      imageTag: imageName,
-    });
-    logger.info(`[${appName}] Deployment complete.`);
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId });
   } catch (error) {
-    logger.error(`[${appName}] Deployment failed:`, error);
+    await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
+  }
+}
 
-    // Unlike before this became a background step, cleanup on failure
-    // matters here too — a build that keeps failing (bad Dockerfile,
-    // flaky dependency) would otherwise leave a build dir + upload behind
-    // on every single retry, forever, with nothing to ever remove them.
-    await fs.remove(buildDir).catch(() => {});
-    await fs.remove(filePath).catch(() => {});
+// The static fast path — see docs/Static-apps-req.md. Everything a
+// container deploy does after the upload is skipped: no railpack build,
+// no image, no data directory, no Nomad job. The files are copied under
+// STATIC_SITES_ROOT (static-site.js) and a Traefik router file points the
+// app's hostnames at the shared static server (traefik-router-file.js).
+// Still runs in the background after the 202, purely so the response
+// contract (accepted -> poll statusUrl) is the same for both kinds of
+// app; in practice it is finished within a second.
+async function performStaticDeploy({
+  appName, appVersion, imageName, domain, buildDir, filePath,
+  claim, credential, deploymentId, plan, convertingFromService,
+}) {
+  try {
+    logger.info(`[${appName}] Static site (railpack provider: ${plan.providers}, root: ${plan.rootDir}) — publishing files directly, no image build and no Nomad job.`);
+    await publishStaticVersion({
+      appName,
+      version: appVersion,
+      sourceDir: path.join(buildDir, plan.rootDir),
+      provider: plan.providers,
+    });
+    await writeStaticRouterFile({
+      appName,
+      domain,
+      customDomains: claim.customDomains || [],
+      isOrphan: claim.isOrphan,
+      orphanExpiresAt: claim.orphanExpiresAt,
+      orphanLoginUrl: claim.orphanLoginUrl,
+    });
+    logger.info(`[${appName}] Static version ${appVersion} is live.`);
 
-    if (isIdentified(credential)) {
-      await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'failed',
-        errorDetail: error.message,
-        deploymentId,
+    // Server app -> static site (see app-kind.js for why this direction
+    // is allowed). The router file above already sends the hostnames to
+    // the static server, so purging the job — and with it the
+    // Nomad-provider router that was matching the same Host — only
+    // removes a container nothing routes to any more. Its images go too:
+    // a rollback to one of them is not something the static config push
+    // can do, so keeping them would only take up disk. The app's DATA_DIR
+    // is deliberately left alone — only the delete endpoint removes data.
+    // This is also how every static app that predates the fast path (a
+    // job running Railpack's Caddy over the same files) moves off its
+    // container on its next deploy.
+    if (convertingFromService) {
+      logger.info(`[${appName}] Retiring the server job now that the files are served directly.`);
+      await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+        logger.warn(`[${appName}] Could not purge the old Nomad job (continuing): ${e.message}`);
+      });
+      await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
+        logger.warn(`[${appName}] Could not remove the old images (continuing): ${e.message}`);
       });
     }
-    setDeployState(appName, {
-      status: 'failed',
-      finishedAt: new Date().toISOString(),
-      errorDetail: error.message,
+
+    // Best-effort, same as pruneOldImages on the container path.
+    await pruneOldStaticVersions(appName).catch((e) => {
+      logger.warn(`[${appName}] Static version retention pass failed (continuing): ${e.message}`);
     });
+
+    await fs.remove(buildDir);
+    await fs.remove(filePath);
+
+    // No memoryMb: a static app runs no process, so there is nothing
+    // hostnsoft-api's Project.memoryMb could describe for it.
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId });
+  } catch (error) {
+    await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
   }
 }
 
@@ -486,6 +577,50 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       }
     }
 
+    // NEW 2b'. Which KIND of app this is — a plain static site, or one that
+    // needs a build and a server. Railpack decides (build-plan.js), and
+    // this host's own record of what is already deployed under this name
+    // says what it was before (app-kind.js). A server app may become a
+    // static site (performStaticDeploy retires its job once the files are
+    // live); a static site may NOT become a server app — see
+    // docs/Static-apps-req.md for why only that direction is refused.
+    // Checked BEFORE the 202, so a refusal is a real response, not a
+    // background failure to poll for.
+    const plan = await inspectBuildPlan(buildDir);
+    if (!plan.ok) {
+      logger.info(`[${appName}] railpack could not inspect this upload (${plan.error}) — leaving it to the build to report`);
+    } else if (plan.isSpa) {
+      logger.info(`[${appName}] Single-page app build detected (${plan.providers}) — built and served in a container for now`);
+    }
+    const isStaticDeploy = plan.ok && plan.isPlainStatic;
+    const existingKind = await resolveAppKind(appName);
+    if (!isStaticDeploy && existingKind === 'static') {
+      const now = plan.ok
+        ? `a server app (railpack detected: ${plan.providers || 'unknown'})`
+        : 'not recognizable as a static site (railpack could not detect the app type)';
+      logger.info(`[${appName}] Rejected: app is a static site, this upload is ${now}`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(422).json({
+        error: "App kind changed",
+        code: "app_kind_changed",
+        detail:
+          `"${appName}" is deployed as a static site, but this upload is ${now}. A static site is ` +
+          `served directly from its files with no server process; a server app runs as its own job ` +
+          `with routing, a data directory and settings this app never had, so a static app cannot ` +
+          `be turned into one. To ship this version, deploy it under a NEW app name (X-App-Name). ` +
+          `If the change is a mistake, restore the static files (e.g. an index.html at the upload ` +
+          `root) and redeploy under this name.`,
+        previousKind: 'static',
+        uploadedKind: 'service',
+        docs: DOCS_URL,
+      });
+    }
+    const convertingFromService = isStaticDeploy && existingKind === 'service';
+    if (convertingFromService) {
+      logger.info(`[${appName}] Currently a server app (Nomad job) — this static upload will replace it and retire the job`);
+    }
+
     // 2c. Memory sizing. There is no auto-detected tier any more: PGlite
     // is no longer supported, and SQLite — the only remaining embedded
     // option — is an in-process library that needs no extra headroom, so
@@ -545,13 +680,25 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     const responseBody = {
       success: true,
       accepted: true,
-      message:
-        `Deployment accepted and is building in the background — this can take a few ` +
-        `minutes for a fresh build. Check ${statusUrl} for progress (and ${logsUrl} for ` +
-        `build/runtime logs) before assuming it's live at the URL below.`,
+      // "static": a plain static site, served directly from its files
+      // (docs/Static-apps-req.md); "service": built and run as a job.
+      kind: isStaticDeploy ? 'static' : 'service',
+      message: isStaticDeploy
+        ? `Static site detected — no build and no server needed, so it's being published ` +
+          `directly and should be live at the URL below within seconds. Confirm with ${statusUrl}.` +
+          (convertingFromService
+            ? ` NOTE: "${appName}" was running as a server app; this upload converts it to a ` +
+              `static site and its server job is being removed. If that was not intended, ` +
+              `redeploy the server version under a NEW app name — a static app cannot be turned ` +
+              `back into a server app.`
+            : '')
+        : `Deployment accepted and is building in the background — this can take a few ` +
+          `minutes for a fresh build. Check ${statusUrl} for progress (and ${logsUrl} for ` +
+          `build/runtime logs) before assuming it's live at the URL below.`,
       version: appVersion,
       image: imageName,
-      memory: `${taskMemory}MB`,
+      // A static app runs no process, so there is nothing to size.
+      memory: isStaticDeploy ? null : `${taskMemory}MB`,
       url: `https://${domain}`,
       statusUrl,
       logsUrl,
@@ -597,11 +744,18 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // Deliberately not awaited — everything from here happens after the
     // response above. performBuildAndDeploy has its own try/catch that
     // records success/failure; .catch() here is only a backstop.
-    performBuildAndDeploy({
-      appName, appVersion, imageName, domain,
-      buildDir, filePath: req.file.path,
-      claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-    }).catch((err) => {
+    const backgroundDeploy = isStaticDeploy
+      ? performStaticDeploy({
+          appName, appVersion, imageName, domain,
+          buildDir, filePath: req.file.path,
+          claim, credential, deploymentId, plan, convertingFromService,
+        })
+      : performBuildAndDeploy({
+          appName, appVersion, imageName, domain,
+          buildDir, filePath: req.file.path,
+          claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+        });
+    backgroundDeploy.catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
 
@@ -712,9 +866,11 @@ app.get('/apps/:appName/status', async (req, res) => {
 
   const deployState = getDeployState(appName) || {};
   const health = await getAppHealth(appName);
+  const kind = (await isStaticApp(appName)) ? 'static' : 'service';
 
   res.json({
     appName,
+    kind,
     deploy: {
       status: deployState.status || 'unknown',
       appVersion: deployState.appVersion || null,
@@ -842,6 +998,63 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   const schedulingFloorMb = SCHEDULING_FLOOR_MB;
   const domain = defaultDomainFor(appName);
 
+  // A static app (static-site.js) has no image and no job: the same push
+  // means "serve this already-published version" (rollback) and/or
+  // "route these hostnames to it" (custom domains). memoryMb and envVars
+  // have nothing to apply to — a static site runs no process — and are
+  // ignored; hostnsoft-api sends them on every push whatever the reason
+  // for it, so their presence is not an error. imageTag keeps its
+  // "<appName>:<appVersion>" shape and the version names the directory,
+  // so hostnsoft-api's rollback and custom-domain flows needed no change.
+  if (await isStaticApp(appName)) {
+    if (!(await hasStaticVersion(appName, appVersion))) {
+      logger.warn(`[${appName}] Requested static version "${appVersion}" not found on this host, refusing config update`);
+      return res.status(404).json({
+        error: `Version "${imageTag}" is no longer available on this host`,
+        code: 'image_unavailable',
+        retainCount: IMAGE_RETAIN_COUNT,
+      });
+    }
+    if ((envVars || []).length > 0 || typeof memoryMb === 'number') {
+      logger.info(`[${appName}] Static app: env vars and memory in this config push have no effect (no server process)`);
+    }
+
+    const applyStatic = async () => {
+      await switchCurrentVersion(appName, appVersion);
+      // A config push only ever comes from hostnsoft-api on behalf of a
+      // company, so the app is claimed: the orphan-banner routing goes,
+      // exactly as the sidecar does when a container app's spec is
+      // rebuilt by this same endpoint without isOrphan.
+      const manifest = await updateManifest(appName, { customDomains, isOrphan: false });
+      await writeStaticRouterFile({
+        appName, domain, customDomains, isOrphan: false, spa: !!(manifest && manifest.spa),
+      });
+    };
+
+    if (deploymentId) {
+      res.status(202).json({ accepted: true, kind: 'static' });
+      applyStatic()
+        .then(() => {
+          logger.info(`[${appName}] Static config update applied (version ${appVersion}, deploymentId=${deploymentId}).`);
+          return reportConfigPushResult(deploymentId, { success: true });
+        })
+        .catch(async (error) => {
+          logger.error(`[${appName}] Applying static config update failed:`, error);
+          await reportConfigPushResult(deploymentId, { success: false, errorDetail: error.message });
+        });
+      return;
+    }
+
+    try {
+      await applyStatic();
+      logger.info(`[${appName}] Static config update applied (version ${appVersion}, customDomains: ${customDomains.join(', ') || 'none'}).`);
+      return res.json({ success: true, kind: 'static' });
+    } catch (error) {
+      logger.error(`[${appName}] Applying static config update failed:`, error);
+      return res.status(500).json({ error: "Applying config update failed", details: error.message });
+    }
+  }
+
   // NEW: this endpoint now also backs one-click rollback (see
   // hostnsoft-api's src/routes/deployments.routes.ts), which can request
   // ANY past imageTag, not just the currently-running one. These images
@@ -958,6 +1171,18 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
       if (!/no job\(s\) with prefix or id/i.test(output)) throw e;
     });
 
+    // A static app (static-site.js) has no job to purge; it has a Traefik
+    // router file and a directory of files instead. Router first, so
+    // Traefik has stopped sending traffic before the files go. Both are
+    // no-ops for a container app — teardown does not need to know which
+    // kind it is dealing with, it removes whatever either kind leaves.
+    await removeStaticRouterFile(appName).catch((e) => {
+      logger.warn(`[${appName}] Could not remove static router file: ${e.message}`);
+    });
+    await removeStaticApp(appName).catch((e) => {
+      logger.warn(`[${appName}] Could not remove static files: ${e.message}`);
+    });
+
     // Now that DATA_DIR is a host directory rather than the allocation's
     // own ephemeral disk, purging the Nomad job no longer takes the app's
     // data with it — so deleting it is an explicit step, and this is the
@@ -1010,7 +1235,8 @@ app.get('/internal/apps/:appName/status', requireInternalSecret, async (req, res
   }
 
   const health = await getAppHealth(appName);
-  res.json({ health });
+  const kind = (await isStaticApp(appName)) ? 'static' : 'service';
+  res.json({ health, kind });
 });
 
 // NEW: per-app traffic (Traefik access log) and CPU/memory (Nomad stats)

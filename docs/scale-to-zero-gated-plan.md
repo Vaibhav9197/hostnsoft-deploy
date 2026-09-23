@@ -256,8 +256,10 @@ down with it.
 
 **How a request reaches it.** App routers come from Traefik's Nomad
 provider, which only sees *running* services, so a stopped app has no
-router and its hostname 404s. `/opt/traefik/dynamic.yml` declares a
-fallback router per app at `priority: 1`. App routers set no explicit
+router and its hostname 404s. A file in `/opt/traefik/dynamic/` (Traefik's
+file-provider directory since 2026-09-22 — previously the single
+`/opt/traefik/dynamic.yml`) declares a fallback router per app at
+`priority: 1`. App routers set no explicit
 priority, so Traefik derives theirs from the rule's length (~44 for a
 `Host` rule) — a running app outranks the fallback by a wide margin and
 its traffic never touches the activator. One router per exact hostname,
@@ -282,9 +284,12 @@ any difference at all is a problem, and this avoids reading a whole
 database on every cold start.
 
 **Deploying this needs `server-setup.sh`, not `redeploy.sh`** — the
-router lives in root-owned `/opt/traefik/dynamic.yml`, which only
-`server-setup.sh` generates. That run restarts Nomad, Docker and Traefik
-and briefly drops every customer app.
+router lives in `/opt/traefik/dynamic/<env-prefix>platform.yml`, which
+only `server-setup.sh` generates. That run restarts Nomad, Docker and
+Traefik and briefly drops every customer app. (Since the static fast path
+that directory is owned by the deploy user and Traefik watches it, so a
+fallback router could alternatively be dropped in as its own file there
+without a re-provision — not done yet.)
 
 **Verification before moving on**:
 - [ ] With the test app stopped (via Step 3), send it a real HTTP

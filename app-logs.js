@@ -11,6 +11,7 @@
  * healthy one's.
  */
 const logger = require('./logger');
+const { isStaticApp } = require('./static-site');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -33,6 +34,20 @@ async function findLatestAllocId(jobId) {
 // fetch (Nomad's `origin=end&offset=N` — a single non-streaming fetch,
 // not a live tail; `follow` is deliberately omitted/false).
 async function getAppLogs(appName, { stream = 'stdout', tailBytes = 8000 } = {}) {
+  // A static app (static-site.js) runs no process at all, so there is
+  // nothing to tail. Said plainly, since an agent reading this is
+  // usually trying to work out why the site looks wrong.
+  if (await isStaticApp(appName)) {
+    return {
+      available: false,
+      kind: 'static',
+      reason:
+        "This app is a static site served directly from its files — it has no server process, " +
+        "so there are no runtime logs. If the site isn't showing what you expect, check the " +
+        "uploaded files themselves (an index.html at the upload root is what gets served), not logs.",
+    };
+  }
+
   let allocId;
   try {
     allocId = await findLatestAllocId(appName);

@@ -342,7 +342,9 @@ ${sidecarTask}
     `;
 }
 
-module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER };
+// DEFAULT_CSP is exported so traefik-router-file.js (static apps) emits the
+// exact same policy through Traefik's file provider — one CSP, two providers.
+module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER, DEFAULT_CSP };
 
 // Fail-fast at require-time, same convention as internal-auth.js and
 // validate-deploy-token.js — server-setup.sh computes and exports this
