@@ -981,6 +981,48 @@ Worth carrying forward, none of which the plan anticipated:
 
 ---
 
+## Universal mode, live 2026-09-23
+
+`SCALE_TO_ZERO_MODE=universal` in prod. **47 apps eligible, 49 routers** —
+the two extra are custom domains, which per-hostname generation picks up
+from each app's saved spec.
+
+Excluded: `traefik` and `boy-and-dog-server`, both hardcoded.
+
+### The WebSocket guard was removed, not fixed
+
+Automatic detection keyed on HTTP 101. Across **250,000 logged requests
+Traefik never recorded a single 101** — the check could not fire and never
+had. It was deleted rather than left in place: a guard that looks like
+protection and provides none is worse than no guard, because it stops
+anyone looking for the real one.
+
+WebSockets are now declared unsupported in `capabilities.js`, and
+`EXCLUDED_APPS` is the only protection. A WebSocket app that is not on that
+list will be slept while users are connected, and the symptom — clients
+disconnecting every six hours — points nowhere near this system.
+
+### What universal changed about routing
+
+Seed apps keep `priority: 500` (activator permanently in front, no
+post-stop window). The 43 apps universal added get `priority: 1`: reached
+directly while running, activator only once stopped. That reintroduces the
+~5s window after each stop, now across 47 apps rather than 4 — chosen on
+2026-09-23 over making the activator the front door for the whole fleet.
+
+### The risk that has no technical mitigation
+
+Every guard here asks whether FILES survive. An app that keeps state only
+in memory passes all of them and is emptied on every sleep — `demo-python`
+is the proven case, with a 0-byte snapshot and todos that vanish. With 47
+apps enrolled there will be others, and the first sign will be a user
+reporting lost data rather than anything in a log.
+
+The remedy is per app, after the fact: `X-Scale-To-Zero: false` on its next
+deploy, or add it to `EXCLUDED_APPS`.
+
+---
+
 ## Explicitly out of scope for this plan
 
 - **Making scale-to-zero the default** for new deploys — a separate,

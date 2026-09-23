@@ -283,8 +283,10 @@ async function captureJobSpec(appName) {
       throw new Error(
         `DATA_DIR is ${badDataDirs.join(', ')}, not /data, and holds ${contents.length} file(s) ` +
           `(${contents.slice(0, 3).join(', ')}${contents.length > 3 ? ', ...' : ''}). Nomad garbage ` +
-          `collects that directory with a stopped job. Migrate and redeploy first — see ` +
-          `Server-setup/migrate-app-data.sh, and note a plain redeploy is NOT enough`
+          `collects that directory with a stopped job. Fix with ` +
+          `Server-setup/apply-app-config.sh, which regenerates the spec onto the bind mount ` +
+          `using api-service's stored config — no rebuild, no downtime. If its data is not ` +
+          `already at APP_DATA_ROOT, copy it first with migrate-app-data.sh`
       );
     }
     logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
@@ -400,11 +402,26 @@ async function main() {
 // Refresh every eligible app's spec, not just the one about to stop.
 // Stop-time capture alone leaves a real app with no spec between joining
 // the allowlist and its first stop. One inspect per app per run.
+  // Collected and summarised rather than logged per app per pass: the
+  // DATA_DIR refusal is permanent until an app is migrated, so at one run
+  // every 10 minutes it was ~576 identical lines a day.
+  const blocked = [];
   for (const row of rows) {
     if (!STOPPABLE_APPS.includes(row.appName)) continue;
-    await captureJobSpec(row.appName).catch((e) =>
-      logger(`  ! could not refresh saved spec for ${row.appName}: ${e.message}`)
-    );
+    await captureJobSpec(row.appName).catch((e) => blocked.push([row.appName, e.message]));
+  }
+  if (blocked.length > 0) {
+    const unmigrated = blocked.filter(([, m]) => m.includes('DATA_DIR'));
+    const other = blocked.filter(([, m]) => !m.includes('DATA_DIR'));
+    if (unmigrated.length > 0) {
+      logger(
+        `  ! ${unmigrated.length} app(s) can never be stopped until migrated off /alloc/data: ` +
+          `${unmigrated.map(([n]) => n).join(', ')} — see Server-setup/migrate-app-data.sh`
+      );
+    }
+    // Anything else is unexpected and stays per-app: a missing image or an
+    // unreachable Nomad is a new problem, not a known backlog.
+    for (const [name, msg] of other) logger(`  ! could not refresh saved spec for ${name}: ${msg}`);
   }
 
   const apply = process.argv.includes('--apply');
