@@ -144,6 +144,7 @@ const CAPABILITIES = {
       'tolerates the process restarting between requests — in-memory state is lost',
     ],
     notes: [
+      'WebSockets are NOT supported under scale-to-zero: a live connection is invisible to idle detection, so the app can be slept while users are connected.',
       'Automated traffic (credential scanners, crawlers) will NOT wake a sleeping app; it gets a 404.',
       'A stopped app is woken by the first real request, which is held until the app answers.',
     ],

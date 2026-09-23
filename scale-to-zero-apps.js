@@ -17,14 +17,16 @@ const SCALE_TO_ZERO_APPS = Object.freeze([
 // 'universal' makes every running app eligible except the exclusions below.
 const SCALE_TO_ZERO_MODE = process.env.SCALE_TO_ZERO_MODE === 'universal' ? 'universal' : 'allowlist';
 
-// Never eligible, any mode. boy-and-dog-server is a WebSocket server: a
-// live connection produces no access-log line until it closes, so the app
-// reads as idle while users are connected.
+// Never eligible, any mode.
+//
+// WebSocket apps MUST be added here by hand. Traefik logs a WebSocket
+// request only when the connection closes, so a live one is invisible to
+// idle detection and the app reads as idle while users are connected.
+// Automatic detection via HTTP 101 was tried and removed: across 250k
+// logged requests Traefik never recorded a 101, so the check could not
+// fire. WebSockets are not a supported capability (see capabilities.js);
+// this list is the only protection.
 const EXCLUDED_APPS = Object.freeze(['traefik', 'boy-and-dog-server']);
-
-// Any app that served an HTTP 101 in this window is treated as a WebSocket
-// app and excluded automatically — same reason as above.
-const WEBSOCKET_LOOKBACK_DAYS = Number(process.env.WEBSOCKET_LOOKBACK_DAYS) || 7;
 
 function isAlwaysFront(appName) {
   return SCALE_TO_ZERO_APPS.includes(appName);
@@ -34,6 +36,5 @@ module.exports = {
   SCALE_TO_ZERO_APPS,
   SCALE_TO_ZERO_MODE,
   EXCLUDED_APPS,
-  WEBSOCKET_LOOKBACK_DAYS,
   isAlwaysFront,
 };

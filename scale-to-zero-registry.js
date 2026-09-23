@@ -25,7 +25,7 @@ if (require.main === module) {
 const { appDataPathFor, specPathFor, defaultDomainFor, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
 const {
-  SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, WEBSOCKET_LOOKBACK_DAYS, isAlwaysFront,
+  SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, isAlwaysFront,
 } = require('./scale-to-zero-apps');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
@@ -69,30 +69,6 @@ async function writeRegistry(reg) {
   await fs.rename(tmp, REGISTRY_PATH);
 }
 
-/**
- * WebSocket apps, which must never be slept automatically: Traefik logs a
- * WebSocket request only when the connection CLOSES, so an app full of
- * connected users reads as completely idle.
- *
- * null means analytics is unavailable — callers must treat that as "cannot
- * tell", not "none".
- */
-function websocketApps() {
-  try {
-    // Required lazily: analytics is optional, and a box without it must
-    // still be able to load this module.
-    const { getDb, isAnalyticsEnabled } = require('./analytics/db');
-    if (!isAnalyticsEnabled()) return null;
-    const since = Date.now() - WEBSOCKET_LOOKBACK_DAYS * 86400000;
-    const rows = getDb()
-      .prepare('SELECT DISTINCT app_name FROM request_log WHERE status = 101 AND ts >= ?')
-      .all(since);
-    return new Set(rows.map((r) => r.app_name));
-  } catch {
-    return null;
-  }
-}
-
 async function runningJobNames() {
   const res = await fetch(`${NOMAD_ADDR}/v1/jobs`);
   if (!res.ok) throw new Error(`Nomad /v1/jobs -> ${res.status}`);
@@ -112,16 +88,6 @@ async function allApps() {
 
   if (SCALE_TO_ZERO_MODE !== 'universal') return [...base].sort();
 
-  const ws = websocketApps();
-  if (ws === null) {
-    // Cannot tell which apps hold WebSocket connections, so cannot safely
-    // enrol anything new. Falls back to exactly what allowlist mode would
-    // do rather than guessing — the alternative is dropping live
-    // connections on an app nobody opted in.
-    logger('universal mode: analytics unavailable, falling back to the allowlist');
-    return [...base].sort();
-  }
-
   let running;
   try {
     running = await runningJobNames();
@@ -134,7 +100,6 @@ async function allApps() {
   for (const name of running) {
     if (EXCLUDED_APPS.includes(name)) continue;
     if (optedOut.has(name)) continue;
-    if (ws.has(name)) continue;
     base.add(name);
   }
   return [...base].sort();
