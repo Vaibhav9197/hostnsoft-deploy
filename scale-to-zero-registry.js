@@ -1,27 +1,13 @@
 /**
- * scale-to-zero-registry.js — Step 7 of docs/scale-to-zero-gated-plan.md.
+ * Which apps opted into scale-to-zero, and the Traefik routers that make a
+ * stopped one reachable. Step 7 of docs/scale-to-zero-gated-plan.md.
  *
- * Which apps have opted into scale-to-zero, and the Traefik routers that
- * make a stopped one reachable.
+ * The code seed stays code and this can only ADD to it; opting in requires
+ * an authenticated deploy for that app; and being listed only means "may
+ * be considered" — idle-report still re-checks image, spec and DATA_DIR
+ * before every stop.
  *
- * Steps 3-6 used a frozen array in scale-to-zero-apps.js: widening it was a
- * reviewed code change plus a re-provision, which is exactly the friction
- * those steps wanted. Step 7 is where an app opts in at deploy time
- * instead, so the list has to become data. Three things keep that from
- * being a straight loss of safety:
- *
- *   - The seed list still exists and is still code. The registry can only
- *     ADD to it, never remove from it.
- *   - Opting in requires an authenticated deploy for that app. There is no
- *     endpoint that adds an arbitrary name.
- *   - Nothing here decides whether an app may be STOPPED. idle-report.js
- *     still re-checks, per stop, that the image exists, the spec saved, and
- *     DATA_DIR is not an allocation directory. Being in this file only
- *     means "allowed to be considered".
- *
- * The router file is regenerated wholesale from the registry rather than
- * appended to, so the file always matches the registry exactly and a
- * half-written previous state cannot survive.
+ * The router file is rewritten wholesale, never appended to.
  */
 const fs = require('fs-extra');
 const path = require('path');
@@ -84,17 +70,12 @@ async function writeRegistry(reg) {
 }
 
 /**
- * Apps that have served an HTTP 101 recently — WebSocket apps, which must
- * never be put to sleep automatically.
+ * WebSocket apps, which must never be slept automatically: Traefik logs a
+ * WebSocket request only when the connection CLOSES, so an app full of
+ * connected users reads as completely idle.
  *
- * This is the failure mode universal mode introduces that the allowlist
- * never exposed. Idle detection reads Traefik's access log, and Traefik
- * logs a WebSocket request only when the connection CLOSES. So an app with
- * a room full of users connected for six hours produces NO log line at all
- * and reads as completely idle. Stopping it drops every live connection.
- *
- * Returns null if analytics is unavailable — which callers must treat as
- * "cannot tell", not "none".
+ * null means analytics is unavailable — callers must treat that as "cannot
+ * tell", not "none".
  */
 function websocketApps() {
   try {
@@ -120,14 +101,9 @@ async function runningJobNames() {
 }
 
 /**
- * Every app allowed to scale to zero.
- *
- * allowlist mode: the code seed plus anything that opted in.
- * universal mode: every running app, minus the exclusions.
- *
- * The seed is always included and can never be excluded by data — it is
- * the floor, and the only part of this that a bad registry or an
- * unreachable Nomad cannot take away.
+ * allowlist: the seed plus opt-ins. universal: every running app minus the
+ * exclusions. The seed is the floor — no data failure can remove an app
+ * from it.
  */
 async function allApps() {
   const reg = await readRegistry();
@@ -169,13 +145,9 @@ function logger(line) {
 }
 
 /**
- * Every hostname an app answers on, read from its saved Nomad job spec.
- *
- * From the spec rather than from the app name, because a custom domain is
- * exactly the case a name cannot tell you about — and a stopped app with a
- * custom domain and no router for it 404s on someone's real domain with no
- * wake and nothing in any log. That gap is why `focus` was kept out of the
- * Step 6 allowlist; generating per hostname is what closes it.
+ * Every hostname an app answers on, from its saved job spec — a custom
+ * domain is exactly what a name cannot tell you, and a stopped app with no
+ * router for it 404s on someone's real domain.
  */
 async function hostnamesFor(appName) {
   const fallback = APPS_DOMAIN_SUFFIX ? [defaultDomainFor(appName)] : [];
@@ -210,17 +182,10 @@ function routerBlock(name, host, service, alwaysFront) {
     '      entryPoints:',
     '        - websecure',
     `      service: ${service}`,
-    // 500 keeps the activator PERMANENTLY in front, closing the post-stop
-    // 502 window entirely — but it also puts the activator in the path of
-    // that app's every request. Reserved for the seed apps, which have run
-    // that way since 2026-09-21 and are proven.
-    //
-    // 1 is BELOW the ~25-44 Traefik derives from an app router's rule
-    // length, so a running app is reached directly and the activator only
-    // catches the hostname once the app is stopped. That reintroduces a
-    // ~5s window after each stop where Traefik still points at a dead
-    // allocation, and is the deliberate trade for not making the activator
-    // the front door for the whole fleet.
+    // 500: activator permanently in front, no post-stop 502 window, but it
+    // carries that app's every request. 1: below the ~25-44 Traefik derives
+    // from rule length, so a running app is reached directly and the
+    // activator only catches it once stopped. server-setup.md#universal-mode
     alwaysFront ? '      priority: 500' : '      priority: 1',
     '      tls:',
     `        certResolver: ${resolver}`,
@@ -229,12 +194,9 @@ function routerBlock(name, host, service, alwaysFront) {
 }
 
 /**
- * Rewrite the router file from the registry. Idempotent, and safe to call
- * when nothing has changed.
- *
- * Traefik watches the directory, so this takes effect within seconds with
- * no restart and no server-setup.sh run — which is the whole reason Step 7
- * needed the directory provider rather than a single file.
+ * Rewrite the router file. Traefik watches the directory, so this applies
+ * within seconds with no restart — which is why Step 7 needed the
+ * directory provider.
  */
 async function regenerateRouters() {
   const apps = await allApps();
@@ -286,12 +248,8 @@ async function optIn(appName) {
 }
 
 /**
- * Mark an app as never eligible, for `X-Scale-To-Zero: false`.
- *
- * A RECORD, not a deletion. In universal mode an app is eligible by
- * default, so removing its entry would silently re-enrol it on the next
- * pass — the opposite of what its owner asked for. The entry has to
- * persist to say "no".
+ * X-Scale-To-Zero: false. A RECORD, not a deletion — in universal mode a
+ * missing entry means eligible, so removing it would re-enrol the app.
  */
 async function setOptedOut(appName) {
   const reg = await readRegistry();
