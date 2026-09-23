@@ -1221,6 +1221,15 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     await fs.remove(appSpecFile).catch((e) => {
       logger.warn(`[${appName}] Could not remove saved job spec ${appSpecFile}: ${e.message}`);
     });
+
+    // Snapshots are full copies of the app's data directory, written by
+    // idle-report.js every time scale-to-zero stops it. Left behind, they
+    // are the app's own data surviving an explicit deletion — which is the
+    // one thing a delete has to get right.
+    const appSnapshotDir = `${appDataPathFor('.snapshots')}/${appName}`;
+    await fs.remove(appSnapshotDir).catch((e) => {
+      logger.warn(`[${appName}] Could not remove snapshots ${appSnapshotDir}: ${e.message}`);
+    });
     await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
       logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);
     });

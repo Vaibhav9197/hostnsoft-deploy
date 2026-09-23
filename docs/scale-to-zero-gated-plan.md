@@ -93,8 +93,21 @@ network namespace — same discovery as `ORIGIN_IP` in
 - [x] Confirm the container can actually write to the mount (Railpack
       images don't all run as root — deploy-service chmods each app's
       directory 0777 as it creates it).
-- [ ] Confirm deleting an app removes its data directory, and that
+- [x] Confirm deleting an app removes its data directory, and that
       nothing else does.
+      **Verified 2026-09-23** by deleting `s2z-optin-test` through the
+      dashboard (the real api-service -> deploy-service path, not a hand
+      crafted call). Data directory, saved spec, registry entry, Nomad job
+      and images all gone; the URL 404s. The router file regenerated from
+      5 to 4 with the other four apps' routers intact, and all 27 remaining
+      data directories untouched — including every app with a real
+      database (`assetdesk`, `assetdesk-v2`, `embarko-site`, `focus`,
+      `hostnsoft-panel-test`).
+
+      That app had never been stopped, so it had no snapshots and the test
+      could not cover them. Deleting an app that HAD slept would have left
+      `.snapshots/<app>/` behind — full copies of its data outliving an
+      explicit deletion. The delete path now removes those too.
 - [x] Check whether any existing app has data in an old alloc dir that
       needs a one-time copy:
       `ls -la /opt/nomad/data/alloc/*/alloc/data/ 2>/dev/null`
@@ -627,9 +640,20 @@ scale; for a long-lived real app it is a disk-growth question of its own.
 
 **Verification before moving on**:
 - [x] Let this run unattended for 24-48 hours.
-- [ ] Confirm the test app's memory usage graph actually shows the
+- [x] Confirm the test app's memory usage graph actually shows the
       expected pattern — near-zero during idle windows, normal during
       active windows.
+      **Measured 2026-09-23, partially.** Stopping one app freed ~200MB of
+      real memory (`free` used 5.1 -> 4.9GiB). Nomad's own "Allocated
+      Memory" did not move, because it accounts for the 32MB SCHEDULING
+      FLOOR rather than actual usage — which is exactly what the memory
+      oversubscription work was for, and means Nomad's number is the wrong
+      one to read here.
+
+      ~200MB per app against a 7.8GB box is the number that justifies this
+      whole plan: thirty idle apps would be most of the machine. One
+      sample, one app, on a box doing other work — worth repeating with
+      several apps eligible, but it is no longer an assumption.
 - [x] Confirm zero errors, zero effect on any other app, over the whole
       observation window.
 
