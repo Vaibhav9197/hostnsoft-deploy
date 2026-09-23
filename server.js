@@ -26,6 +26,20 @@ const { runWithRequestId } = require('./request-context');
 // for apps that already declare a real database dependency.
 const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
 
+// NEW: confirms the extracted upload actually has a manifest (or
+// index.html) at buildDir's own root — Railpack only looks there. Catches
+// the "app files nested in an extra wrapping folder" upload before any
+// build time is spent on it, instead of letting Railpack fail deep inside
+// the build with a cryptic error that never names the real cause.
+const { resolveBuildRoot, detectDelegatingRoot } = require('./detect-manifest-root');
+
+// NEW: keeps a failed build's actual output (which used to be discarded
+// entirely) and turns the exit codes with an unambiguous meaning into a
+// stated cause. See build-diagnostics.js.
+const {
+  setBuildLog, getBuildLog, describeBuildFailure, BUILD_OUTPUT_MAX_BUFFER,
+} = require('./build-diagnostics');
+
 // NEW: every deploy now authenticates as a specific company via a
 // company-scoped token issued (and revocable/rotatable) by hostnsoft-api,
 // replacing the old single shared PLATFORM_TOKEN everyone used.
@@ -56,7 +70,8 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 // APPS_DOMAIN_SUFFIX's fail-fast check now lives inside this module (see
 // its defaultDomainFor) rather than here, since both this file and the
 // config endpoint below need it.
-const { buildNomadJobSpec, defaultDomainFor, appDataPathFor } = require('./nomad-job-spec');
+const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
+const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
@@ -228,6 +243,84 @@ app.use(
 
 // Configure Multer to save uploaded files to a temporary folder
 const upload = multer({ dest: '/tmp/platform-uploads/' });
+/**
+ * Save the app's Nomad job spec so it can be woken after a stop.
+ *
+ * Nomad's own copy is not enough: `job_gc_threshold` (4h) collects a
+ * STOPPED job out of Nomad's state entirely, taking the spec with it, and
+ * the spec rendered here is written to a temp build directory that is
+ * deleted moments later.
+ *
+ * idle-report.js already captures this immediately before it stops an
+ * app, which covers the apps scale-to-zero itself stops. That is not
+ * sufficient for a real app: it means the ONLY thing that ever creates
+ * the spec is the first stop, so between an app joining the allowlist and
+ * its first stop there is no saved spec at all — and any failure in that
+ * first capture leaves an app that cannot be woken. Writing it at deploy
+ * time means the spec exists from the moment the app does.
+ *
+ * Best-effort, and deliberately after the deploy has already succeeded: a
+ * failure here costs the ability to scale that app to zero, which is an
+ * opt-in feature. Failing the deploy over it would trade a working
+ * deployment for a missing optional file.
+ */
+async function saveJobSpec(appName) {
+  try {
+    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
+    // Parsed before writing so a truncated or error response cannot
+    // overwrite a good spec with something that only fails at wake time.
+    const parsed = JSON.parse(stdout);
+    if (!parsed.Job || parsed.Job.ID !== appName) throw new Error('inspect returned no matching Job');
+    const dest = specPathFor(appName);
+    await fs.ensureDir(path.dirname(dest));
+    await fs.writeFile(dest, stdout);
+  } catch (e) {
+    logger.warn(`[${appName}] Could not save Nomad job spec (scale-to-zero wake would fail): ${e.message}`);
+  }
+}
+
+/**
+ * A job that is registered but DEAD must be purged before it can be
+ * deployed over.
+ *
+ * Nomad versions a job by the content of its spec. Redeploying the same
+ * app version produces a byte-identical spec (only the image tag and
+ * APP_VERSION vary per deploy), so Nomad creates no new version and
+ * starts no new deployment — and `nomad job run` then monitors the
+ * PREVIOUS deployment. If that one failed, the CLI exits non-zero and
+ * the deploy is reported as a failure although nothing was even
+ * attempted. The job's Submit Date gives it away: unchanged.
+ *
+ * That makes the most natural recovery action — retry the failed deploy
+ * with the same version number — permanently impossible, with an error
+ * ("Command failed: nomad job run ...") that says nothing about the
+ * actual cause. Hit for real on 2026-09-18.
+ *
+ * Only a job with no running allocations is purged, so this cannot
+ * disturb a live app: a running job takes the normal update path, where
+ * an identical spec correctly means "nothing to do". A stopped job is
+ * also purged — that includes one parked by scale-to-zero, where a
+ * deploy should plainly bring the app back rather than silently no-op.
+ */
+async function purgeIfNotRunning(appName) {
+  let status;
+  try {
+    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
+    status = JSON.parse(stdout).Job;
+  } catch {
+    return; // not registered at all — nothing to purge, the run registers it
+  }
+  if (!status || (status.Status === 'running' && status.Stop !== true)) return;
+
+  logger.info(`[${appName}] Existing job is ${status.Stop ? 'stopped' : status.Status} — purging before deploy`);
+  await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+    // Not fatal: the run below may still succeed (it will, whenever the
+    // new spec actually differs). Failing the deploy here would turn a
+    // recoverable case into an outage.
+    logger.warn(`[${appName}] Purge of dead job failed (continuing): ${e.message}`);
+  });
+}
+
 
 // Creates this app's host data directory before Nomad is asked to bind
 // mount it. Docker would otherwise create a missing bind-mount source
@@ -283,10 +376,24 @@ async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory,
 async function finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error }) {
   logger.error(`[${appName}] Deployment failed:`, error);
 
+  // Keep whatever the failed command managed to write BEFORE the build
+  // directory is removed below — on an exec rejection these two fields
+  // carry railpack's own output, which is the only place the actual
+  // failing command is ever named. Retrievable afterwards via
+  // GET /apps/:appName/logs, which now falls back to it.
+  setBuildLog(appName, error);
+    
+  // A stated cause for the exit codes that have one, appended to the
+  // raw error rather than replacing it — nothing that was reported
+  // before stops being reported.
+  const failure = describeBuildFailure(error);
+  const errorDetail = failure.hint ? `${error.message}\n\n${failure.hint}` : error.message;
+
   // Unlike before this became a background step, cleanup on failure
   // matters here too — a build that keeps failing (bad Dockerfile,
   // flaky dependency) would otherwise leave a build dir + upload behind
   // on every single retry, forever, with nothing to ever remove them.
+
   await fs.remove(buildDir).catch(() => {});
   await fs.remove(filePath).catch(() => {});
 
@@ -296,15 +403,17 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
       projectSlug: appName,
       appVersion,
       status: 'failed',
-      errorDetail: error.message,
+      errorDetail,
       deploymentId,
     });
   }
   setDeployState(appName, {
     status: 'failed',
     finishedAt: new Date().toISOString(),
-    errorDetail: error.message,
+    errorDetail,
   });
+
+
 }
 
 // Runs the actually-slow part of a deploy (railpack build + `nomad job
@@ -316,12 +425,24 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
   claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+  scaleToZeroOptIn, scaleToZeroOptOut,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
     // Railpack's CLI takes the directory as a positional arg and the
     // image tag via --name.
-    await execPromise(`cd ${buildDir} && railpack build . --name ${imageName}`);
+    //
+    // The output is CAPTURED, not discarded: railpack names the actual
+    // failing command in it, and that was previously thrown away — a
+    // failed build produces no Nomad allocation, so GET .../logs had
+    // nothing to serve either and the failure was undiagnosable. The
+    // raised maxBuffer matters for the same reason (exec's 1MB default
+    // truncates a cold-cache build). See build-diagnostics.js.
+    const buildResult = await execPromise(
+      `cd ${buildDir} && railpack build . --name ${imageName}`,
+      { maxBuffer: BUILD_OUTPUT_MAX_BUFFER },
+    );
+    setBuildLog(appName, buildResult);
 
     // Before the job spec is applied, not after — Nomad's bind mount
     // needs this to exist and be writable at container start.
@@ -346,7 +467,40 @@ async function performBuildAndDeploy({
     await fs.writeFile(nomadFilePath, nomadJobSpec);
 
     logger.info(`[${appName}] Deploying to Nomad...`);
+    // See purgeIfNotRunning: without this, redeploying the same app
+    // version over a dead job is a silent no-op reported as a failure.
+    await purgeIfNotRunning(appName);
     await execPromise(`nomad job run ${nomadFilePath}`);
+    await saveJobSpec(appName);
+
+    // AFTER saveJobSpec, which is what the router generation reads
+    // hostnames from — including any custom domain, which is the case a
+    // name alone cannot tell you about.
+    //
+    // Best-effort, like saveJobSpec: scale-to-zero is opt-in, and failing
+    // a working deployment because an optional registration did not stick
+    // would be the worse trade. The app simply stays always-on, which is
+    // the behaviour its owner had before asking.
+    if (scaleToZeroOptIn || scaleToZeroOptOut) {
+      try {
+        const result = scaleToZeroOptIn
+          ? await scaleToZero.optIn(appName)
+          : await scaleToZero.setOptedOut(appName);
+        logger.info(
+          `[${appName}] scale-to-zero ${scaleToZeroOptIn ? 'opt-IN' : 'opt-OUT'} recorded ` +
+            `(${result.routers} router(s) across ${result.apps} app(s))`
+        );
+      } catch (e) {
+        // An opt-IN failure leaves the app always-on, which is safe. An
+        // opt-OUT failure is NOT: in universal mode the app stays
+        // eligible, so its owner's "leave mine alone" did not take. Said
+        // plainly rather than folded into a generic warning.
+        logger.warn(
+          `[${appName}] Could not record scale-to-zero ${scaleToZeroOptIn ? 'opt-in' : 'OPT-OUT'}: ${e.message}` +
+            (scaleToZeroOptOut ? ' — THIS APP MAY STILL BE PUT TO SLEEP' : ' (app stays always-on)')
+        );
+      }
+    }
 
     // Best-effort, after the deploy that matters has already succeeded —
     // never lets a retention hiccup affect the response/state below.
@@ -452,6 +606,18 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
   // Never fall back to "latest" — Nomad's Docker driver always re-pulls :latest tags
   // and ignores the locally built image, even with force_pull = false.
+  // Step 7 opt-in. Absent — the default for every existing and future
+  // deploy — behaves exactly as before. Only an explicit "true" counts:
+  // anything else is treated as not opting in rather than guessed at,
+  // since the failure mode of a wrong guess is an app that sleeps when
+  // its owner never asked it to.
+  const scaleToZeroHeader = String(req.headers['x-scale-to-zero'] || '').toLowerCase();
+  const scaleToZeroOptIn = scaleToZeroHeader === 'true';
+  // An explicit "false" is a real instruction, not just the absence of
+  // one. In universal mode an app is eligible by default, so "leave mine
+  // alone" has to be RECORDED — otherwise the next pass re-enrols it.
+  const scaleToZeroOptOut = scaleToZeroHeader === 'false';
+
   const rawVersion = req.headers['x-app-version'];
   const appVersion = (rawVersion && /^[a-zA-Z0-9._-]+$/.test(rawVersion))
     ? rawVersion
@@ -531,6 +697,62 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       file: req.file.path,
       cwd: buildDir
     });
+
+    // NEW 2a-pre. Confirm there's actually something buildable at
+    // buildDir's own root before spending any build time — see
+    // detect-manifest-root.js. Auto-flattens the common single-wrapping-
+    // folder case (matching what the dashboard's own upload flow already
+    // does client-side in pack.ts's stripCommonRoot, so both paths behave
+    // identically) and only hard-fails when flattening wouldn't help.
+    const rootCheck = await resolveBuildRoot(buildDir);
+    if (rootCheck.flattened) {
+      logger.info(`[${appName}] Auto-flattened a wrapping folder ('${rootCheck.flattened}') to reach the app root`);
+    }
+    if (!rootCheck.ok) {
+      logger.info(`[${appName}] Rejected: no buildable manifest at the archive root${rootCheck.hint ? ` (found one nested at ${rootCheck.hint})` : ''}`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(422).json({
+        error: "No buildable app found at the archive root",
+        code: "no_manifest_at_root",
+        detail:
+          "No package.json, requirements.txt, pyproject.toml, go.mod, Gemfile, composer.json, " +
+          "Cargo.toml, or index.html was found at the top level of the uploaded archive" +
+          (rootCheck.hint ? `, but one was found nested at '${rootCheck.hint}'` : "") +
+          ". Railpack only looks at the archive root — re-package so the app's manifest (or " +
+          "index.html for a static site) sits at the top level, not inside an extra wrapping " +
+          "folder, then redeploy.",
+        foundNestedAt: rootCheck.hint || null,
+        docs: DOCS_URL,
+      });
+    }
+
+    // NEW 2a-pre2. The root looks buildable, but only because a wrapper
+    // package.json sits on top of the real app — see
+    // detect-manifest-root.js's detectDelegatingRoot. railpack installs at
+    // the archive root only, so the delegated build dies on a missing
+    // binary (exit 127) minutes from now. Reject it in seconds, naming the
+    // subdirectory to deploy instead.
+    const delegating = await detectDelegatingRoot(buildDir);
+    if (delegating) {
+      logger.info(`[${appName}] Rejected: root package.json delegates its build to '${delegating.subdir}/'`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(422).json({
+        error: "The app to deploy is in a subdirectory, not at the archive root",
+        code: "app_nested_in_subdirectory",
+        detail:
+          `The package.json at the archive root declares no dependencies of its own and hands its ` +
+          `build to '${delegating.subdir}/'` +
+          (delegating.script ? ` (${delegating.script})` : '') +
+          `. Only the archive root is installed, so '${delegating.subdir}/node_modules' would never ` +
+          `be created and the build would fail on a missing command (exit code 127). Deploy the ` +
+          `'${delegating.subdir}' directory directly — upload that folder, or point the deploy ` +
+          `script at it — instead of the folder above it.`,
+        deployThisInstead: delegating.subdir,
+        docs: DOCS_URL,
+      });
+    }
 
     // NEW 2a. Read package.json once, up front — shared by the embedded-DB
     // memory check below AND to decide whether the window.storage scan is
@@ -754,6 +976,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
           appName, appVersion, imageName, domain,
           buildDir, filePath: req.file.path,
           claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+          scaleToZeroOptIn, scaleToZeroOptOut,
         });
     backgroundDeploy.catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
@@ -901,6 +1124,30 @@ app.get('/apps/:appName/logs', async (req, res) => {
 
   const stream = req.query.stream === 'stderr' ? 'stderr' : 'stdout';
   const result = await getAppLogs(appName, { stream });
+
+  // NEW: Nomad allocation logs only exist once something has actually been
+  // scheduled, so a build that FAILED has none — which used to mean the
+  // one case people reach for logs hardest returned nothing at all. Fall
+  // back to the most recent build's own output (build-diagnostics.js),
+  // which is where the real failure is named. Runtime logs still win
+  // whenever they exist, so nothing about a healthy app's response
+  // changes.
+  if (!result.available) {
+    const buildLog = getBuildLog(appName);
+    if (buildLog) {
+      return res.json({
+        available: true,
+        source: 'build',
+        stream: 'combined',
+        logs: buildLog.output,
+        capturedAt: buildLog.capturedAt,
+        note:
+          "Runtime logs aren't available for this app yet, so these are its most recent BUILD " +
+          'logs instead. If the deploy failed, the cause is in here.',
+      });
+    }
+  }
+
   res.json(result);
 });
 
@@ -1115,6 +1362,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
         await execPromise(`nomad job run ${nomadFilePath}`);
+        await saveJobSpec(appName);
         await fs.remove(nomadFilePath);
         logger.info(`[${appName}] Config update applied.`);
         await reportConfigPushResult(deploymentId, { success: true });
@@ -1132,6 +1380,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
     await execPromise(`nomad job run ${nomadFilePath}`);
+    await saveJobSpec(appName);
     await fs.remove(nomadFilePath);
     res.json({ success: true });
   } catch (error) {
@@ -1193,6 +1442,13 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     // After the job stop, not before: removing a running container's bind
     // mount source out from under it is how you corrupt a database rather
     // than delete one.
+    // Before the data and spec are removed: the router file is generated
+    // from those, and a deleted app left in the registry would keep a
+    // router pointing at the activator for a hostname nothing serves.
+    await scaleToZero.forget(appName).catch((e) => {
+      logger.warn(`[${appName}] Could not remove from the scale-to-zero registry: ${e.message}`);
+    });
+
     const appDataDir = appDataPathFor(appName);
     await fs.remove(appDataDir).catch((e) => {
       // Best-effort, same posture as the not-found handling above — an
@@ -1208,9 +1464,18 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     // DELETED app is worse than clutter: it is a complete, runnable
     // description of an app the user asked us to remove, sitting exactly
     // where the activator looks. Removed here so deletion stays final.
-    const appSpecFile = `${appDataPathFor('.specs')}/${appName}.json`;
+    const appSpecFile = specPathFor(appName);
     await fs.remove(appSpecFile).catch((e) => {
       logger.warn(`[${appName}] Could not remove saved job spec ${appSpecFile}: ${e.message}`);
+    });
+
+    // Snapshots are full copies of the app's data directory, written by
+    // idle-report.js every time scale-to-zero stops it. Left behind, they
+    // are the app's own data surviving an explicit deletion — which is the
+    // one thing a delete has to get right.
+    const appSnapshotDir = `${appDataPathFor('.snapshots')}/${appName}`;
+    await fs.remove(appSnapshotDir).catch((e) => {
+      logger.warn(`[${appName}] Could not remove snapshots ${appSnapshotDir}: ${e.message}`);
     });
     await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
       logger.warn(`[${appName}] Removing docker image(s) during teardown failed (continuing): ${e.message}`);

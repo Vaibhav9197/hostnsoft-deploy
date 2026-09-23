@@ -423,3 +423,14 @@ function defaultDomainFor(appName) {
   return `${appName}.${APPS_DOMAIN_SUFFIX}`;
 }
 module.exports.defaultDomainFor = defaultDomainFor;
+
+// Where an app's saved Nomad job spec lives. One definition, because
+// three files write or read it — server.js saves it at deploy time,
+// idle-report.js refreshes it before a stop, activator.js runs it to wake
+// the app — and a disagreement about the path would not fail loudly. It
+// would look like "no saved spec", i.e. an app that cannot be woken, and
+// only at the moment someone is waiting for it.
+function specPathFor(appName) {
+  return `${appDataPathFor('.specs')}/${appName}.json`;
+}
+module.exports.specPathFor = specPathFor;

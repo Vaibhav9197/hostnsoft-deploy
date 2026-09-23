@@ -23,10 +23,10 @@ completes it.
 | 1 | Request activity tracking | **Done** |
 | 2 | Idle detection, dry-run only | **Done** |
 | 3 | Real stop, one hardcoded test app | **Done** — verified in prod 2026-09-17 |
-| 4 | Activator (wake-on-request) | **Built, not yet verified** |
-| 5 | Unattended 24-48h run | Not started |
-| 6 | A few real, consenting apps | Not started |
-| 7 | Opt-in via the deploy API | Not started |
+| 4 | Activator (wake-on-request) | **Done** — verified in prod 2026-09-18 |
+| 5 | Unattended 24-48h run | **Done** — 2026-09-21, window closed and verified |
+| 6 | A few real, consenting apps | **Verified** 2026-09-22 — one efficiency fix pending |
+| 7 | Opt-in via the deploy API | **Done** — verified in prod 2026-09-23 |
 
 A step is "Done" only when every box in its own verification checklist is
 ticked. "Code shipped" is deliberately not the same thing: Step 3's code
@@ -77,22 +77,103 @@ network namespace — same discovery as `ORIGIN_IP` in
 - [x] Deploy a test app that writes a SQLite database under `DATA_DIR`,
       confirm the file appears under `$APP_DATA_ROOT/<appName>/` on the
       host.
-- [ ] Redeploy it — confirm the data is still there (no regression on
+- [x] Redeploy it — confirm the data is still there (no regression on
       the guarantee that already existed).
-- [ ] `nomad job stop` it, wait past `job_gc_threshold`, re-run the job —
+- [x] `nomad job stop` it, wait past `job_gc_threshold`, re-run the job —
       confirm the data is STILL there. This is the whole point of the
       step; if this check fails, nothing after it is safe. Re-run it from
       the spec `idle-report.js` saved under `$APP_DATA_ROOT/.specs/`, NOT
       from Nomad: by the time this check is due, Nomad has GC'd the
       stopped job and no longer has the spec (see Step 3).
+      **Verified the hard way on 2026-09-18**: `nomad job status` reported
+      "No job(s) with prefix or ID found" — the job was entirely gone from
+      Nomad's state — and the activator restored it from the saved spec
+      with the visit counter unbroken. Also verified across 1.0.0 -> 1.0.1
+      -> 1.0.2 redeploys: 803 -> 1134 visits, `firstVisitEver` unchanged.
 - [x] Confirm the container can actually write to the mount (Railpack
       images don't all run as root — deploy-service chmods each app's
       directory 0777 as it creates it).
-- [ ] Confirm deleting an app removes its data directory, and that
+- [x] Confirm deleting an app removes its data directory, and that
       nothing else does.
-- [ ] Check whether any existing app has data in an old alloc dir that
+      **Verified 2026-09-23** by deleting `s2z-optin-test` through the
+      dashboard (the real api-service -> deploy-service path, not a hand
+      crafted call). Data directory, saved spec, registry entry, Nomad job
+      and images all gone; the URL 404s. The router file regenerated from
+      5 to 4 with the other four apps' routers intact, and all 27 remaining
+      data directories untouched — including every app with a real
+      database (`assetdesk`, `assetdesk-v2`, `embarko-site`, `focus`,
+      `hostnsoft-panel-test`).
+
+      That app had never been stopped, so it had no snapshots and the test
+      could not cover them. Deleting an app that HAD slept would have left
+      `.snapshots/<app>/` behind — full copies of its data outliving an
+      explicit deletion. The delete path now removes those too.
+- [x] Check whether any existing app has data in an old alloc dir that
       needs a one-time copy:
       `ls -la /opt/nomad/data/alloc/*/alloc/data/ 2>/dev/null`
+      **Audited 2026-09-18** — see "Migration status" below.
+
+### Migration status as of 2026-09-18 — most apps are NOT migrated
+
+`migrate-app-data.sh` (dry run) plus a per-app read of the running spec:
+
+- **28 of 36 running apps still have `DATA_DIR=/alloc/data`** and no bind
+  mount. An app only moves onto the host directory on its NEXT deploy, so
+  "the platform was fixed" and "this app is safe to stop" are different
+  statements — and for most apps the second is still false.
+- **8 are migrated**: `commonground-campus-9f2d`, `demo-python`, `focus`,
+  `frontend`, `pushpendra-agrawal`, `recall-brain-delta-457666`,
+  `scale-to-zero-test-1`, `viasocket-embed`.
+- **5 have real files in an allocation directory**: `assetdesk`,
+  `assetdesk-v2`, `embarko-site`, `hostnsoft-panel-test` (all still on
+  `/alloc/data`) and `focus` (migrated; its allocation copy is stale
+  leftovers, and its destination is correctly newer and larger).
+- The four unmigrated ones already have a byte-identical copy at
+  `$APP_DATA_ROOT/<app>` from an earlier `--copy` run. That copy is
+  current only because none of them has written since 8-11 September.
+
+**Nothing is at risk today**: an allocation directory is only collected
+when its job STOPS, `STOPPABLE_APPS` contains one throwaway test app, and
+all 36 are running.
+
+**It is a hard precondition for Step 6.** Adding any `/alloc/data` app to
+the allowlist would destroy its data on the first stop — silently, because
+an app that wakes to a missing database does not crash, it creates a fresh
+one and reports itself healthy.
+
+Two things follow:
+
+1. `idle-report.js` now refuses to stop an app whose old `DATA_DIR`
+   actually **contains** something. An old `DATA_DIR` is not by itself a
+   reason to refuse: 28 apps are on `/alloc/data` and only 4 have a single
+   file between them, so a blanket refusal would block Step 6 on
+   redeploying two dozen apps that have nothing to lose. The question is
+   not which path `DATA_DIR` points at, it is whether anything is there.
+   Read over Nomad's client filesystem API, since allocation directories
+   are root-owned 0700 and this runs as the deploy-service user; "could
+   not tell" is treated as unsafe. A human reviewing a list of app names
+   for the allowlist cannot see any of this; the code can.
+2. **Four apps need migrating** before they could join the allowlist:
+   `assetdesk`, `assetdesk-v2`, `embarko-site`, `hostnsoft-panel-test`.
+   `focus` does not — it is already on the bind mount, and
+   `migrate-app-data.sh` now skips apps whose running spec says `/data`
+   rather than listing them as candidates. That listing was dangerous, not
+   merely noisy: `--copy --force` on `focus` would have rsync'd a
+   five-day-old allocation copy over live data, and an old `-wal` written
+   over a newer `.db` can corrupt the database rather than just roll it
+   back. The script now also refuses any copy where the destination is
+   newer than the source, whatever `--force` says.
+3. Migrating an app is **not** just a redeploy. The existing copies are
+   point-in-time, so anything written between the copy and the redeploy
+   stays in the old location and is lost. The sequence is
+   `--copy` -> `nomad job stop <app>` -> `--copy --force` -> redeploy, per
+   that script's own header.
+
+`migrate-app-data.sh` also gained a guard while doing this audit: run
+without sudo it could not read the root-owned, 0700 allocation
+directories, every read swallowed its own error, and every app was
+reported as having nothing to migrate. A confident all-clear over stranded
+customer data. It now refuses to run rather than produce that.
 
 ---
 
@@ -248,7 +329,32 @@ requests for `scale-to-zero-test-1`'s hostname through this new logic —
 every other app's traffic keeps flowing through Traefik exactly as
 today, completely untouched by this new component.
 
-**Status: built, not yet verified.** `deploy-service/activator.js`, its
+**Status: done — verified in prod on 2026-09-18.** A real request to a
+stopped app:
+
+```
+cold start requested → data verified (3 file(s), 1046296 bytes)
+job submitted (+315ms) → awake at 156.238.99.173:28025 (+832ms)
+GET / served in 4796ms          (curl: status=200 total=5.049436s)
+```
+
+**~5 seconds end to end**, of which the app's own boot is nearly all of
+it — Nomad placement was under a second. That is the number Step 5 needs
+in order to pick an idle threshold: the cold-start cost is small enough
+that a fairly aggressive threshold is defensible.
+
+Also confirmed on the same cycle: the manifest grew 1,038,056 →
+1,046,296 bytes across stop → GC → wake, so the app is writing to data
+that genuinely survived all three.
+
+The other three checks: 10 simultaneous requests to a stopped app all
+returned 200 and produced exactly ONE `cold start requested` — the
+single-flight guard holds. An app whose image was removed returned 503 in
+0.14s with an accurate message, rather than the seven-minute `pull access
+denied` this used to produce. And no request for any other app ever
+reached the activator.
+
+ `deploy-service/activator.js`, its
 own pm2 process (`<env>-activator`, `127.0.0.1:4200+offset`) rather than
 an endpoint inside deploy-service — it holds visitor connections open for
 the length of a cold start and must not be able to take the deploy API
@@ -283,6 +389,69 @@ rather than checksums: the files are quiescent between stop and wake, so
 any difference at all is a problem, and this avoids reading a whole
 database on every cold start.
 
+**The blocker found on the first real wake: Nomad was deleting the
+image.** The Docker plugin in `nomad.hcl` carried no `gc` block, so the
+driver's defaults applied — `gc.image = true`, `image_delay = "3m"`. Once
+a stopped job's allocations were garbage collected, Nomad deleted the
+image itself. App images are built locally by railpack, pushed to no
+registry, and referenced with `force_pull = false`, so this destroyed the
+only copy in existence. Stopping an app quietly made it unrecoverable
+three minutes later.
+
+It surfaced as `pull access denied for scale-to-zero-test-1, repository
+does not exist or may require 'docker login'` — which reads as a registry
+credentials problem and is nothing of the sort. The deployment then
+burned four allocations against its restart policy and failed on the
+progress deadline, seven minutes later.
+
+Three changes, in order of what actually fixes it:
+
+1. `nomad.hcl` now sets `gc { image = false }` in the docker plugin.
+   Off rather than a longer `image_delay`, because deploy-service already
+   owns image lifecycle completely — `pruneOldImages()` keeps
+   `IMAGE_RETAIN_COUNT` versions per app after each deploy, and teardown
+   removes an app's images on delete. Nomad's GC was a second,
+   uncoordinated policy on top of that, and it could also delete the
+   image behind an older `imageTag` that one-click rollback depends on.
+2. `idle-report.js` verifies every image in the captured spec is present
+   before stopping, and aborts the stop if any is missing — the same rule
+   as capturing the spec itself: **do not stop what you cannot restart**.
+3. `activator.js` checks the same thing before submitting, so a missing
+   image is an immediate, accurate error rather than a seven-minute
+   deployment failure blaming Docker credentials.
+
+**Requires a `server-setup.sh` run**, since `nomad.hcl` changing means
+Nomad restarts.
+
+**Known gap found on 2026-09-18 — the post-stop blackout window.**
+Traefik's Nomad provider polls on a refresh interval (15s by default).
+Between an app being stopped and Traefik noticing, Traefik still holds
+that app's OWN router, pointing at a dead allocation — so a request in
+that window gets a fast 502 and never falls through to the priority-1
+activator router that would have woken it. Observed directly: 10 requests
+sent seconds after a stop all failed, and the activator logged nothing at
+all.
+
+`server-setup.sh` now sets `--providers.nomad.refreshInterval=5s`, which
+shortens the window; nothing can close it, because Traefik's view of a
+stopped job can never be instantaneous. Two things follow:
+
+- Any test of wake behaviour must wait past the refresh interval after a
+  stop, or it is testing the stale router instead.
+- Step 5 should MEASURE this rather than assume 5s — it is the one
+  remaining case where a real visitor sees an error rather than a slow
+  page, and it is the strongest argument for a generous idle threshold
+  (fewer stops means fewer windows).
+
+**Known limit — custom domains are not covered.** The fallback router
+matches only the app's default `<app>.<APPS_DOMAIN_SUFFIX>` hostname.
+`nomad-job-spec.js` also emits a router per custom domain, and those
+disappear with the job like any other Nomad-provider router — so a
+stopped app with a custom domain still 404s on that domain. Harmless
+while the only stoppable app is a throwaway test app with no custom
+domain, but it MUST be fixed before Step 6 puts a real app on this: a
+customer's own domain going dark is the most visible possible failure.
+
 **Deploying this needs `server-setup.sh`, not `redeploy.sh`** — the
 router lives in `/opt/traefik/dynamic/<env-prefix>platform.yml`, which
 only `server-setup.sh` generates. That run restarts Nomad, Docker and
@@ -292,17 +461,17 @@ fallback router could alternatively be dropped in as its own file there
 without a re-provision — not done yet.)
 
 **Verification before moving on**:
-- [ ] With the test app stopped (via Step 3), send it a real HTTP
+- [x] With the test app stopped (via Step 3), send it a real HTTP
       request — confirm the request is held (not an immediate error),
       the app cold-starts, and the *original* request gets a correct
       response (not just "app started," the actual expected content).
-- [ ] Send several requests simultaneously during a cold start — confirm
+- [x] Send several requests simultaneously during a cold start — confirm
       this doesn't trigger multiple redundant `nomad job run` calls for
       the same app.
-- [ ] Deliberately break the test app so it can't start — confirm the
+- [x] Deliberately break the test app so it can't start — confirm the
       activator returns a clean error after a reasonable timeout,
       instead of hanging forever.
-- [ ] Confirm no other app's traffic ever passes through this new proxy
+- [x] Confirm no other app's traffic ever passes through this new proxy
       component at all.
 
 ---
@@ -316,13 +485,245 @@ stability, not adding features.
 for the one test app, cycling automatically through
 idle → stop → request → wake → serve → idle, with no manual intervention.
 
+**Status: soak running in prod since 2026-09-18 11:35 UTC.** Started with
+`scale-to-zero-soak.sh prod`; both timers confirmed scheduled via
+`systemctl list-timers`.
+
+Three bugs in the harness itself had to be fixed first, all of them
+systemd/bash subtleties that pass `bash -n` and fail only at runtime:
+
+- `OnUnitActiveSec` on a `Type=oneshot` whose run can last 150s left no
+  computable next elapse. Now `OnUnitInactiveSec`, which also gives the
+  interval its intended meaning: 45 minutes of idleness AFTER a request.
+- `OnBootSec` is measured from boot, so on a long-running box its deadline
+  is permanently past and produces no trigger — leaving a freshly
+  installed timer with nothing to anchor to at all. Now `OnActiveSec`,
+  relative to when the timer itself starts. The production idle timer had
+  the same latent bug and escaped it only by luck.
+- `systemctl list-unit-files | grep -q` under `set -o pipefail`: `grep -q`
+  exits on first match, the still-writing upstream takes SIGPIPE and exits
+  141, and the pipeline reports 141 — so a SUCCESSFUL match reads as a
+  failure. It passed initially (the listing fit in the 64KB pipe buffer)
+  and began failing permanently once two more unit files pushed it over.
+  Worth remembering as a shape: worked in testing, then failed for reasons
+  unrelated to any code change.
+
+
+Two things this step needs that the plan did not call out:
+
+- **Synthetic traffic.** `scale-to-zero-test-1` has no real users, so on a
+  schedule it would stop once and stay stopped — exercising the stop path
+  and never the wake path, which is the half that can lose data.
+- **A deliberately short threshold.** Production is 6 hours; at that rate
+  a 24h soak gives about four cycles, far too few to shake out a race.
+
+`server-setup.sh` installs the production watcher as a systemd timer
+(`embarko-idle-<env>`, every 10 min, `IDLE_THRESHOLD_MIN` default 360,
+running as APP_USER so it cannot leave root-owned WAL files beside the
+analytics database). `scale-to-zero-soak.sh <env>` layers the test
+instruments on top: a drop-in shortening the threshold to 15 min, and a
+timer requesting the test app every 45 min — about 30 full cycles a day.
+`--remove` takes both away and restores the real threshold without a
+re-provision. A drop-in rather than an edit so `server-setup.sh` can never
+bake the test value into production.
+
+**Scheduling does not widen what may be stopped.** That is still
+`STOPPABLE_APPS`, frozen in `idle-report.js`. At a 15-minute threshold
+nearly every app on the box reports as idle and every one of them is still
+left running — which is itself part of what the soak tests.
+
+**The threshold: 360 minutes (6 hours).** Chosen around the cost of
+STOPPING, not waking. Waking is graceful — ~5s, a slow page then correct
+content. Stopping is not: for a few seconds afterwards Traefik still
+routes to the dead allocation and a request gets a hard 502. So what
+matters is how OFTEN an app stops, not how long it stays stopped. Observed
+working-day gaps run 4-6 hours (`viasocket` 4h11, `socket-ux` 5h42,
+`embarko-homepage-prototype` 5h50), so a shorter threshold makes apps
+cycle during office hours, putting 502 windows exactly where the users
+are. 6 hours pushes almost every stop into the night. Of 31 live apps, 22
+were idle over 1h and 9 over 6h — so 6h gives up the evening savings to
+avoid daytime churn, and recovers most of it overnight anyway.
+
+Worth revisiting later, in this order: time-of-day awareness (6h by day,
+1h between 22:00-06:00) recovers the evening window; and routing
+scale-to-zero apps through the activator PERMANENTLY, proxying straight
+through while the app runs, removes the blackout window altogether and
+would allow a genuinely aggressive threshold. The latter costs a hop and
+makes the activator an availability dependency — a Step 6 decision.
+
+**What the soak is measuring**, beyond "no errors": the number of 502s
+against the number of cycles. That ratio is the blackout window's real
+cost, and it is the one number that should decide whether Step 6 needs the
+always-front proxy first.
+
+### Soak results — 20 hours, 2026-09-18 11:35 to 2026-09-19 05:00 UTC
+
+**31 stop/wake cycles. 25 requests, all `200`. Zero 502s, zero aborts,
+zero errors of any kind.** Cold starts held at 4.1-6.4s with no upward
+drift across the run. The activator ran 16h with `unstable restarts 0`.
+
+The result that matters:
+
+```
+"visits": 803,
+"firstVisitEver": "2026-09-17T09:16:53.131Z"
+```
+
+Unbroken since before any of this — 803 visits across 31 stops, a Nomad
+job GC, an image deletion, a failed deploy and a version bump. The data
+directory grew 1,062,776 -> 4,181,472 bytes. No loss at any point.
+
+### The blackout window: measured, then closed
+
+Measured 2026-09-19 by stopping the app and requesting within a second,
+repeatedly: **roughly one in three attempts returned `502` in ~0.07s** —
+an instant hard error, never reaching the activator, never waking
+anything. The window is real, not theoretical.
+
+Closed by routing allowlisted apps through the activator
+**permanently** rather than only once stopped: `dynamic.yml`'s per-app
+router moves from `priority: 1` (below the ~44 Traefik derives from an
+app router's rule length) to `priority: 500` (above any possible
+rule-length value, far below the platform's own 10000/10100). Traefik
+then never points at an allocation for these apps, so there is no moment
+when it can point at a dead one. Narrowing `refreshInterval` shrinks the
+window; only this removes it.
+
+**Verified 2026-09-21**: the same stop-then-request-immediately loop that
+produced a 502 in one attempt out of three now returns `200` every time,
+at 4.4-5.3s — the request is held through the cold start instead of being
+refused. `priority: 500` confirmed live in `dynamic.yml`.
+
+`activator.js` needed three things to be a proxy rather than a wake-up
+hook that happens to forward:
+
+- **An address cache** (30s TTL *and* failure-driven invalidation) so the
+  hot path makes no Nomad calls. A stale entry self-heals: a connection
+  error drops it and falls through to the full resolve-and-wake path,
+  which is safe to retry because nothing has been written back yet.
+- **A keep-alive agent**, so an app's whole traffic doesn't open and tear
+  down a TCP connection per request.
+- **Upgrade (WebSocket) proxying.** Not a bonus — while this only handled
+  stopped apps, upgrades never reached it and worked because nothing was
+  in the way. Routed here permanently, an activator that cannot proxy an
+  upgrade breaks them silently: the page loads, the socket never
+  connects.
+
+**The cost, stated plainly:** the activator is now an availability
+dependency for allowlisted apps, not just for waking them. It already had
+to be up for a stopped app to return; this extends that to serving a
+running one. That is the trade for removing the only hard-error path in
+the design.
+
+**This also weakens the case for a 6-hour threshold**, which was chosen
+around how often an app stops precisely because stopping was harmful. A
+stop now costs only a ~5s cold start on the next request. 6 hours stays
+as a conservative starting point for Step 6 — first real users — and
+should be revisited with data rather than left there by inertia.
+
+**What the soak did NOT test: the blackout window.** It requests every 45
+minutes and the watcher stops the app 15-25 minutes before each request,
+so every request arrived half an hour outside the window. 0/25 was
+structurally guaranteed and says nothing about the risk. Measuring it
+needs a request issued within seconds of a stop, repeated — still to do,
+and still the gate on Step 6.
+
+**A real problem the soak did find: snapshots grow without limit.** 36
+snapshots, 127MB, from one trivial app in 20 hours. Every stop copies the
+whole data directory and nothing removed the old ones. At the production
+6h threshold a real app stops about four times a day, so a 500MB database
+would write 2GB/day forever — and the first symptom would be a full disk
+taking every app on the box down at once. `idle-report.js` now keeps
+`SNAPSHOT_RETAIN_COUNT` (default 3) and prunes older ones, matched
+narrowly by directory-name pattern so `latest-manifest.json` and the app's
+own data cannot be caught by it.
+
+Worth watching, not yet a problem: of that 4.1MB, `visits.db` is 28KB and
+`visits.db-wal` is 4.1MB. The WAL is never checkpointed because the
+container is killed rather than shut down, so it only grows. Fine at this
+scale; for a long-lived real app it is a disk-growth question of its own.
+
 **Verification before moving on**:
-- [ ] Let this run unattended for 24-48 hours.
-- [ ] Confirm the test app's memory usage graph actually shows the
+- [x] Let this run unattended for 24-48 hours.
+- [x] Confirm the test app's memory usage graph actually shows the
       expected pattern — near-zero during idle windows, normal during
       active windows.
-- [ ] Confirm zero errors, zero effect on any other app, over the whole
+      **Measured 2026-09-23, partially.** Stopping one app freed ~200MB of
+      real memory (`free` used 5.1 -> 4.9GiB). Nomad's own "Allocated
+      Memory" did not move, because it accounts for the 32MB SCHEDULING
+      FLOOR rather than actual usage — which is exactly what the memory
+      oversubscription work was for, and means Nomad's number is the wrong
+      one to read here.
+
+      ~200MB per app against a 7.8GB box is the number that justifies this
+      whole plan: thirty idle apps would be most of the machine. One
+      sample, one app, on a box doing other work — worth repeating with
+      several apps eligible, but it is no longer an assumption.
+- [x] Confirm zero errors, zero effect on any other app, over the whole
       observation window.
+
+### Step 6 preconditions
+
+1. **Restore the production idle threshold.** The soak drop-in still
+   holds `IDLE_THRESHOLD_MIN=15`. Real apps on a 15-minute threshold would
+   cycle through working hours, which is exactly what 360 exists to
+   prevent. `scale-to-zero-soak.sh prod --remove` restores it.
+2. **Job specs are now saved at DEPLOY time** (`server.js`'s
+   `saveJobSpec`), not only immediately before a stop. Stop-time capture
+   alone means the first stop is the only thing that ever creates the
+   spec, so an app has no saved spec between joining the allowlist and
+   stopping for the first time — and any failure in that one capture
+   leaves an app that cannot be woken. Best-effort and after the deploy
+   has succeeded: losing it costs the ability to scale that app to zero,
+   which is opt-in, and failing a working deploy over a missing optional
+   file would be the worse trade. The path now has a single definition,
+   `specPathFor` in `nomad-job-spec.js`, since three files touch it and a
+   disagreement would surface only as "cannot be woken", at the moment
+   someone is waiting.
+3. **Choose candidates with no custom domain.** The activator's routers
+   cover only `<app>.app.<suffix>`; a stopped app with a custom domain
+   still 404s on that domain. Sidestepped rather than fixed for now —
+   fixing it properly needs the activator to resolve custom domain -> app
+   via api-service.
+4. **Candidates must already be on `DATA_DIR=/data`.** `idle-report.js`
+   enforces this, but choosing an app that is already migrated avoids
+   needing user-visible downtime to migrate it first. 28 of 36 apps were
+   still on `/alloc/data` as of 2026-09-18.
+
+### Disk: orphaned anonymous volumes (2026-09-21)
+
+Found at 92% of a 124GB disk, twelve hours from taking every app down at
+once, with nothing in any log to say so — `df` was the only symptom.
+
+**74.66GB across 25 orphaned Docker volumes**, one of them 40.3GB. An
+image that declares `VOLUME` gets a fresh ANONYMOUS volume per container,
+and nothing reuses the old one: every redeploy, reschedule, and
+scale-to-zero stop-and-wake orphans another. Nomad's docker driver
+collects containers but not these. Reclaiming them took the disk to 30%.
+
+Two things worth recording because both guesses before measuring were
+wrong. It was not images — those are ~20GB of unique size and nearly all
+in use — and it was not BuildKit's cache, which reported 0B. `du` and
+`docker system df -v` gave the answer in minutes; three rounds of
+inference from `docker images` output did not.
+
+**Scale-to-zero makes this worse, not better**: every sleep/wake cycle is
+another container and therefore another orphan. `server-setup.sh` now
+installs a daily `embarko-docker-gc-<env>` timer (`docker volume prune`
+plus dangling images only). Safe because app data lives in BIND MOUNTS,
+which never appear in `docker volume ls`, and because an anonymous volume
+never survived its container being replaced — so nothing could have been
+relying on one.
+
+A related gap, not the cause of this one: `pruneOldImages()` runs only as
+part of a deploy, so an app deployed once and never again keeps every
+image it has ever had. Nomad's own image GC used to reap those as a side
+effect, and turning it off (necessary — it was deleting stopped apps'
+images) removed that without replacing it. `prune-app-images.sh` fills it,
+deliberately manual and dry-run by default: it protects images in use, and
+images named in a saved job spec, which are exactly the ones a stopped
+app needs to wake and which no "remove what nothing is running" rule
+would spare.
 
 ---
 
@@ -336,9 +737,126 @@ default.
 **Deliverable**: 2-3 real (but non-critical) apps added to the
 allowlist, with their owners informed beforehand.
 
+**Status: two real apps added, not yet exercised.** `demo-python` and
+`pushpendra-agrawal`, alongside the existing test app. Both were already
+on `DATA_DIR=/data`, so neither needed a migration with user-visible
+downtime first.
+
+**`focus` was chosen and then rejected by the pre-flight check** — it also
+serves `focus.walkover.uk`. The activator's routers cover only
+`<app>.<APPS_DOMAIN_SUFFIX>`, so once stopped it would have 404'd on a
+real customer domain: no wake, no warning, nothing in any log explaining
+why. The custom-domain gap had been noted twice as "a thing to handle
+before Step 6" and would have shipped anyway without a check that
+actually looks:
+
+```
+nomad job inspect <app> | grep -o 'Host(`[^`]*`)' | sort -u
+```
+
+An app on this list must return exactly one hostname. `focus` becomes a
+good candidate once Step 7 generates routers per HOSTNAME rather than per
+app.
+
+**The allowlist is now one list**, `deploy-service/scale-to-zero-apps.js`,
+read by both `idle-report.js` (what may be stopped) and `activator.js`
+(what may be woken). They were separate frozen constants in separate
+files: an app stoppable but not wakeable is an app taken offline
+permanently, which is much worse than the reverse, and two hand-synced
+lists is how that happens.
+
+A third copy remains — the Traefik routers in `dynamic.yml`, without which
+no request for a stopped app reaches the activator. `server-setup.sh` now
+generates them from a bash array rather than a hand-copied block per app,
+but it still cannot read the JS list: `dynamic.yml` is written before the
+repo is pulled. Step 7 replaces this.
+
+**Saved specs are refreshed on every watcher pass**, not only immediately
+before a stop. Stop-time capture alone leaves a real app with no saved
+spec between joining the allowlist and stopping for the first time, and
+makes that single capture the only thing between it and being unwakeable.
+One `nomad job inspect` per allowlisted app per run removes the gap.
+
+**Cold starts verified 2026-09-21**: `pushpendra-agrawal` 3.58s,
+`socket-ux` 5.43s, both from `dead (stopped)`, both returning identical
+content. `socket-ux` is a Next.js app, so this is also the first real app
+cold-starting through the always-front activator.
+
+### A category the plan never considered: in-memory state
+
+`demo-python` is a Todo app whose snapshot is **0 files, 0 bytes**. It
+writes nothing to `DATA_DIR` — its todos live in memory. Scale-to-zero
+will empty them every time it sleeps.
+
+This is not data loss in the sense the plan has been guarding against: we
+never had the data, and nothing we do destroys a file. It is something
+else, and arguably worse because none of the existing guards can see it —
+the spec check, the image check, the DATA_DIR check and the manifest
+comparison all pass an app that persists nothing at all. What changes is
+the app's BEHAVIOUR: it used to run indefinitely and accumulate state, and
+now it restarts every six hours.
+
+A content hash before and after will not catch it either. `demo-python`
+compared identical because an empty todo list looks exactly like an empty
+todo list.
+
+So Step 6's "owners have explicitly agreed to the cold-start tradeoff"
+has to mean more than tolerating a slow first request. **Before an app
+joins the allowlist, put real state into it, stop it, wake it, and check
+the state is still there.** If it is not, the owner has to accept that
+their app now forgets, or the app comes off the list.
+
+### Step 6 results — 24 hours, 2026-09-21 06:00 to 2026-09-22 06:00 UTC
+
+**19 stops. 9 cold starts. Zero failures.** No `FAILED` line in the
+activator log at any point. Wake latency was flat all day: Nomad placement
+780-1228ms, full response 3.8-8.8s.
+
+**3 aborts, all `a deploy is in flight`** — the guard doing its job, not a
+fault. Every other app on the box was untouched; the watcher reports 36-43
+apps per pass and stopped only allowlisted ones.
+
+Docker GC ran and reclaimed 0B, so nothing regrew. Disk went 30% -> 32%,
+entirely from newly deployed apps.
+
+### The finding: scanners were cold-starting sleeping apps
+
+```
+demo-python:          GET /.git/config   served in 5916ms   <- woke it
+scale-to-zero-test-1: GET /.env          served in 3872ms   <- woke it
+pushpendra-agrawal:   GET /htdocs/.env, /psnlink/.env, /tmp/phpinfo.php
+scale-to-zero-test-1: GET /nest/.env
+demo-python:          GET /mail/.env
+```
+
+Two separate bugs, both now fixed:
+
+1. **The activator had no bot filter at all.** `idle-report.js` ignores
+   scanner traffic when deciding to STOP, but nothing filtered the decision
+   to WAKE. An app would sleep, a scanner would probe `/.env`, and it burned
+   a cold start and stayed up for another full six hours. The activator now
+   refuses to cold-start for automated traffic and returns 404 — only the
+   cold start, though: a RUNNING app still serves these normally, because
+   answering differently depending on whether an app happens to be awake
+   would be a behaviour change its owner never asked for.
+
+2. **`SCAN_PATH_PATTERN` was anchored at `^/`**, so it caught `/.env` but
+   missed `/nest/.env`, `/mail/.env`, `/htdocs/.env` and `/tmp/phpinfo.php`
+   — and in real traffic the NESTED form was the common one. So scanner
+   hits were counting as genuine usage and keeping apps awake even for idle
+   detection. A second, deliberately much shorter unanchored pattern now
+   covers them; anchoring is what makes entries like `vendor/` safe, so
+   only names no application serves from any directory were added.
+
+Neither is a correctness failure — no request was mishandled and no data
+was at risk — but together they undercut the economics the feature exists
+for. 19 stops in a day across four apps is roughly five per app, well above
+the 1-4 a 6-hour threshold should produce, because apps kept being woken by
+background scanning and then re-idling.
+
 **Verification before moving on**:
-- [ ] Same checklist as Step 5, now for these specific apps.
-- [ ] Confirm every app *not* on the allowlist remains completely
+- [x] Same checklist as Step 5, now for these specific apps.
+- [x] Confirm every app *not* on the allowlist remains completely
       unaffected — this is the most important check in this step,
       since it's the first time the mechanism runs against real traffic
       it wasn't purpose-built around.
@@ -356,13 +874,157 @@ with the idle-watcher and activator. When absent — the default,
 unchanged for every existing and future app that doesn't ask for
 this — behavior is identical to today.
 
+**Status: done — verified in prod 2026-09-23.** A deploy carrying
+`X-Scale-To-Zero: true` wrote the app into the registry and regenerated the
+router file from 4 to 5 entries, with no re-provision. A deploy without the
+header changed nothing.
+
+`X-Scale-To-Zero: true` on `POST /apps`. Absent — the default for every
+existing and future deploy — nothing changes. Only a literal `true`
+counts; anything else is treated as not opting in rather than guessed at,
+because the cost of a wrong guess is an app that sleeps when its owner
+never asked.
+
+**The allowlist becomes data, and that is a real reduction in the rail.**
+Three things compensate:
+
+- The code seed (`scale-to-zero-apps.js`) still exists and is still code.
+  The registry can only ADD to it, never remove from it.
+- Opting in requires an authenticated deploy *for that app*. There is no
+  endpoint that adds an arbitrary name.
+- Being listed only means "may be considered". `idle-report.js` still
+  re-checks, per stop, that the image exists, the spec was saved, and
+  `DATA_DIR` is not an allocation directory. The registry cannot waive
+  any of those.
+
+**Traefik moved from a single file to a directory provider**
+(`--providers.file.directory=/etc/traefik/dynamic`). `server-setup.sh`
+owns `platform.yml` there; deploy-service owns `scale-to-zero.yml` and
+rewrites it in full from the registry, which Traefik hot-reloads within
+seconds. That is what lets an app opt in without a re-provision, and it
+was the only way to do it: `dynamic.yml` is generated before the repo is
+even pulled.
+
+**Routers are now generated per HOSTNAME, from the saved job spec** — so
+custom domains are covered and `focus` becomes eligible. That gap is what
+kept it out of Step 6, and it had been noted twice as "handle before Step
+6" without being handled, because a noted risk is not a check.
+
+Registration happens AFTER `saveJobSpec`, which is what hostnames are read
+from, and is best-effort: a failed registration leaves the app always-on,
+which is the behaviour its owner had before asking. Deleting an app
+removes it from the registry before its data and spec go, so no router is
+left pointing at a hostname nothing serves.
+
+**Still to do once verified**: advertise the header in `capabilities.js`.
+That file's rule is to state only what the platform actually does, so it
+gets updated in the commit that proves this works, not before.
+
 **Verification before moving on**:
-- [ ] Deploy a brand-new test app *with* the header — confirm
+- [x] Deploy a brand-new test app *with* the header — confirm
       scale-to-zero works out of the box, no manual config needed.
-- [ ] Deploy a brand-new test app *without* the header — confirm it
+- [x] Deploy a brand-new test app *without* the header — confirm it
       behaves exactly like every other app today (always-on).
-- [ ] Confirm every existing already-deployed app is completely
+- [x] Confirm every existing already-deployed app is completely
       unaffected by this change to `deploy-service`.
+
+---
+
+## The bot-wake fix, verified 2026-09-23
+
+The Step 6 finding, confirmed fixed in production:
+
+```
+scanner: 404 in 0.11s   -> app still `dead (stopped)`
+         activator log: "not waking for automated GET /.env"
+real:    200 in 3.91s   -> cold start requested, served in 3828ms
+```
+
+The split is exactly right: a credential scanner gets a cheap 404 and the
+app stays asleep; the next genuine request wakes it and is held through the
+cold start.
+
+## Where this leaves the plan
+
+All seven steps are built and running in production, and the mechanism is
+proven: apps sleep when idle, wake on a real request, and lose nothing in
+between — `scale-to-zero-test-1` passed 1134 visits across roughly forty
+stop/wake cycles with `firstVisitEver` unchanged since 2026-09-17.
+
+**Two checklist boxes are still genuinely open**, and neither should be
+ticked by assumption:
+
+1. **The memory saving has never been measured.** Step 5's box asks for the
+   idle memory pattern and it was never checked. That is the entire
+   economic justification for this work — every other number here is about
+   correctness, and correctness without the saving means the feature costs
+   cold starts and buys nothing. Mechanically the container is gone when
+   the job stops, so the RSS must be freed, but "must be" is not a
+   measurement.
+2. **Deleting an app has never been tested end to end.** Step 0 asks that
+   deletion removes the data directory and that nothing else does. The
+   delete path now also removes the saved spec and the registry entry, and
+   none of that has been exercised — so the one path that is *supposed* to
+   destroy data is the least tested one here.
+
+Worth carrying forward, none of which the plan anticipated:
+
+- **`IDLE_THRESHOLD_MIN` of 360 was chosen when stopping was harmful.**
+  The 502 window is closed and a stop now costs only a cold start, so the
+  argument for six hours is weaker than when it was picked. Revisit it with
+  Step 6/7 data rather than leaving it there by inertia.
+- **In-memory state is invisible to every guard here.** The spec, image,
+  `DATA_DIR` and manifest checks all pass an app that persists nothing at
+  all. Before adding an app, put real state into it, stop it, wake it, and
+  check the state survived.
+- **Three lists still have to agree** — the code seed, the registry, and
+  the routers. The routers are generated now, which removes the worst of
+  it, but the seed and registry are still separate concepts.
+- **Nomad is unpinned.** `server-setup.sh` installs whatever HashiCorp's
+  checkpoint API currently returns; it silently moved prod 2.0.6 -> 2.0.7
+  on 2026-09-21. Same risk the BuildKit pin exists to prevent.
+
+---
+
+## Universal mode, live 2026-09-23
+
+`SCALE_TO_ZERO_MODE=universal` in prod. **47 apps eligible, 49 routers** —
+the two extra are custom domains, which per-hostname generation picks up
+from each app's saved spec.
+
+Excluded: `traefik` and `boy-and-dog-server`, both hardcoded.
+
+### The WebSocket guard was removed, not fixed
+
+Automatic detection keyed on HTTP 101. Across **250,000 logged requests
+Traefik never recorded a single 101** — the check could not fire and never
+had. It was deleted rather than left in place: a guard that looks like
+protection and provides none is worse than no guard, because it stops
+anyone looking for the real one.
+
+WebSockets are now declared unsupported in `capabilities.js`, and
+`EXCLUDED_APPS` is the only protection. A WebSocket app that is not on that
+list will be slept while users are connected, and the symptom — clients
+disconnecting every six hours — points nowhere near this system.
+
+### What universal changed about routing
+
+Seed apps keep `priority: 500` (activator permanently in front, no
+post-stop window). The 43 apps universal added get `priority: 1`: reached
+directly while running, activator only once stopped. That reintroduces the
+~5s window after each stop, now across 47 apps rather than 4 — chosen on
+2026-09-23 over making the activator the front door for the whole fleet.
+
+### The risk that has no technical mitigation
+
+Every guard here asks whether FILES survive. An app that keeps state only
+in memory passes all of them and is emptied on every sleep — `demo-python`
+is the proven case, with a 0-byte snapshot and todos that vanish. With 47
+apps enrolled there will be others, and the first sign will be a user
+reporting lost data rather than anything in a log.
+
+The remedy is per app, after the fact: `X-Scale-To-Zero: false` on its next
+deploy, or add it to `EXCLUDED_APPS`.
 
 ---
 

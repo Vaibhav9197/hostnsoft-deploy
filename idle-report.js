@@ -1,42 +1,17 @@
 /**
- * idle-report.js — Step 2 of docs/scale-to-zero-gated-plan.md.
+ * Reports which apps are idle and, with --apply, stops them. Steps 2, 3
+ * and 6 of docs/scale-to-zero-gated-plan.md, which has the guards and the
+ * reasoning behind each.
  *
- * Reports which apps are idle and, with --apply, stops them — but ONLY an
- * app whose name appears in STOPPABLE_APPS below, which is a hardcoded
- * frozen list, not configuration and not an env var. That is the Step 3
- * safety rail: a bug anywhere else in this file still cannot reach an app
- * that is not literally named in the source.
+ * Never gains: `-purge` (a purged job cannot be woken) or any delete of
+ * app data (that is server.js's DELETE endpoint alone).
  *
- * Two things this file must never gain, and does not have:
- *   - `-purge`. A purged job is GONE, spec and all, and cannot be woken.
- *     Plain `nomad job stop` keeps the job registered so Step 4 can
- *     restart it.
- *   - any delete/unlink/rm of app data. Stopping an app must never touch
- *     its data; removing an app's data directory belongs to exactly one
- *     place, server.js's DELETE /internal/apps/:appName.
+ * Run as the deploy-service user, NOT root — it opens the analytics DB
+ * read-write, and root leaves root-owned -wal/-shm files behind.
  *
- * Still a standalone script rather than a loop inside server.js: a script
- * you run by hand cannot fire on a timer by accident. Step 5 is where it
- * earns a schedule.
- *
- *   node idle-report.js            # report only (default)
- *   node idle-report.js --apply    # actually stop, allowlisted apps only
- *
- * Run as the SAME user deploy-service runs as (ubuntu), not root:
- * analytics/db.js's getDb() opens the database read-write (it sets WAL
- * mode and runs CREATE TABLE IF NOT EXISTS), so running it as root can
- * leave root-owned -wal/-shm files beside a ubuntu-owned database and
- * break the running service's ability to write to it.
- *
- * Step 1 of the plan ("record when each app was last requested") needed no
- * new code — analytics/access-log-tailer.js already writes one row per
- * request into request_log(app_name, ts), indexed on exactly (app_name,
- * ts). Last-seen is a MAX(ts) over that.
+ *   node idle-report.js            # report only
+ *   node idle-report.js --apply    # stop, allowlisted apps only
  */
-// Same absolute-path dotenv load as server.js — this script is run by
-// hand from wherever the operator happens to be standing, so the default
-// cwd-relative lookup would silently find nothing and the script would
-// (correctly, but unhelpfully) report that analytics is disabled.
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -46,8 +21,11 @@ const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
-const { appDataPathFor } = require('./nomad-job-spec');
+const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
+const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
+const { SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
+const { allApps } = require('./scale-to-zero-registry');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -58,17 +36,25 @@ const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 // from actual traffic patterns.
 const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 30;
 
-// THE SAFETY RAIL. Hardcoded and frozen deliberately: an allowlist read
-// from the environment or a config file could be widened by accident, or
-// by a deploy that ships the wrong file. Adding a real app here is a
-// code change that has to be reviewed and deployed — which is exactly
-// the friction Step 3 of the plan asks for. Step 6 is where this grows.
-const STOPPABLE_APPS = Object.freeze(['scale-to-zero-test-1']);
+// THE SAFETY RAIL. The code seed in scale-to-zero-apps.js plus anything
+// that opted in at deploy time (scale-to-zero-registry.js). Loaded once
+// per run in main(), before anything can consult it.
+//
+// Being on this list only means "may be considered". Every stop still has
+// to pass the spec, image and DATA_DIR checks below, none of which this
+// list can waive.
+let STOPPABLE_APPS = SCALE_TO_ZERO_APPS;
 
 // A last-moment re-check window. The idle threshold is measured in tens
 // of minutes; this catches a request that landed between the report and
 // the stop, which the threshold's own resolution would miss.
 const RECENT_TRAFFIC_GRACE_SEC = Number(process.env.RECENT_TRAFFIC_GRACE_SEC) || 60;
+
+// Every stop copies the whole data directory, so unbounded this grows
+// without limit: 20h of soak on one trivial app produced 36 snapshots and
+// 127MB. 3 rather than 1, so there is somewhere to go back to when the
+// newest copy is the damaged one.
+const SNAPSHOT_RETAIN_COUNT = Number(process.env.SNAPSHOT_RETAIN_COUNT) || 3;
 
 // Nomad jobs that are part of the platform itself, not a customer app.
 // Traefik and the static-server (the shared Caddy behind static apps —
@@ -103,18 +89,9 @@ async function runningAppNames() {
     .sort();
 }
 
-// "Last REAL request", not "last request". A newly deployed app picks up
-// credential-scanner traffic within seconds of its first TLS certificate
-// (confirmed in production: ~2/min of /.env, /.git/config and friends),
-// which would otherwise keep it permanently non-idle — and under
-// scale-to-zero would wake it to serve those scans.
-//
-// Scans a bounded window of recent rows rather than MAX(ts): the answer
-// is the newest NON-bot row, which SQL alone can't pick without pushing
-// the whole classifier into a query. LOOKBACK_ROWS is generous enough
-// that an app whose recent traffic is entirely bots still resolves
-// correctly, and if every row in the window is a bot the app is
-// genuinely idle by any definition.
+// "Last REAL request". A new app attracts scanner traffic within seconds
+// of its first certificate, and counting that would keep every app awake
+// forever. See analytics/bot-filter.js.
 const LOOKBACK_ROWS = 500;
 
 function lastSeenMsFor(db, appName) {
@@ -171,22 +148,12 @@ function hadRecentTraffic(db, appName) {
   return rows.some((r) => !isBotRequest({ userAgent: r.user_agent, path: r.path }));
 }
 
-// Snapshot of what the app's data looked like at the moment it was
-// stopped. Two jobs: a rollback copy, and a manifest Step 4 can assert
-// against before it declares a woken app healthy.
+// A rollback copy plus a manifest Step 4 asserts against before serving a
+// woken app — an app that wakes to an empty DATA_DIR usually just creates
+// a fresh database and reports itself healthy.
 //
-// That assertion is the point. An app that wakes to an empty DATA_DIR
-// will usually just create a fresh database and report itself perfectly
-// healthy — the user's data is gone and nothing alerts. Comparing file
-// count and per-file sizes against this manifest catches exactly that.
-//
-// Written AFTER the job has stopped, when the files are quiescent: a
-// plain copy of a live SQLite database can be torn, but a copy of a
-// stopped one cannot.
-//
-// The snapshot root is a dot-prefixed sibling inside APP_DATA_ROOT. App
-// names are /^[a-z0-9-]+$/, so a leading dot cannot ever collide with a
-// real app's directory.
+// Written AFTER the stop, when the files are quiescent: a copy of a live
+// SQLite database can be torn.
 async function snapshotAppData(appName) {
   const dataDir = appDataPathFor(appName);
   const snapshotRoot = `${appDataPathFor('.snapshots')}/${appName}`;
@@ -222,34 +189,61 @@ async function snapshotAppData(appName) {
   // cp -a, not a delete-then-copy: nothing in this file removes anything.
   await execFileAsync('cp', ['-a', `${dataDir}/.`, dest]);
   await fsp.writeFile(`${snapshotRoot}/latest-manifest.json`, JSON.stringify(manifest, null, 2));
+  await pruneSnapshots(snapshotRoot);
   return { dest, manifest };
 }
 
-// Capture the app's Nomad job spec to disk BEFORE stopping it.
-//
-// This is a hard prerequisite for Step 4, not a nicety. deploy-service
-// renders each job spec into a temp build directory, runs it, and
-// deletes the file (server.js) — so after a deploy the ONLY copy of an
-// app's spec lives inside Nomad's own state. `job_gc_threshold`
-// (4h by default) garbage collects a STOPPED job out of that state, and
-// at that moment the spec is gone for good: there is nothing left for an
-// activator to `nomad job run`, and no way to recover the app short of a
-// fresh deploy from source.
-//
-// So the window in which a stopped app can be woken is currently the GC
-// threshold, and it closes silently. Writing the spec out here makes
-// waking independent of Nomad's retention entirely.
-//
-// Before the stop, deliberately: `nomad job inspect` on an already-GC'd
-// job returns nothing, and the whole point is to hold a copy that
-// outlives GC. A capture failure ABORTS the stop — an app we cannot
-// prove we can restart must not be stopped.
-//
-// `nomad job inspect` emits `{"Job": {...}}`, which is exactly what
-// `nomad job run -json` accepts back, so no transformation is needed.
+/**
+ * Every `server` task's DATA_DIR. An app on /alloc/data writes into the
+ * allocation directory, which Nomad collects with a stopped job. A missing
+ * DATA_DIR is fine — nothing to lose.
+ */
+function dataDirsFromSpec(spec) {
+  const dirs = [];
+  for (const group of spec?.Job?.TaskGroups || []) {
+    for (const task of group.Tasks || []) {
+      if (task?.Name !== 'server') continue;
+      if (task?.Env && 'DATA_DIR' in task.Env) dirs.push(task.Env.DATA_DIR);
+    }
+  }
+  return dirs;
+}
+
+/**
+ * Filenames under the running allocation's /alloc/data, or null if it
+ * cannot be determined — which callers must treat as unsafe.
+ *
+ * Via Nomad's filesystem API, not the disk: allocation directories are
+ * root-owned 0700 and this runs as the deploy-service user.
+ */
+async function allocDataDirContents(appName) {
+  try {
+    const allocs = await nomadGet(`/v1/job/${encodeURIComponent(appName)}/allocations`);
+    const running = allocs
+      .filter((a) => a.ClientStatus === 'running')
+      .sort((a, b) => a.CreateIndex - b.CreateIndex)
+      .pop();
+    if (!running) return null;
+
+    const res = await fetch(
+      `${NOMAD_ADDR}/v1/client/fs/ls/${running.ID}?path=${encodeURIComponent('alloc/data')}`
+    );
+    if (res.status === 404) return [];
+    if (!res.ok) return null;
+    const entries = await res.json();
+    if (!Array.isArray(entries)) return null;
+    return entries.map((e) => e.Name).filter((n) => n && n !== '.' && n !== '..');
+  } catch {
+    return null;
+  }
+}
+
+// Capture the job spec BEFORE stopping. deploy-service deletes the
+// rendered spec after running it, so Nomad's own state is the only copy —
+// and job_gc_threshold (4h) collects a STOPPED job out of it, at which
+// point the app can never be woken. A capture failure ABORTS the stop.
 async function captureJobSpec(appName) {
-  const specDir = appDataPathFor('.specs');
-  const dest = `${specDir}/${appName}.json`;
+  const dest = specPathFor(appName);
   const { stdout } = await execFileAsync('nomad', ['job', 'inspect', appName]);
 
   // Guard against writing an empty or unparseable file over a good one:
@@ -260,9 +254,87 @@ async function captureJobSpec(appName) {
     throw new Error(`inspect returned no Job for "${appName}"`);
   }
 
-  await fsp.mkdir(specDir, { recursive: true });
+  // The spec is worthless without the images it references. App images
+  // are built locally and pushed to no registry, and Nomad's own docker
+  // GC used to delete them ~3m after the job's allocations were
+  // collected (now disabled in nomad.hcl) — so an app stopped with its
+  // image already gone could never be started again, and the failure
+  // surfaced as "pull access denied", nowhere near the real cause.
+  //
+  // Checked here, before the stop, and fatal: exactly the same rule as
+  // saving the spec. Do not stop what you cannot restart.
+  const missing = await missingImages(imagesFromSpec(parsed));
+  if (missing.length > 0) {
+    throw new Error(`image(s) not present on this host: ${missing.join(', ')}`);
+  }
+
+// The last "do not stop what you cannot restart" check, and the only one
+// whose failure costs DATA rather than uptime.
+//
+// An old DATA_DIR is not by itself a reason to refuse — 28 of 36 apps were
+// on /alloc/data and only 4 had a file in it. The question is whether
+// anything is actually there. Read over Nomad's filesystem API since this
+// runs unprivileged; "cannot tell" is treated as unsafe.
+  const badDataDirs = dataDirsFromSpec(parsed).filter((d) => d !== '/data');
+  if (badDataDirs.length > 0) {
+    const contents = await allocDataDirContents(appName);
+    if (contents === null) {
+      throw new Error(
+        `DATA_DIR is ${badDataDirs.join(', ')} (not /data) and its allocation directory could not be ` +
+          `read, so whether stopping this app would destroy data is unknown — refusing`
+      );
+    }
+    if (contents.length > 0) {
+      throw new Error(
+        `DATA_DIR is ${badDataDirs.join(', ')}, not /data, and holds ${contents.length} file(s) ` +
+          `(${contents.slice(0, 3).join(', ')}${contents.length > 3 ? ', ...' : ''}). Nomad garbage ` +
+          `collects that directory with a stopped job. Fix with ` +
+          `Server-setup/apply-app-config.sh, which regenerates the spec onto the bind mount ` +
+          `using api-service's stored config — no rebuild, no downtime. If its data is not ` +
+          `already at APP_DATA_ROOT, copy it first with migrate-app-data.sh`
+      );
+    }
+    logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
+  }
+
+  await fsp.mkdir(path.dirname(dest), { recursive: true });
   await fsp.writeFile(dest, stdout);
   return dest;
+}
+
+/**
+ * Prune old snapshots. This file's rule that nothing here deletes app data
+ * still holds: these are OUR copies under .snapshots/, never the app's own
+ * directory. Narrow on purpose — only timestamp-named directories, so
+ * latest-manifest.json cannot be caught by it.
+ */
+const SNAPSHOT_DIR_PATTERN = /^\d{4}-\d{2}-\d{2}T[\d-]+Z$/;
+
+async function pruneSnapshots(snapshotRoot) {
+  let entries;
+  try {
+    entries = await fsp.readdir(snapshotRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const snapshots = entries
+    .filter((e) => e.isDirectory() && SNAPSHOT_DIR_PATTERN.test(e.name))
+    .map((e) => e.name)
+    // The timestamp format sorts lexicographically in chronological
+    // order, so this is oldest-first without parsing any dates.
+    .sort();
+
+  const doomed = snapshots.slice(0, Math.max(0, snapshots.length - SNAPSHOT_RETAIN_COUNT));
+  for (const name of doomed) {
+    try {
+      await fsp.rm(`${snapshotRoot}/${name}`, { recursive: true, force: true });
+    } catch (e) {
+      logger(`  ! could not prune old snapshot ${name}: ${e.message}`);
+    }
+  }
+  if (doomed.length > 0) {
+    logger(`  pruned ${doomed.length} old snapshot(s), keeping ${SNAPSHOT_RETAIN_COUNT}`);
+  }
 }
 
 async function stopApp(appName) {
@@ -302,6 +374,11 @@ async function main() {
     process.exit(1);
   }
 
+  // Registry first: an app that opted in at deploy time is not in the code
+  // seed, and reading it after the report was built would silently exclude
+  // exactly the apps Step 7 exists to include.
+  STOPPABLE_APPS = await allApps();
+
   const db = getDb();
   const apps = await runningAppNames();
   if (apps.length === 0) {
@@ -326,6 +403,31 @@ async function main() {
       wouldStop: idleMs !== null && idleMs >= thresholdMs,
     };
   });
+
+// Refresh every eligible app's spec, not just the one about to stop.
+// Stop-time capture alone leaves a real app with no spec between joining
+// the allowlist and its first stop. One inspect per app per run.
+  // Collected and summarised rather than logged per app per pass: the
+  // DATA_DIR refusal is permanent until an app is migrated, so at one run
+  // every 10 minutes it was ~576 identical lines a day.
+  const blocked = [];
+  for (const row of rows) {
+    if (!STOPPABLE_APPS.includes(row.appName)) continue;
+    await captureJobSpec(row.appName).catch((e) => blocked.push([row.appName, e.message]));
+  }
+  if (blocked.length > 0) {
+    const unmigrated = blocked.filter(([, m]) => m.includes('DATA_DIR'));
+    const other = blocked.filter(([, m]) => !m.includes('DATA_DIR'));
+    if (unmigrated.length > 0) {
+      logger(
+        `  ! ${unmigrated.length} app(s) can never be stopped until migrated off /alloc/data: ` +
+          `${unmigrated.map(([n]) => n).join(', ')} — see Server-setup/migrate-app-data.sh`
+      );
+    }
+    // Anything else is unexpected and stays per-app: a missing image or an
+    // unreachable Nomad is a new problem, not a known backlog.
+    for (const [name, msg] of other) logger(`  ! could not refresh saved spec for ${name}: ${msg}`);
+  }
 
   const apply = process.argv.includes('--apply');
   console.log(
@@ -352,7 +454,11 @@ async function main() {
   const stoppable = rows.filter((r) => r.wouldStop).length;
 
   if (!apply) {
-    console.log(`\n${rows.length} app(s) checked, ${stoppable} would be stopped, 0 actually touched.`);
+    const eligible = rows.filter((r) => r.wouldStop && STOPPABLE_APPS.includes(r.appName)).length;
+    console.log(
+      `\n${rows.length} app(s) checked, ${stoppable} idle past the threshold, ` +
+        `${eligible} of those eligible (mode: ${SCALE_TO_ZERO_MODE}), 0 actually touched.`
+    );
     return;
   }
 
@@ -383,7 +489,7 @@ async function main() {
       const specPath = await captureJobSpec(row.appName);
       console.log(`  job spec saved -> ${specPath}`);
     } catch (e) {
-      console.log(`  ABORT — could not save job spec (${e.message}); refusing to stop an app we may not be able to restart`);
+      console.log(`  ABORT — ${e.message}; refusing to stop an app we may not be able to restart`);
       continue;
     }
 
