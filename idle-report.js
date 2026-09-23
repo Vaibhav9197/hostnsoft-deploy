@@ -34,7 +34,10 @@ const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 // ORPHAN_TTL_MS. 30 minutes is a starting point for observation, NOT a
 // tuned value — Step 5 of the plan is where a real threshold gets chosen
 // from actual traffic patterns.
-const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 30;
+// 360 = the production value the systemd unit sets. They MUST match: a
+// manual run that defaults to something else answers a different question
+// than the timer, and reports a different set of apps as eligible.
+const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 360;
 
 // THE SAFETY RAIL. The code seed in scale-to-zero-apps.js plus anything
 // that opted in at deploy time (scale-to-zero-registry.js). Loaded once
