@@ -70,7 +70,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 // APPS_DOMAIN_SUFFIX's fail-fast check now lives inside this module (see
 // its defaultDomainFor) rather than here, since both this file and the
 // config endpoint below need it.
-const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
+const { buildNomadJobSpec, domainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
 
@@ -585,9 +585,10 @@ app.post('/apps', upload.single('source'), async (req, res) => {
   const imageName = `${appName}:${appVersion}`; // CHANGED: versioned tag instead of :latest
   // Real domain via Cloudflare DNS, routed through Traefik with Let's Encrypt TLS.
   // Domain suffix comes from APPS_DOMAIN_SUFFIX (see nomad-job-spec.js's
-  // defaultDomainFor) — not hardcoded, so it tracks whatever
-  // server-setup.sh configured.
-  const domain = defaultDomainFor(appName);
+  // domainFor) — not hardcoded, so it tracks whatever server-setup.sh
+  // configured. An app deployed before the domain move keeps its legacy
+  // hostname (read from its saved spec) rather than being migrated.
+  const domain = await domainFor(appName);
   // The status/log check-back URLs below always answer as this same
   // service, so they're built off the incoming request's own host rather
   // than a separate env var — same https-hardcoding the response already
@@ -1084,7 +1085,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   // here. This endpoint has no build dir and therefore no dependency
   // scan, which used to matter when the floor had an embedded-DB tier.
   const schedulingFloorMb = SCHEDULING_FLOOR_MB;
-  const domain = defaultDomainFor(appName);
+  const domain = await domainFor(appName);
 
   // NEW: this endpoint now also backs one-click rollback (see
   // hostnsoft-api's src/routes/deployments.routes.ts), which can request

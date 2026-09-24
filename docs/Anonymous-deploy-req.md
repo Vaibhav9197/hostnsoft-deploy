@@ -67,7 +67,7 @@ nothing existing is removed or renamed:
   "version": "abc1234",
   "image": "my-app:abc1234",
   "memory": "256MB",
-  "url": "https://my-app.app.embarko.ai",
+  "url": "https://my-app.embarko.app",
   "orphan": {
     "expiresAt": "2026-09-05T14:30:00.000Z",
     "message": "This app is temporary and will be deleted at 2026-09-05T14:30:00.000Z unless claimed. To keep it: 1) go to https://embarko.ai/login and sign in (or create an account), 2) create a company if you don't have one, 3) create a deploy token from that company's Tokens page, 4) redeploy this exact app name using that token as the Authorization header before the deadline above. Redeploying with a valid token before expiry permanently keeps this app and removes this notice."

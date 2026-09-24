@@ -22,7 +22,7 @@ if (require.main === module) {
   require('dotenv').config({ path: path.join(__dirname, '.env') });
 }
 
-const { appDataPathFor, specPathFor, defaultDomainFor, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
+const { appDataPathFor, specPathFor, domainFor, isPlatformHost, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
 const {
   SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, isAlwaysFront,
@@ -115,7 +115,7 @@ function logger(line) {
  * router for it 404s on someone's real domain.
  */
 async function hostnamesFor(appName) {
-  const fallback = APPS_DOMAIN_SUFFIX ? [defaultDomainFor(appName)] : [];
+  const fallback = APPS_DOMAIN_SUFFIX ? [await domainFor(appName)] : [];
   let spec;
   try {
     spec = await fs.readFile(specPathFor(appName), 'utf8');
@@ -138,9 +138,7 @@ function routerBlock(name, host, service, alwaysFront) {
   // Custom domains are not in this platform's Cloudflare zone, so they can
   // only be issued over HTTP-01 — the same split the app's own router uses.
   const resolver =
-    APPS_DOMAIN_SUFFIX && host.endsWith(`.${APPS_DOMAIN_SUFFIX}`)
-      ? DNS01_CERT_RESOLVER
-      : HTTP01_CERT_RESOLVER;
+    APPS_DOMAIN_SUFFIX && isPlatformHost(host) ? DNS01_CERT_RESOLVER : HTTP01_CERT_RESOLVER;
   return [
     `    ${name}:`,
     `      rule: "Host(${BT}${host}${BT})"`,
