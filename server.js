@@ -527,24 +527,52 @@ async function performBuildAndDeploy({
 // app; in practice it is finished within a second.
 async function performStaticDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, credential, deploymentId, plan, convertingFromService,
+  claim, credential, deploymentId, plan, existingKind,
 }) {
+  const convertingFromService = existingKind === 'service';
   try {
-    logger.info(`[${appName}] Static site (railpack provider: ${plan.providers}, root: ${plan.rootDir}) — publishing files directly, no image build and no Nomad job.`);
+    // plan.ok is false when railpack could not inspect the upload and the
+    // app kept its existing static kind (see the deploy handler); there is
+    // then no detected root or provider, so the upload root is the site.
+    const rootDir = (plan.ok && plan.rootDir) || '.';
+    const provider = (plan.ok && plan.providers) || 'staticfile';
+    logger.info(`[${appName}] Static site (railpack provider: ${provider}, root: ${rootDir}) — publishing files directly, no image build and no Nomad job.`);
     await publishStaticVersion({
       appName,
       version: appVersion,
-      sourceDir: path.join(buildDir, plan.rootDir),
-      provider: plan.providers,
+      sourceDir: path.join(buildDir, rootDir),
+      provider,
     });
-    await writeStaticRouterFile({
-      appName,
-      domain,
-      customDomains: claim.customDomains || [],
-      isOrphan: claim.isOrphan,
-      orphanExpiresAt: claim.orphanExpiresAt,
-      orphanLoginUrl: claim.orphanLoginUrl,
-    });
+    // publishStaticVersion above wrote the manifest, which is what
+    // app-kind.js reads: from this point the host calls the app static.
+    // The version is not reachable until the router file exists, though,
+    // so if that write fails an app that was NOT static before must not
+    // stay marked static — otherwise the old Nomad job (or nothing at
+    // all) keeps answering the hostnames while every later server-app
+    // upload is refused with app_kind_changed. Undo the publish so the
+    // host is back to exactly what it was before this deploy. An app
+    // that was already static keeps its previous router file (the write
+    // is an atomic rename), so its files stay served and there is
+    // nothing to roll back.
+    try {
+      await writeStaticRouterFile({
+        appName,
+        domain,
+        customDomains: claim.customDomains || [],
+        isOrphan: claim.isOrphan,
+        orphanExpiresAt: claim.orphanExpiresAt,
+        orphanLoginUrl: claim.orphanLoginUrl,
+      });
+    } catch (routerError) {
+      if (existingKind !== 'static') {
+        logger.warn(`[${appName}] Router file write failed; undoing the static publish so the app stays a ${existingKind === 'service' ? 'server app' : 'new name'}: ${routerError.message}`);
+        await removeStaticRouterFile(appName).catch(() => {});
+        await removeStaticApp(appName).catch((e) => {
+          logger.error(`[${appName}] Could not undo the static publish after the router failure — the app may now be wrongly marked static: ${e.message}`);
+        });
+      }
+      throw routerError;
+    }
     logger.info(`[${appName}] Static version ${appVersion} is live.`);
 
     // Server app -> static site (see app-kind.js for why this direction
@@ -809,17 +837,39 @@ app.post('/apps', upload.single('source'), async (req, res) => {
     // Checked BEFORE the 202, so a refusal is a real response, not a
     // background failure to poll for.
     const plan = await inspectBuildPlan(buildDir);
+    const existingKind = await resolveAppKind(appName);
+    if (plan.invalidStaticRoot !== undefined) {
+      // build-plan.js: the Staticfile names a root outside the upload.
+      // Not a transient railpack failure, so it does NOT fall through to
+      // "keep the existing kind" — that path publishes from the upload
+      // root and would hide the misconfiguration.
+      logger.info(`[${appName}] Rejected: ${plan.error}`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(422).json({
+        error: "Invalid static root",
+        code: "invalid_static_root",
+        detail:
+          `The Staticfile sets root: ${plan.invalidStaticRoot}, which points outside the uploaded files. ` +
+          `The root must be a directory inside the upload (for example "root: dist" or "root: public").`,
+        docs: DOCS_URL,
+      });
+    }
     if (!plan.ok) {
-      logger.info(`[${appName}] railpack could not inspect this upload (${plan.error}) — leaving it to the build to report`);
+      logger.info(`[${appName}] railpack could not inspect this upload (${plan.error}) — keeping the app's existing kind (${existingKind === 'none' ? 'new app, so server' : existingKind})`);
     } else if (plan.isSpa) {
       logger.info(`[${appName}] Single-page app build detected (${plan.providers}) — built and served in a container for now`);
     }
-    const isStaticDeploy = plan.ok && plan.isPlainStatic;
-    const existingKind = await resolveAppKind(appName);
-    if (!isStaticDeploy && existingKind === 'static') {
-      const now = plan.ok
-        ? `a server app (railpack detected: ${plan.providers || 'unknown'})`
-        : 'not recognizable as a static site (railpack could not detect the app type)';
+    // Only a SUCCESSFUL inspection says anything about the upload's kind.
+    // When railpack cannot inspect it at all, the upload is not evidence
+    // of a change, so the app keeps whatever kind it already is: a static
+    // site publishes its files from the upload root, a server app (or a
+    // brand new name) goes to the build, which reports the real problem.
+    // Refusing here instead used to send a static app's owner off to a
+    // second app name over a transient railpack failure.
+    const isStaticDeploy = plan.ok ? plan.isPlainStatic : existingKind === 'static';
+    if (plan.ok && !isStaticDeploy && existingKind === 'static') {
+      const now = `a server app (railpack detected: ${plan.providers || 'unknown'})`;
       logger.info(`[${appName}] Rejected: app is a static site, this upload is ${now}`);
       await fs.remove(buildDir);
       await fs.remove(req.file.path);
@@ -970,7 +1020,7 @@ app.post('/apps', upload.single('source'), async (req, res) => {
       ? performStaticDeploy({
           appName, appVersion, imageName, domain,
           buildDir, filePath: req.file.path,
-          claim, credential, deploymentId, plan, convertingFromService,
+          claim, credential, deploymentId, plan, existingKind,
         })
       : performBuildAndDeploy({
           appName, appVersion, imageName, domain,

@@ -88,7 +88,12 @@ inspect` and health trusts `nomad job status`.
   before anything is built. A server app needs routing, a data directory
   and settings the static app never had, and its rollback history would
   mix directories and images. The message tells the caller to deploy
-  under a new app name.
+  under a new app name. Only a **successful** railpack inspection counts
+  as evidence of a kind change: when `railpack info` fails outright, the
+  app keeps its existing kind (a static site publishes the upload root
+  as-is; a server app or a new name goes to the build, which reports the
+  real error). Refusing on a failed inspection used to push static-app
+  owners onto a second app name over a transient railpack failure.
 
 Accepted edge case (decided 2026-09-22): an accidental static upload of a
 server app (say, a tarball missing its package.json) converts it and

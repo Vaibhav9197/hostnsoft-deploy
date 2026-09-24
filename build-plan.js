@@ -34,6 +34,7 @@
 'use strict';
 
 const { execFile } = require('child_process');
+const path = require('path');
 const util = require('util');
 const execFileAsync = util.promisify(execFile);
 
@@ -51,6 +52,19 @@ function staticRootFromPlan(plan) {
   if (typeof caddyfile !== 'string') return null;
   const match = caddyfile.match(/^\s*root\s+\*\s+(\S+)\s*$/m);
   return match ? match[1] : null;
+}
+
+// Railpack copies a Staticfile's `root:` into the Caddyfile verbatim (it
+// only trims whitespace), and the caller joins that value onto the upload
+// directory to pick the files to publish. A root of "../../.." or "/etc"
+// would therefore publish a host directory on the app's public URL. Only
+// a root that stays inside the upload is accepted; anything else refuses
+// the deploy rather than silently publishing something the owner did not
+// mean to.
+function staticRootStaysInside(dir, rootDir) {
+  const base = path.resolve(dir);
+  const target = path.resolve(base, rootDir);
+  return target === base || target.startsWith(base + path.sep);
 }
 
 async function inspectBuildPlan(dir) {
@@ -86,6 +100,15 @@ async function inspectBuildPlan(dir) {
   const isPlainStatic = isStatic && providers === 'staticfile';
   const isSpa = isStatic && metadata.nodeIsSPA === 'true';
 
+  const rootDir = isPlainStatic ? staticRootFromPlan(plan) || '.' : null;
+  if (rootDir !== null && !staticRootStaysInside(dir, rootDir)) {
+    return {
+      ok: false,
+      invalidStaticRoot: rootDir,
+      error: `Staticfile root "${rootDir}" points outside the uploaded files`,
+    };
+  }
+
   return {
     ok: true,
     providers,
@@ -94,9 +117,9 @@ async function inspectBuildPlan(dir) {
     isPlainStatic,
     isSpa,
     // Relative to the upload root; only meaningful for a plain static app.
-    rootDir: isPlainStatic ? staticRootFromPlan(plan) || '.' : null,
+    rootDir,
     railpackVersion: info.railpackVersion || null,
   };
 }
 
-module.exports = { inspectBuildPlan };
+module.exports = { inspectBuildPlan, staticRootFromPlan, staticRootStaysInside };

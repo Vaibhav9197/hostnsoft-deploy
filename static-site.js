@@ -138,11 +138,24 @@ async function pointCurrentAt(appName, version) {
 // `current` to them, records the version in the manifest. Redeploying an
 // existing version replaces its directory, exactly as `railpack build`
 // re-tagging an existing image did on the container path.
+//
+// The copy goes to a staging directory first and is renamed into place
+// once complete. If the version being redeployed is the one `current`
+// points at, its files therefore stay served for the whole copy instead
+// of disappearing while it runs; the only window left is the
+// remove-plus-rename below. A failed copy leaves the old files untouched.
 async function publishStaticVersion({ appName, version, sourceDir, provider, spa = false }) {
   const dest = versionDir(appName, version);
+  const staging = `${dest}.tmp-${process.pid}-${Date.now()}`;
   await fs.ensureDir(versionsDir(appName));
+  try {
+    await fs.copy(sourceDir, staging, { filter: copyFilter });
+  } catch (e) {
+    await fs.remove(staging).catch(() => {});
+    throw e;
+  }
   await fs.remove(dest);
-  await fs.copy(sourceDir, dest, { filter: copyFilter });
+  await fs.rename(staging, dest);
 
   await pointCurrentAt(appName, version);
 
