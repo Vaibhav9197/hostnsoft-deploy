@@ -351,8 +351,12 @@ async function ensureAppDataDir(appName) {
 // "out of scope": there's no company to attribute history to
 // until/unless the project is claimed. deploymentId (from the
 // in_progress call in the request handler) updates that same row in
-// place rather than creating a second one for this attempt.
-async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId }) {
+// place rather than creating a second one for this attempt. `kind`
+// ("static" | "service") is what hostnsoft-api persists as
+// Project.kind — reported only here, on success, because that is
+// the first moment the app's kind on this host is actually settled
+// (a failed static publish is undone, see performStaticDeploy).
+async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind }) {
   if (isIdentified(credential)) {
     await recordDeployment({
       credential,
@@ -362,6 +366,7 @@ async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory,
       imageTag: imageName,
       memoryMb: taskMemory,
       deploymentId,
+      kind,
     });
   }
   setDeployState(appName, {
@@ -511,7 +516,7 @@ async function performBuildAndDeploy({
     await fs.remove(buildDir);
     await fs.remove(filePath);
 
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId });
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind: 'service' });
   } catch (error) {
     await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
   }
@@ -606,7 +611,7 @@ async function performStaticDeploy({
 
     // No memoryMb: a static app runs no process, so there is nothing
     // hostnsoft-api's Project.memoryMb could describe for it.
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId });
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static' });
   } catch (error) {
     await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
   }

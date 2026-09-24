@@ -55,7 +55,10 @@ history first).
   empty. Best-effort and fails open on the *deploy's* own response — a
   `hostnsoft-api` outage here only means this one deploy's outcome doesn't
   get recorded (logged to `pm2 logs`), it never changes the response
-  already going back to whoever triggered the deploy.
+  already going back to whoever triggered the deploy. Since 2026-09-24
+  the success call also carries `kind: "static" | "service"`, which
+  `hostnsoft-api` persists as `Project.kind` so the dashboard can hide
+  env-var/memory controls for a static site (see `docs/Static-apps-req.md`).
 - **`deploy-credential.js`** (added 2026-09-17) — reads whichever
   credential `POST /apps` presented and packages it for the two
   `hostnsoft-api` calls a deploy makes. **This is where the deploy

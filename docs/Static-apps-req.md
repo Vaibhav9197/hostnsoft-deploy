@@ -146,5 +146,12 @@ changed).
   the same way, and set `X-Embarko-Spa: 1` in the router — the Caddyfile
   already falls back to `/index.html` for it. Build logs would need to be
   captured per version for `GET /apps/:app/logs`.
-- Report `kind` to hostnsoft-api (an optional field on `Deployment`) so
-  the dashboard can label static apps and hide memory / env-var controls.
+- ~~Report `kind` to hostnsoft-api~~ — done 2026-09-24. `finishDeploySuccess`
+  sends `kind: "static" | "service"` on the success call to
+  `POST /internal/deployments/record`, and hostnsoft-api stores it as
+  `Project.kind` (a string, so more kinds can be added later; not a
+  `Deployment` column: kind only ever moves service -> static and a
+  rollback can't change it). The dashboard reads it to hide memory /
+  env-var controls when it is `"static"`. Anonymous deploys record
+  nothing, so an orphan stays at the default `"service"` until it is
+  deployed with a credential.
