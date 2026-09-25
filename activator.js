@@ -5,7 +5,9 @@
  *
  * A separate pm2 process, not part of deploy-service: it holds visitor
  * connections open through a cold start and must not be able to take the
- * deploy API down with it.
+ * deploy API down with it.  
+ * A file in /opt/traefik/dynamic/
+ * (Traefik's file-provider directory — see server-setup.sh)
  *
  *   node activator.js
  */
@@ -370,7 +372,7 @@ const server = http.createServer(async (req, res) => {
 
   if (!appName) {
     // Nothing should ever reach here: Traefik only routes hostnames that
-    // have a fallback router in dynamic.yml. A 404 rather than a proxy
+    // have a fallback router in /opt/traefik/dynamic/. A 404 rather than a proxy
     // attempt means a misconfiguration can never turn this process into
     // an open relay for an arbitrary Host header.
     res.writeHead(404, { 'content-type': 'text/plain' });

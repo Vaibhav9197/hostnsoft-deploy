@@ -26,6 +26,13 @@
  * That's informational, not an identity: nothing stops a user from
  * redeploying without bumping it at all.
  *
+ * `kind` ("static" | "service") says what this deploy actually shipped —
+ * the same verdict server.js puts in its own response — so hostnsoft-api
+ * can keep Project.kind current and the dashboard can stop offering
+ * env vars / memory for an app that runs no process. Only sent on the
+ * "success" call: nothing is live until then, and a static publish that
+ * fails is undone on this side (see performStaticDeploy in server.js).
+ *
  * Best-effort: never throws. A hostnsoft-api outage or a bug in this
  * reporting step must never change the response already being sent back
  * to the client that triggered the deploy — the deploy itself already
@@ -48,6 +55,7 @@ async function recordDeployment({
   memoryMb,
   errorDetail,
   deploymentId,
+  kind,
 }) {
   try {
     const response = await fetch(`${HOSTNSOFT_API_URL}/internal/deployments/record`, {
@@ -62,6 +70,7 @@ async function recordDeployment({
         memoryMb,
         errorDetail,
         deploymentId,
+        kind,
       }),
     });
 

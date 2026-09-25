@@ -57,11 +57,16 @@ const RECENT_TRAFFIC_GRACE_SEC = Number(process.env.RECENT_TRAFFIC_GRACE_SEC) ||
 const SNAPSHOT_RETAIN_COUNT = Number(process.env.SNAPSHOT_RETAIN_COUNT) || 3;
 
 // Nomad jobs that are part of the platform itself, not a customer app.
-// Traefik is the only one that runs as a Nomad job (deploy-service and
-// api-service run under pm2, so they never appear in /v1/jobs at all) —
-// but listing it explicitly means a future platform job can't silently
-// become a scale-to-zero candidate just by existing.
-const PLATFORM_JOBS = new Set(['traefik']);
+// Traefik and the static-server (the shared Caddy behind static apps —
+// docs/Static-apps-req.md) are the ones that run as Nomad jobs
+// (deploy-service and api-service run under pm2, so they never appear in
+// /v1/jobs at all). Both are `type = "system"` jobs, which is what
+// runningAppNames actually filters on — customer apps are always
+// `type = "service"` — but naming them here too means a future platform
+// job can't silently become a scale-to-zero candidate just by existing.
+// On a shared host the static-server's name carries the environment
+// prefix (e.g. "test-static-server"), hence the type check doing the work.
+const PLATFORM_JOBS = new Set(['traefik', 'static-server']);
 
 async function nomadGet(path) {
   const response = await fetch(`${NOMAD_ADDR}${path}`);
@@ -78,7 +83,7 @@ async function nomadGet(path) {
 async function runningAppNames() {
   const jobs = await nomadGet('/v1/jobs');
   return jobs
-    .filter((j) => j.Status === 'running')
+    .filter((j) => j.Status === 'running' && j.Type !== 'system')
     .map((j) => j.ID)
     .filter((id) => !PLATFORM_JOBS.has(id))
     .sort();

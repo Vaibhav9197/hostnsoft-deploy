@@ -42,6 +42,7 @@ reading `error`/`detail`/`details` keep working unchanged).
 | No file uploaded | `400` | `missing_source_file` |
 | `window.storage` detected | `422` | `unsupported_storage_pattern` |
 | Build/deploy failure | `500` | `deploy_failed` |
+| A static site is redeployed as a server app (the reverse is allowed) | `422` | `app_kind_changed` — added 2026-09-22 with the static fast path, see `Static-apps-req.md`; response also carries `previousKind`/`uploadedKind` |
 
 Example — the storage-rejection response becomes:
 
