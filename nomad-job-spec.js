@@ -9,7 +9,7 @@
  * docs/Customdomain-req.md.
  *
  * Two cert resolvers, deliberately kept separate (constraint #1):
- * - DNS-01 ("cloudflare") for the platform's own *.app.<platform-domain>
+ * - DNS-01 ("cloudflare") for the platform's own *.<APPS_DOMAIN_SUFFIX> (e.g. *.embarko.app)
  *   router — DNS-01 needs write access to the DNS zone, which the
  *   platform only has for its own domain.
  * - HTTP-01 ("letsencrypt-http") for every client custom domain — works
@@ -353,11 +353,19 @@ module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER,
 if (!process.env.APPS_DOMAIN_SUFFIX) {
   throw new Error(
     'APPS_DOMAIN_SUFFIX environment variable is not set. This is the ' +
-      'domain suffix deployed apps live under (e.g. "app.embarko.ai") — ' +
+      'domain suffix deployed apps live under (e.g. "embarko.app") — ' +
       'see server-setup.sh, which computes and exports it per environment.'
   );
 }
 const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
+
+// Optional. The suffix apps USED to live under (e.g. "app.embarko.ai")
+// before APPS_DOMAIN_SUFFIX moved to its own zone. Apps whose saved spec
+// still routes <app>.<legacy> are deliberately NOT migrated: they keep that
+// hostname on every redeploy/config push (see domainFor), and its certs
+// keep coming from the DNS-01 resolver (see isPlatformHost). New apps get
+// APPS_DOMAIN_SUFFIX. Unset once every legacy app is gone.
+const LEGACY_APPS_DOMAIN_SUFFIX = process.env.LEGACY_APPS_DOMAIN_SUFFIX || null;
 
 // Same convention — the address Docker actually publishes app container
 // ports to on this box (confirmed in practice: NOT 0.0.0.0/127.0.0.1,
@@ -423,6 +431,35 @@ function defaultDomainFor(appName) {
   return `${appName}.${APPS_DOMAIN_SUFFIX}`;
 }
 module.exports.defaultDomainFor = defaultDomainFor;
+
+// True for hostnames in a zone this platform controls in Cloudflare (the
+// current apps suffix and the legacy one), i.e. issuable over DNS-01.
+// Everything else is a client custom domain (HTTP-01).
+function isPlatformHost(host) {
+  if (host.endsWith(`.${APPS_DOMAIN_SUFFIX}`)) return true;
+  return !!LEGACY_APPS_DOMAIN_SUFFIX && host.endsWith(`.${LEGACY_APPS_DOMAIN_SUFFIX}`);
+}
+module.exports.isPlatformHost = isPlatformHost;
+
+// The hostname an app actually lives on. The saved job spec is the truth:
+// an app deployed before the domain move keeps <app>.<legacy suffix>
+// across redeploys and config pushes, so its URL never silently changes
+// under it. Anything else (new app, no saved spec, legacy unset) gets
+// defaultDomainFor. Deploy and config-push paths must use THIS, not
+// defaultDomainFor, or a redeploy would move a legacy app.
+async function domainFor(appName) {
+  const current = defaultDomainFor(appName);
+  if (!LEGACY_APPS_DOMAIN_SUFFIX) return current;
+  const legacy = `${appName}.${LEGACY_APPS_DOMAIN_SUFFIX}`;
+  let spec;
+  try {
+    spec = await require('fs').promises.readFile(specPathFor(appName), 'utf8');
+  } catch {
+    return current;
+  }
+  return spec.includes(`Host(\`${legacy}\`)`) ? legacy : current;
+}
+module.exports.domainFor = domainFor;
 
 // Where an app's saved Nomad job spec lives. One definition, because
 // three files write or read it — server.js saves it at deploy time,
