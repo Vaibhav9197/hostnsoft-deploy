@@ -22,7 +22,7 @@ if (require.main === module) {
   require('dotenv').config({ path: path.join(__dirname, '.env') });
 }
 
-const { appDataPathFor, specPathFor, domainFor, isPlatformHost, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
+const { appDataPathFor, specPathFor, defaultDomainFor, isPlatformHost, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
 const {
   SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, isAlwaysFront,
@@ -161,7 +161,7 @@ function logger(line) {
  * router for it 404s on someone's real domain.
  */
 async function hostnamesFor(appName) {
-  const fallback = APPS_DOMAIN_SUFFIX ? [await domainFor(appName)] : [];
+  const fallback = APPS_DOMAIN_SUFFIX ? [defaultDomainFor(appName)] : [];
   let spec;
   try {
     spec = await fs.readFile(specPathFor(appName), 'utf8');
