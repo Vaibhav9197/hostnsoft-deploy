@@ -599,6 +599,19 @@ async function performStaticDeploy({
       await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
         logger.warn(`[${appName}] Could not remove the old images (continuing): ${e.message}`);
       });
+      // Retire the scale-to-zero enrolment along with the job, or its wake
+      // router outlives the thing it wakes. The job above was purged, and a
+      // purged job CANNOT be woken — so a surviving router sends real
+      // traffic to the activator to wait on something that can never start.
+      //
+      // For a universal-tier app that router sits at priority 1 and loses
+      // to the static router's rule-length ~44, making this look harmless.
+      // For an always-front app it sits at 500 and WINS, and the static
+      // site is then unreachable. Hence unconditional, not best-effort on
+      // the tier.
+      await scaleToZero.forget(appName).catch((e) => {
+        logger.warn(`[${appName}] Could not clear the scale-to-zero entry (continuing): ${e.message}`);
+      });
     }
 
     // Best-effort, same as pruneOldImages on the container path.

@@ -38,6 +38,16 @@ const REGISTRY_PATH = `${appDataPathFor('.scale-to-zero')}/apps.json`;
 const TRAEFIK_DYNAMIC_DIR = process.env.TRAEFIK_DYNAMIC_DIR || '/opt/traefik/dynamic';
 const ROUTER_FILE = `${TRAEFIK_DYNAMIC_DIR}/scale-to-zero.yml`;
 
+// MUST match staticRouterFilePath() in traefik-router-file.js. Duplicated
+// rather than imported because that module fail-fasts at require time on
+// STATIC_SERVER_PORT/STATIC_ORPHAN_PROXY_PORT, which a host without static
+// sites configured does not set — importing it would take scale-to-zero
+// down on exactly the hosts that have nothing to do with static sites.
+// If the filename convention changes there, change it here too.
+function staticRouterFilePathFor(appName) {
+  return `${TRAEFIK_DYNAMIC_DIR}/static-${appName}.yml`;
+}
+
 // Must match the service name server-setup.sh defines in platform.yml. The
 // file provider merges every file in the directory into one configuration,
 // so a router here can reference a service defined there.
@@ -88,11 +98,25 @@ async function appsWithSavedSpec() {
   }
 }
 
+// Type !== 'system' drops the platform's OWN jobs — Traefik and the shared
+// static-server — the same test idle-report.js applies. Without it universal
+// mode enrols them as if they were customer apps: a wake router gets written
+// for a hostname no app owns, and the activator believes it can start a
+// platform job.
+//
+// The type check, not a name in EXCLUDED_APPS, because the static-server's
+// job name carries the environment prefix (prod-static-server,
+// test-static-server) while EXCLUDED_APPS holds bare names — a name-based
+// exclusion silently misses it on every environment. These two functions
+// must keep answering "is this a customer app?" the same way; they disagreed
+// once and that is what this comment exists to prevent.
 async function runningJobNames() {
   const res = await fetch(`${NOMAD_ADDR}/v1/jobs`);
   if (!res.ok) throw new Error(`Nomad /v1/jobs -> ${res.status}`);
   const jobs = await res.json();
-  return jobs.filter((j) => j.Status === 'running' && j.Stop !== true).map((j) => j.ID);
+  return jobs
+    .filter((j) => j.Status === 'running' && j.Stop !== true && j.Type !== 'system')
+    .map((j) => j.ID);
 }
 
 /**
@@ -199,6 +223,28 @@ async function regenerateRouters() {
 
   let count = 0;
   for (const appName of apps) {
+    // A static app has no Nomad job to wake, so a wake router for it can
+    // only do harm. This matters most for an app that MIGRATED from a
+    // service: the old job was purged, and a purged job can never be
+    // woken, so the activator would hold real traffic waiting on
+    // something that cannot start.
+    //
+    // Checked here rather than removing the app from the set, because an
+    // app in the frozen SCALE_TO_ZERO_APPS seed cannot be removed from it
+    // at runtime — not by forget(), not by setOptedOut(). Such an app is
+    // always-front (priority 500), which OUTRANKS the static router's
+    // rule-length ~44, so without this its site is unreachable.
+    //
+    // The test is the presence of the static router file rather than a
+    // call into static-site.js: that module fail-fasts at require time
+    // when STATIC_SITES_ROOT is unset, which would break scale-to-zero
+    // entirely on a host where static sites are not configured. The file
+    // is also the more direct question — "does something else already
+    // route this hostname".
+    if (await fs.pathExists(staticRouterFilePathFor(appName))) {
+      logger(`skipping ${appName}: served statically, no job to wake`);
+      continue;
+    }
     for (const host of await hostnamesFor(appName)) {
       // Router names must be unique across the whole file provider, and a
       // hostname can contain dots which read badly in Traefik's dashboard.
