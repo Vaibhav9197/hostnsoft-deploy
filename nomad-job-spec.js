@@ -133,11 +133,53 @@ function projectEnvVarLines(envVars) {
 // those scripts pass to `docker build -t`.
 const ORPHAN_PROXY_IMAGE = 'orphan-banner-proxy:local';
 
+// ONE wildcard certificate for the whole apps zone, instead of one per app.
+//
+// Let's Encrypt allows 50 new certificates per REGISTERED DOMAIN per week.
+// Asking for a separate cert per app hostname means app number fifty-one
+// fails, and so does every deploy after it, with a 429 that does not clear
+// for up to seven days. That is not hypothetical: it happened on
+// 2026-09-25, hours after apps moved to embarko.app — new deploys and
+// existing apps alike stopped being able to get certificates, service and
+// static apps together.
+//
+// A wildcard is one certificate that covers every app forever, so the
+// weekly ceiling stops scaling with the number of apps. It is only
+// obtainable over DNS-01; HTTP-01 cannot issue wildcards at all, which is
+// why custom domains are deliberately NOT given one below — we do not
+// control those zones, and each keeps its own per-domain certificate.
+//
+// Derived from the host rather than assumed, because two platform suffixes
+// can be live at once: apps deployed before the move still route under
+// LEGACY_APPS_DOMAIN_SUFFIX and need the wildcard for THAT zone.
+function wildcardDomainsFor(host) {
+  // Never introduce a new crash path here. A caller that somehow reaches
+  // this without a host already had a broken router; it should stay broken
+  // in the same way it was before, not fail differently inside certificate
+  // logic that has nothing to do with the real mistake.
+  if (!host) return null;
+  for (const suffix of [APPS_DOMAIN_SUFFIX, LEGACY_APPS_DOMAIN_SUFFIX].filter(Boolean)) {
+    if (host === suffix || host.endsWith(`.${suffix}`)) {
+      return { main: suffix, sans: [`*.${suffix}`] };
+    }
+  }
+  // Not a platform hostname. Emit nothing and let the caller fall back to a
+  // per-host certificate — correct for a custom domain.
+  return null;
+}
+
 function defaultRouterTags(appName, domain) {
+  const wildcard = wildcardDomainsFor(domain);
   return [
     `traefik.http.routers.${appName}.rule=Host(\`${domain}\`)`,
     `traefik.http.routers.${appName}.entrypoints=websecure`,
     `traefik.http.routers.${appName}.tls.certresolver=${DNS01_CERT_RESOLVER}`,
+    ...(wildcard
+      ? [
+          `traefik.http.routers.${appName}.tls.domains[0].main=${wildcard.main}`,
+          `traefik.http.routers.${appName}.tls.domains[0].sans=${wildcard.sans.join(',')}`,
+        ]
+      : []),
     `traefik.http.routers.${appName}.middlewares=${securityHeadersMiddlewareName(appName)}`,
   ];
 }
@@ -344,7 +386,7 @@ ${sidecarTask}
 
 // DEFAULT_CSP is exported so traefik-router-file.js (static apps) emits the
 // exact same policy through Traefik's file provider — one CSP, two providers.
-module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER, DEFAULT_CSP };
+module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER, DEFAULT_CSP, wildcardDomainsFor };
 
 // Fail-fast at require-time, same convention as internal-auth.js and
 // validate-deploy-token.js — server-setup.sh computes and exports this

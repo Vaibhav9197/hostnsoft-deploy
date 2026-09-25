@@ -43,7 +43,9 @@
 const path = require('path');
 const fs = require('fs-extra');
 const logger = require('./logger');
-const { DEFAULT_CSP, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } = require('./nomad-job-spec');
+const {
+  DEFAULT_CSP, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER, wildcardDomainsFor,
+} = require('./nomad-job-spec');
 
 // Fail-fast at require-time, same convention as every other required
 // config in this codebase — server-setup.sh exports all three.
@@ -75,7 +77,13 @@ function staticRouterFilePath(appName) {
   return path.join(TRAEFIK_DYNAMIC_DIR, `static-${appName}.yml`);
 }
 
-function routerLines(name, host, certResolver, serviceName, middlewares) {
+// certDomains: the wildcard this router's certificate should cover, or null
+// for a per-host certificate. Supplied only for platform hostnames — see
+// wildcardDomainsFor in nomad-job-spec.js for why (Let's Encrypt's 50
+// certs/week per registered domain, which a cert-per-app model hits at the
+// fiftieth app). Custom domains pass null: HTTP-01 cannot issue wildcards,
+// and we do not control those zones anyway.
+function routerLines(name, host, certResolver, serviceName, middlewares, certDomains = null) {
   return [
     `    ${q(name)}:`,
     `      rule: ${q(`Host(\`${host}\`)`)}`,
@@ -86,6 +94,14 @@ function routerLines(name, host, certResolver, serviceName, middlewares) {
     ...middlewares.map((m) => `        - ${q(m)}`),
     '      tls:',
     `        certResolver: ${q(certResolver)}`,
+    ...(certDomains
+      ? [
+          '        domains:',
+          `          - main: ${q(certDomains.main)}`,
+          '            sans:',
+          ...certDomains.sans.map((s) => `              - ${q(s)}`),
+        ]
+      : []),
   ];
 }
 
@@ -127,7 +143,8 @@ function buildStaticRouterConfig({
     '# next deploy or config push of this app overwrites it; deletion removes it.',
     'http:',
     '  routers:',
-    ...routerLines(appName, domain, DNS01_CERT_RESOLVER, serviceName, middlewares),
+    ...routerLines(appName, domain, DNS01_CERT_RESOLVER, serviceName, middlewares,
+      wildcardDomainsFor(domain)),
     ...validCustomDomains.flatMap((d, i) =>
       routerLines(`${appName}-custom${i}`, d, HTTP01_CERT_RESOLVER, serviceName, middlewares)
     ),
