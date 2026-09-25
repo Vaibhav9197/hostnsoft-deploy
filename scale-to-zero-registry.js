@@ -69,6 +69,25 @@ async function writeRegistry(reg) {
   await fs.rename(tmp, REGISTRY_PATH);
 }
 
+/**
+ * Apps with a saved job spec — every app scale-to-zero has ever stopped.
+ *
+ * Essential in universal mode: a SLEEPING app is not a running Nomad job,
+ * so enumerating running jobs alone drops it from the wakeable set the
+ * moment it sleeps, and the activator then 404s its hostname. A saved spec
+ * is the durable record that we stopped this app and must be able to wake
+ * it.
+ */
+async function appsWithSavedSpec() {
+  try {
+    const dir = appDataPathFor('.specs');
+    const files = await fs.readdir(dir);
+    return files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5));
+  } catch {
+    return [];
+  }
+}
+
 async function runningJobNames() {
   const res = await fetch(`${NOMAD_ADDR}/v1/jobs`);
   if (!res.ok) throw new Error(`Nomad /v1/jobs -> ${res.status}`);
@@ -97,7 +116,10 @@ async function allApps() {
   }
 
   const optedOut = new Set(Object.entries(reg.apps).filter(([, v]) => v.optedOut).map(([k]) => k));
-  for (const name of running) {
+  // Running jobs AND anything we have a saved spec for. A sleeping app is
+  // in the second set only, and omitting it is what made 35 apps
+  // unreachable on 2026-09-24.
+  for (const name of [...running, ...(await appsWithSavedSpec())]) {
     if (EXCLUDED_APPS.includes(name)) continue;
     if (optedOut.has(name)) continue;
     base.add(name);
