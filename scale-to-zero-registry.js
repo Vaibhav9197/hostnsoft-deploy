@@ -236,6 +236,34 @@ async function forget(appName) {
   return regenerateRouters();
 }
 
+/**
+ * Carry an app's registry entry across a rename.
+ *
+ * Distinct from optIn + forget, and the difference is the whole point: an
+ * entry may be an opt-OUT record, and `optIn` would rewrite it into an
+ * opt-in. In universal mode a missing entry reads as eligible, so losing
+ * an opt-out to a rename silently re-enrols an app whose owner asked to be
+ * left alone — the same reasoning setOptedOut is built on.
+ *
+ * The entry is copied verbatim apart from `hostnames`, which is re-derived
+ * because every hostname changed. An app with no entry is not an error:
+ * in universal mode most eligible apps have never been recorded at all.
+ */
+async function rekey(oldName, newName) {
+  const reg = await readRegistry();
+  if (!(oldName in reg.apps)) return null;
+  const entry = reg.apps[oldName];
+  delete reg.apps[oldName];
+  reg.apps[newName] = {
+    ...entry,
+    ...(entry.hostnames ? { hostnames: await hostnamesFor(newName) } : {}),
+    renamedFrom: oldName,
+    renamedAt: new Date().toISOString(),
+  };
+  await writeRegistry(reg);
+  return regenerateRouters();
+}
+
 function isSeedApp(appName) {
   return SCALE_TO_ZERO_APPS.includes(appName);
 }
@@ -264,5 +292,6 @@ module.exports = {
   optIn,
   setOptedOut,
   forget,
+  rekey,
   isSeedApp,
 };

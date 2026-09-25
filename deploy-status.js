@@ -27,4 +27,8 @@ function getDeployState(appName) {
   return state.get(appName) || null;
 }
 
-module.exports = { setDeployState, getDeployState };
+function clearDeployState(appName) {
+  state.delete(appName);
+}
+
+module.exports = { setDeployState, getDeployState, clearDeployState };
