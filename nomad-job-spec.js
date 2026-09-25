@@ -148,20 +148,14 @@ const ORPHAN_PROXY_IMAGE = 'orphan-banner-proxy:local';
 // obtainable over DNS-01; HTTP-01 cannot issue wildcards at all, which is
 // why custom domains are deliberately NOT given one below — we do not
 // control those zones, and each keeps its own per-domain certificate.
-//
-// Derived from the host rather than assumed, because two platform suffixes
-// can be live at once: apps deployed before the move still route under
-// LEGACY_APPS_DOMAIN_SUFFIX and need the wildcard for THAT zone.
 function wildcardDomainsFor(host) {
   // Never introduce a new crash path here. A caller that somehow reaches
   // this without a host already had a broken router; it should stay broken
   // in the same way it was before, not fail differently inside certificate
   // logic that has nothing to do with the real mistake.
   if (!host) return null;
-  for (const suffix of [APPS_DOMAIN_SUFFIX, LEGACY_APPS_DOMAIN_SUFFIX].filter(Boolean)) {
-    if (host === suffix || host.endsWith(`.${suffix}`)) {
-      return { main: suffix, sans: [`*.${suffix}`] };
-    }
+  if (host === APPS_DOMAIN_SUFFIX || host.endsWith(`.${APPS_DOMAIN_SUFFIX}`)) {
+    return { main: APPS_DOMAIN_SUFFIX, sans: [`*.${APPS_DOMAIN_SUFFIX}`] };
   }
   // Not a platform hostname. Emit nothing and let the caller fall back to a
   // per-host certificate — correct for a custom domain.
@@ -401,14 +395,6 @@ if (!process.env.APPS_DOMAIN_SUFFIX) {
 }
 const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
 
-// Optional. The suffix apps USED to live under (e.g. "app.embarko.ai")
-// before APPS_DOMAIN_SUFFIX moved to its own zone. Apps whose saved spec
-// still routes <app>.<legacy> are deliberately NOT migrated: they keep that
-// hostname on every redeploy/config push (see domainFor), and its certs
-// keep coming from the DNS-01 resolver (see isPlatformHost). New apps get
-// APPS_DOMAIN_SUFFIX. Unset once every legacy app is gone.
-const LEGACY_APPS_DOMAIN_SUFFIX = process.env.LEGACY_APPS_DOMAIN_SUFFIX || null;
-
 // Same convention — the address Docker actually publishes app container
 // ports to on this box (confirmed in practice: NOT 0.0.0.0/127.0.0.1,
 // specifically the box's own advertised/public IP — see nomad.hcl's
@@ -474,34 +460,13 @@ function defaultDomainFor(appName) {
 }
 module.exports.defaultDomainFor = defaultDomainFor;
 
-// True for hostnames in a zone this platform controls in Cloudflare (the
-// current apps suffix and the legacy one), i.e. issuable over DNS-01.
-// Everything else is a client custom domain (HTTP-01).
+// True for hostnames in the zone this platform controls in Cloudflare,
+// i.e. issuable over DNS-01. Everything else is a client custom domain
+// (HTTP-01).
 function isPlatformHost(host) {
-  if (host.endsWith(`.${APPS_DOMAIN_SUFFIX}`)) return true;
-  return !!LEGACY_APPS_DOMAIN_SUFFIX && host.endsWith(`.${LEGACY_APPS_DOMAIN_SUFFIX}`);
+  return host.endsWith(`.${APPS_DOMAIN_SUFFIX}`);
 }
 module.exports.isPlatformHost = isPlatformHost;
-
-// The hostname an app actually lives on. The saved job spec is the truth:
-// an app deployed before the domain move keeps <app>.<legacy suffix>
-// across redeploys and config pushes, so its URL never silently changes
-// under it. Anything else (new app, no saved spec, legacy unset) gets
-// defaultDomainFor. Deploy and config-push paths must use THIS, not
-// defaultDomainFor, or a redeploy would move a legacy app.
-async function domainFor(appName) {
-  const current = defaultDomainFor(appName);
-  if (!LEGACY_APPS_DOMAIN_SUFFIX) return current;
-  const legacy = `${appName}.${LEGACY_APPS_DOMAIN_SUFFIX}`;
-  let spec;
-  try {
-    spec = await require('fs').promises.readFile(specPathFor(appName), 'utf8');
-  } catch {
-    return current;
-  }
-  return spec.includes(`Host(\`${legacy}\`)`) ? legacy : current;
-}
-module.exports.domainFor = domainFor;
 
 // Where an app's saved Nomad job spec lives. One definition, because
 // three files write or read it — server.js saves it at deploy time,
