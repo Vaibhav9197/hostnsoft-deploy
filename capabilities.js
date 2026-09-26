@@ -8,10 +8,14 @@
  * designs around it, writes code against it, and the human pays for the
  * wasted round trip. Two consequences of that rule, both deliberate:
  *
- *   - `features` says WHO can invoke each one. Rollback, env vars and
- *     custom domains exist, but only through the dashboard's session
- *     credential — a deploy token cannot reach them. An agent that knows
- *     this hands the job to the human instead of failing at it.
+ *   - `features` says WHO can invoke each one, and that answer moves:
+ *     several of these began dashboard-only and are now reachable with a
+ *     deploy token. Read `via` rather than this comment — an earlier
+ *     version of it listed the split by name and was wrong within weeks.
+ *     An agent that reads `via` hands the dashboard-only ones to the
+ *     human instead of failing at them. Keep the field honest in the same
+ *     commit that moves a feature, or it becomes the fiction the rule
+ *     above forbids.
  *   - Limits that aren't enforced anywhere are OMITTED, not guessed. We
  *     currently set no upload ceiling, no build timeout, and no cap on
  *     memoryMb; publishing invented numbers for those would be fiction.
@@ -23,7 +27,7 @@
 const crypto = require('crypto');
 
 const CAPABILITIES = {
-  capabilities_version: '2026-09-23',
+  capabilities_version: '2026-09-25',
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -41,6 +45,8 @@ const CAPABILITIES = {
       list_deployments: 'GET /deployments',
       get_deployment: 'GET /deployments/<id>',
       rollback: 'POST /rollback',
+      change_app_address: 'POST /slug-change',
+      change_app_address_status: 'GET https://ship.embarko.ai/api/slug-changes/<project-id>',
     },
     // Reading a value back is deliberately not offered — see the
     // env-vars route's own comment.
@@ -194,6 +200,13 @@ const CAPABILITIES = {
     // so an agent can drive most of this flow but not all of it.
     custom_domains: { status: 'available', via: ['agent', 'dashboard'] },
     rename_app: { status: 'available', via: ['agent', 'dashboard'] },
+    // Distinct from rename_app above, and the distinction matters: that
+    // one changes the DISPLAY name and leaves the URL alone, this one
+    // changes the URL itself. New hostname, new certificate, and the old
+    // address stops working with no redirect, so anything linking to it
+    // breaks and the freed name can be claimed by someone else. One
+    // change per week per app, shared between both surfaces.
+    change_app_address: { status: 'available', via: ['agent', 'dashboard'] },
     memory_config: { status: 'available', via: ['dashboard'] },
     // Irreversible with no backup. Agent path requires the caller to
     // resend the app's own name as confirmation — a deploy token alone
