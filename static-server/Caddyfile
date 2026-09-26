@@ -1,0 +1,102 @@
+# static-server/Caddyfile — the ONE Caddy that serves every plain static
+# app on this host, in place of the per-app Caddy Railpack used to bake
+# into each static app's image (see ../docs/Static-apps-req.md).
+#
+# Installed to $STATIC_ROOT/Caddyfile by server-setup.sh and mounted into
+# the static-server Nomad job, which also mounts STATIC_SITES_ROOT
+# read-only at /srv/static. The admin API is off, so a change to this
+# file needs that job restarted — see embarko-server-setup/README.md.
+#
+# Which app a request is for comes from X-Embarko-App, set by the app's
+# own Traefik router middleware (../traefik-router-file.js). Only Traefik
+# can reach this listener (bound to 127.0.0.1) and Traefik overwrites
+# that header on every request, so a client cannot choose a directory.
+# The regexp below refuses anything that is not a well-formed app name
+# regardless, since the header is the only thing that selects a path.
+#
+# Behaviour is Railpack's own staticfile Caddyfile (its
+# core/providers/staticfile/Caddyfile.template) so a site serves the
+# same either way: same try_files order, same hidden files, same
+# compression, same headers — minus Content-Security-Policy, which
+# Traefik's per-app middleware sets for every app on this platform.
+{
+	admin off
+	persist_config off
+	auto_https off
+
+	log {
+		format json
+	}
+
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:{$PORT:4300} {
+	bind {$BIND_ADDRESS:127.0.0.1}
+
+	log {
+		format json
+	}
+
+	@app header_regexp app X-Embarko-App ^([a-z0-9-]+)$
+
+	handle @app {
+		root * /srv/static/{http.regexp.app.1}/current
+
+		header {
+			X-XSS-Protection "1; mode=block"
+			X-Content-Type-Options "nosniff"
+			Referrer-Policy "strict-origin-when-cross-origin"
+			-Server
+		}
+
+		encode {
+			gzip
+			zstd
+		}
+
+		# A build-time single-page app (X-Embarko-Spa: 1 — not produced
+		# yet, see docs/Static-apps-req.md "Next") falls back to its
+		# index.html for any unknown path, as Railpack's SPA Caddyfile
+		# does. A plain static site tries the .html and directory-index
+		# spellings and otherwise 404s into handle_errors below.
+		#
+		# Two handle blocks rather than two try_files with matchers:
+		# try_files takes NO matcher token — a leading "@spa" is read as
+		# a file name and "/index.html" then becomes a fallback for every
+		# request (confirmed: every unknown path served the index, 200).
+		@spa header X-Embarko-Spa 1
+		handle @spa {
+			try_files {path} /index.html
+			file_server {
+				hide .git
+				hide .env*
+			}
+		}
+		handle {
+			try_files {path} {path}.html {path}/index.html
+			file_server {
+				hide .git
+				hide .env*
+			}
+		}
+	}
+
+	# No (or a malformed) app header: nothing selected a site.
+	handle {
+		respond "Not found" 404
+	}
+
+	handle_errors {
+		# Same check as above under another name — Caddy allows a named
+		# matcher to be defined once per block.
+		@errapp header_regexp errapp X-Embarko-App ^([a-z0-9-]+)$
+		handle @errapp {
+			root * /srv/static/{http.regexp.errapp.1}/current
+			rewrite * /{err.status_code}.html
+			file_server
+		}
+	}
+}

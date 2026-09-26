@@ -9,7 +9,7 @@
  * docs/Customdomain-req.md.
  *
  * Two cert resolvers, deliberately kept separate (constraint #1):
- * - DNS-01 ("cloudflare") for the platform's own *.app.<platform-domain>
+ * - DNS-01 ("cloudflare") for the platform's own *.<APPS_DOMAIN_SUFFIX> (e.g. *.embarko.app)
  *   router — DNS-01 needs write access to the DNS zone, which the
  *   platform only has for its own domain.
  * - HTTP-01 ("letsencrypt-http") for every client custom domain — works
@@ -133,11 +133,47 @@ function projectEnvVarLines(envVars) {
 // those scripts pass to `docker build -t`.
 const ORPHAN_PROXY_IMAGE = 'orphan-banner-proxy:local';
 
+// ONE wildcard certificate for the whole apps zone, instead of one per app.
+//
+// Let's Encrypt allows 50 new certificates per REGISTERED DOMAIN per week.
+// Asking for a separate cert per app hostname means app number fifty-one
+// fails, and so does every deploy after it, with a 429 that does not clear
+// for up to seven days. That is not hypothetical: it happened on
+// 2026-09-25, hours after apps moved to embarko.app — new deploys and
+// existing apps alike stopped being able to get certificates, service and
+// static apps together.
+//
+// A wildcard is one certificate that covers every app forever, so the
+// weekly ceiling stops scaling with the number of apps. It is only
+// obtainable over DNS-01; HTTP-01 cannot issue wildcards at all, which is
+// why custom domains are deliberately NOT given one below — we do not
+// control those zones, and each keeps its own per-domain certificate.
+function wildcardDomainsFor(host) {
+  // Never introduce a new crash path here. A caller that somehow reaches
+  // this without a host already had a broken router; it should stay broken
+  // in the same way it was before, not fail differently inside certificate
+  // logic that has nothing to do with the real mistake.
+  if (!host) return null;
+  if (host === APPS_DOMAIN_SUFFIX || host.endsWith(`.${APPS_DOMAIN_SUFFIX}`)) {
+    return { main: APPS_DOMAIN_SUFFIX, sans: [`*.${APPS_DOMAIN_SUFFIX}`] };
+  }
+  // Not a platform hostname. Emit nothing and let the caller fall back to a
+  // per-host certificate — correct for a custom domain.
+  return null;
+}
+
 function defaultRouterTags(appName, domain) {
+  const wildcard = wildcardDomainsFor(domain);
   return [
     `traefik.http.routers.${appName}.rule=Host(\`${domain}\`)`,
     `traefik.http.routers.${appName}.entrypoints=websecure`,
     `traefik.http.routers.${appName}.tls.certresolver=${DNS01_CERT_RESOLVER}`,
+    ...(wildcard
+      ? [
+          `traefik.http.routers.${appName}.tls.domains[0].main=${wildcard.main}`,
+          `traefik.http.routers.${appName}.tls.domains[0].sans=${wildcard.sans.join(',')}`,
+        ]
+      : []),
     `traefik.http.routers.${appName}.middlewares=${securityHeadersMiddlewareName(appName)}`,
   ];
 }
@@ -342,7 +378,9 @@ ${sidecarTask}
     `;
 }
 
-module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER };
+// DEFAULT_CSP is exported so traefik-router-file.js (static apps) emits the
+// exact same policy through Traefik's file provider — one CSP, two providers.
+module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER, DEFAULT_CSP, wildcardDomainsFor };
 
 // Fail-fast at require-time, same convention as internal-auth.js and
 // validate-deploy-token.js — server-setup.sh computes and exports this
@@ -351,7 +389,7 @@ module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER 
 if (!process.env.APPS_DOMAIN_SUFFIX) {
   throw new Error(
     'APPS_DOMAIN_SUFFIX environment variable is not set. This is the ' +
-      'domain suffix deployed apps live under (e.g. "app.embarko.ai") — ' +
+      'domain suffix deployed apps live under (e.g. "embarko.app") — ' +
       'see server-setup.sh, which computes and exports it per environment.'
   );
 }
@@ -421,6 +459,14 @@ function defaultDomainFor(appName) {
   return `${appName}.${APPS_DOMAIN_SUFFIX}`;
 }
 module.exports.defaultDomainFor = defaultDomainFor;
+
+// True for hostnames in the zone this platform controls in Cloudflare,
+// i.e. issuable over DNS-01. Everything else is a client custom domain
+// (HTTP-01).
+function isPlatformHost(host) {
+  return host.endsWith(`.${APPS_DOMAIN_SUFFIX}`);
+}
+module.exports.isPlatformHost = isPlatformHost;
 
 // Where an app's saved Nomad job spec lives. One definition, because
 // three files write or read it — server.js saves it at deploy time,

@@ -22,7 +22,7 @@ if (require.main === module) {
   require('dotenv').config({ path: path.join(__dirname, '.env') });
 }
 
-const { appDataPathFor, specPathFor, defaultDomainFor, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
+const { appDataPathFor, specPathFor, defaultDomainFor, isPlatformHost, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
 const {
   SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, isAlwaysFront,
@@ -37,6 +37,16 @@ const REGISTRY_PATH = `${appDataPathFor('.scale-to-zero')}/apps.json`;
 // can never overwrite each other.
 const TRAEFIK_DYNAMIC_DIR = process.env.TRAEFIK_DYNAMIC_DIR || '/opt/traefik/dynamic';
 const ROUTER_FILE = `${TRAEFIK_DYNAMIC_DIR}/scale-to-zero.yml`;
+
+// MUST match staticRouterFilePath() in traefik-router-file.js. Duplicated
+// rather than imported because that module fail-fasts at require time on
+// STATIC_SERVER_PORT/STATIC_ORPHAN_PROXY_PORT, which a host without static
+// sites configured does not set — importing it would take scale-to-zero
+// down on exactly the hosts that have nothing to do with static sites.
+// If the filename convention changes there, change it here too.
+function staticRouterFilePathFor(appName) {
+  return `${TRAEFIK_DYNAMIC_DIR}/static-${appName}.yml`;
+}
 
 // Must match the service name server-setup.sh defines in platform.yml. The
 // file provider merges every file in the directory into one configuration,
@@ -69,11 +79,44 @@ async function writeRegistry(reg) {
   await fs.rename(tmp, REGISTRY_PATH);
 }
 
+/**
+ * Apps with a saved job spec — every app scale-to-zero has ever stopped.
+ *
+ * Essential in universal mode: a SLEEPING app is not a running Nomad job,
+ * so enumerating running jobs alone drops it from the wakeable set the
+ * moment it sleeps, and the activator then 404s its hostname. A saved spec
+ * is the durable record that we stopped this app and must be able to wake
+ * it.
+ */
+async function appsWithSavedSpec() {
+  try {
+    const dir = appDataPathFor('.specs');
+    const files = await fs.readdir(dir);
+    return files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5));
+  } catch {
+    return [];
+  }
+}
+
+// Type !== 'system' drops the platform's OWN jobs — Traefik and the shared
+// static-server — the same test idle-report.js applies. Without it universal
+// mode enrols them as if they were customer apps: a wake router gets written
+// for a hostname no app owns, and the activator believes it can start a
+// platform job.
+//
+// The type check, not a name in EXCLUDED_APPS, because the static-server's
+// job name carries the environment prefix (prod-static-server,
+// test-static-server) while EXCLUDED_APPS holds bare names — a name-based
+// exclusion silently misses it on every environment. These two functions
+// must keep answering "is this a customer app?" the same way; they disagreed
+// once and that is what this comment exists to prevent.
 async function runningJobNames() {
   const res = await fetch(`${NOMAD_ADDR}/v1/jobs`);
   if (!res.ok) throw new Error(`Nomad /v1/jobs -> ${res.status}`);
   const jobs = await res.json();
-  return jobs.filter((j) => j.Status === 'running' && j.Stop !== true).map((j) => j.ID);
+  return jobs
+    .filter((j) => j.Status === 'running' && j.Stop !== true && j.Type !== 'system')
+    .map((j) => j.ID);
 }
 
 /**
@@ -97,7 +140,10 @@ async function allApps() {
   }
 
   const optedOut = new Set(Object.entries(reg.apps).filter(([, v]) => v.optedOut).map(([k]) => k));
-  for (const name of running) {
+  // Running jobs AND anything we have a saved spec for. A sleeping app is
+  // in the second set only, and omitting it is what made 35 apps
+  // unreachable on 2026-09-24.
+  for (const name of [...running, ...(await appsWithSavedSpec())]) {
     if (EXCLUDED_APPS.includes(name)) continue;
     if (optedOut.has(name)) continue;
     base.add(name);
@@ -138,9 +184,7 @@ function routerBlock(name, host, service, alwaysFront) {
   // Custom domains are not in this platform's Cloudflare zone, so they can
   // only be issued over HTTP-01 — the same split the app's own router uses.
   const resolver =
-    APPS_DOMAIN_SUFFIX && host.endsWith(`.${APPS_DOMAIN_SUFFIX}`)
-      ? DNS01_CERT_RESOLVER
-      : HTTP01_CERT_RESOLVER;
+    APPS_DOMAIN_SUFFIX && isPlatformHost(host) ? DNS01_CERT_RESOLVER : HTTP01_CERT_RESOLVER;
   return [
     `    ${name}:`,
     `      rule: "Host(${BT}${host}${BT})"`,
@@ -177,6 +221,28 @@ async function regenerateRouters() {
 
   let count = 0;
   for (const appName of apps) {
+    // A static app has no Nomad job to wake, so a wake router for it can
+    // only do harm. This matters most for an app that MIGRATED from a
+    // service: the old job was purged, and a purged job can never be
+    // woken, so the activator would hold real traffic waiting on
+    // something that cannot start.
+    //
+    // Checked here rather than removing the app from the set, because an
+    // app in the frozen SCALE_TO_ZERO_APPS seed cannot be removed from it
+    // at runtime — not by forget(), not by setOptedOut(). Such an app is
+    // always-front (priority 500), which OUTRANKS the static router's
+    // rule-length ~44, so without this its site is unreachable.
+    //
+    // The test is the presence of the static router file rather than a
+    // call into static-site.js: that module fail-fasts at require time
+    // when STATIC_SITES_ROOT is unset, which would break scale-to-zero
+    // entirely on a host where static sites are not configured. The file
+    // is also the more direct question — "does something else already
+    // route this hostname".
+    if (await fs.pathExists(staticRouterFilePathFor(appName))) {
+      logger(`skipping ${appName}: served statically, no job to wake`);
+      continue;
+    }
     for (const host of await hostnamesFor(appName)) {
       // Router names must be unique across the whole file provider, and a
       // hostname can contain dots which read badly in Traefik's dashboard.

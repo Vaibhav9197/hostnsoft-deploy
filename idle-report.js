@@ -27,6 +27,13 @@ const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
 const { allApps } = require('./scale-to-zero-registry');
 
+// `node idle-report.js | head -3` closes stdout mid-write; without this
+// Node throws an unhandled EPIPE and the run looks like a crash.
+process.stdout.on('error', (e) => {
+  if (e.code === 'EPIPE') process.exit(0);
+  throw e;
+});
+
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
 // How long without a request before an app counts as idle. Same
@@ -34,7 +41,10 @@ const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 // ORPHAN_TTL_MS. 30 minutes is a starting point for observation, NOT a
 // tuned value — Step 5 of the plan is where a real threshold gets chosen
 // from actual traffic patterns.
-const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 30;
+// 360 = the production value the systemd unit sets. They MUST match: a
+// manual run that defaults to something else answers a different question
+// than the timer, and reports a different set of apps as eligible.
+const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 360;
 
 // THE SAFETY RAIL. The code seed in scale-to-zero-apps.js plus anything
 // that opted in at deploy time (scale-to-zero-registry.js). Loaded once
@@ -57,11 +67,16 @@ const RECENT_TRAFFIC_GRACE_SEC = Number(process.env.RECENT_TRAFFIC_GRACE_SEC) ||
 const SNAPSHOT_RETAIN_COUNT = Number(process.env.SNAPSHOT_RETAIN_COUNT) || 3;
 
 // Nomad jobs that are part of the platform itself, not a customer app.
-// Traefik is the only one that runs as a Nomad job (deploy-service and
-// api-service run under pm2, so they never appear in /v1/jobs at all) —
-// but listing it explicitly means a future platform job can't silently
-// become a scale-to-zero candidate just by existing.
-const PLATFORM_JOBS = new Set(['traefik']);
+// Traefik and the static-server (the shared Caddy behind static apps —
+// docs/Static-apps-req.md) are the ones that run as Nomad jobs
+// (deploy-service and api-service run under pm2, so they never appear in
+// /v1/jobs at all). Both are `type = "system"` jobs, which is what
+// runningAppNames actually filters on — customer apps are always
+// `type = "service"` — but naming them here too means a future platform
+// job can't silently become a scale-to-zero candidate just by existing.
+// On a shared host the static-server's name carries the environment
+// prefix (e.g. "test-static-server"), hence the type check doing the work.
+const PLATFORM_JOBS = new Set(['traefik', 'static-server']);
 
 async function nomadGet(path) {
   const response = await fetch(`${NOMAD_ADDR}${path}`);
@@ -78,7 +93,7 @@ async function nomadGet(path) {
 async function runningAppNames() {
   const jobs = await nomadGet('/v1/jobs');
   return jobs
-    .filter((j) => j.Status === 'running')
+    .filter((j) => j.Status === 'running' && j.Type !== 'system')
     .map((j) => j.ID)
     .filter((id) => !PLATFORM_JOBS.has(id))
     .sort();
@@ -237,7 +252,7 @@ async function allocDataDirContents(appName) {
 // rendered spec after running it, so Nomad's own state is the only copy —
 // and job_gc_threshold (4h) collects a STOPPED job out of it, at which
 // point the app can never be woken. A capture failure ABORTS the stop.
-async function captureJobSpec(appName) {
+async function captureJobSpec(appName, { quiet = false } = {}) {
   const dest = specPathFor(appName);
   const { stdout } = await execFileAsync('nomad', ['job', 'inspect', appName]);
 
@@ -289,7 +304,9 @@ async function captureJobSpec(appName) {
           `already at APP_DATA_ROOT, copy it first with migrate-app-data.sh`
       );
     }
-    logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
+    if (!quiet) {
+      logger(`  note: ${appName} is on ${badDataDirs.join(', ')} but its data directory is empty — nothing to lose`);
+    }
   }
 
   await fsp.mkdir(path.dirname(dest), { recursive: true });
@@ -408,7 +425,7 @@ async function main() {
   const blocked = [];
   for (const row of rows) {
     if (!STOPPABLE_APPS.includes(row.appName)) continue;
-    await captureJobSpec(row.appName).catch((e) => blocked.push([row.appName, e.message]));
+    await captureJobSpec(row.appName, { quiet: true }).catch((e) => blocked.push([row.appName, e.message]));
   }
   if (blocked.length > 0) {
     const unmigrated = blocked.filter(([, m]) => m.includes('DATA_DIR'));

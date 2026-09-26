@@ -20,6 +20,7 @@ const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const logger = require('./logger');
+const { isStaticApp, staticAppIsServing } = require('./static-site');
 
 function parseJobStatus(stdout) {
   const match = stdout.match(/^Status\s*=\s*(\S+)/m);
@@ -57,6 +58,15 @@ function simplifyHealth(jobStatus, allocStatus) {
 }
 
 async function getAppHealth(appName) {
+  // A static app (static-site.js) has no Nomad job and no process: it is
+  // "running" for as long as its `current` version resolves to files the
+  // static server can serve — from the moment it is published until it
+  // is deleted. Anything else would be a bug in this codebase, not an
+  // app state, hence "unknown" rather than "crashed".
+  if (await isStaticApp(appName)) {
+    return (await staticAppIsServing(appName)) ? 'running' : 'unknown';
+  }
+
   let stdout;
   try {
     ({ stdout } = await execPromise(`nomad job status ${appName}`));

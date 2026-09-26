@@ -112,7 +112,9 @@ function containerNameFor(allocId, taskName) {
 // Platform jobs, not customer apps. Skipped outright rather than merely
 // named correctly: their CPU/memory is not per-app analytics and nothing
 // reads it, so sampling them is wasted work either way.
-const PLATFORM_JOBS = new Set(['traefik']);
+// Also skipped by type below: platform jobs are `type = "system"`,
+// customer apps `type = "service"` — see idle-report.js's PLATFORM_JOBS.
+const PLATFORM_JOBS = new Set(['traefik', 'static-server']);
 
 // Same formula `docker stats` itself uses: percent of ONE core, so a
 // container actively using 2 full cores reports ~200%, not capped at
@@ -171,7 +173,7 @@ async function tick() {
     return;
   }
 
-  const runningJobs = jobs.filter((j) => j.Status === 'running');
+  const runningJobs = jobs.filter((j) => j.Status === 'running' && j.Type !== 'system');
   const db = getDb();
   const insert = db.prepare(
     'INSERT INTO resource_sample (app_name, ts, cpu_percent, memory_mb) VALUES (?, ?, ?, ?)'
