@@ -161,6 +161,9 @@ const { pruneOldImages, IMAGE_RETAIN_COUNT } = require('./image-retention');
 // hostnsoft-api once it's known.
 const { reportConfigPushResult } = require('./report-config-push');
 const { CAPABILITIES_BODY, CAPABILITIES_ETAG } = require('./capabilities');
+// JSON { files: [...] } source for POST /apps — what an MCP tool call can
+// carry, since it can't attach a file. See json-source.js.
+const { jsonSource } = require('./json-source');
 
 // Public docs site — one shared constant so every reference to it stays in
 // sync. Canonical path is "/docs" (plural); "/doc" still works via a 308
@@ -645,7 +648,7 @@ app.get('/capabilities', (req, res) => {
   res.status(200).send(CAPABILITIES_BODY);
 });
 
-app.post('/apps', upload.single('source'), async (req, res) => {
+app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
 
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
