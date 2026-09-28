@@ -155,6 +155,7 @@ const { submitCustomerQuery } = require('./customer-query');
 // always has a bounded, known-good window to roll back into (and disk
 // usage stays bounded on a host that never pushes images to a registry).
 const { pruneOldImages, IMAGE_RETAIN_COUNT } = require('./image-retention');
+const { pushToRegistry } = require('./image-registry');
 
 // NEW: reports an async config-push's real outcome (see the
 // POST /internal/apps/:appName/config deploymentId branch below) back to
@@ -516,6 +517,9 @@ async function performBuildAndDeploy({
     await pruneOldImages(appName).catch((e) => {
       logger.warn(`[${appName}] Image retention pass failed (continuing): ${e.message}`);
     });
+
+    // Not awaited: the deploy never waits on, or fails over, the registry.
+    pushToRegistry(appName, imageName);
 
     await fs.remove(buildDir);
     await fs.remove(filePath);
