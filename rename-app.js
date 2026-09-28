@@ -63,6 +63,10 @@ const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = req
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const scaleToZero = require('./scale-to-zero-registry');
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
+const {
+  isStaticApp, staticAppDir, readManifest, updateManifest, staticAppIsServing,
+} = require('./static-site');
+const { writeStaticRouterFile, removeStaticRouterFile } = require('./traefik-router-file');
 
 const APP_NAME_PATTERN = /^[a-z0-9-]+$/;
 
@@ -483,8 +487,106 @@ async function renameApp(oldName, newName, config = {}) {
   }
 }
 
+/**
+ * Move a STATIC app to a new name.
+ *
+ * A static app is not a Nomad job — it is a directory under
+ * STATIC_SITES_ROOT plus a router file in TRAEFIK_DYNAMIC_DIR (see
+ * docs/Static-apps-req.md), so renameApp's Nomad/Docker sequence does not
+ * apply. This is the whole migration for that kind: move the directory,
+ * rewrite the router. No image retag, no data dir, and no certificate
+ * wait — the zone wildcard already covers every platform hostname, so
+ * there is no per-name issuance to wait on.
+ */
+async function renameStaticApp(oldName, newName, config = {}) {
+  if (!APP_NAME_PATTERN.test(oldName) || !APP_NAME_PATTERN.test(newName)) {
+    throw new RenameError('invalid_app_name', 'App names may contain only lowercase letters, digits and hyphens.');
+  }
+  if (oldName === newName) {
+    throw new RenameError('invalid_app_name', 'The new name is the same as the current one.');
+  }
+
+  // --- Checks. Nothing below this block has changed anything yet. ---
+
+  const manifest = await readManifest(oldName);
+  if (!manifest) {
+    throw new RenameError('app_not_found', `No static app named "${oldName}" on this host.`);
+  }
+  // The new name must be free of EVERY kind of app: another static site,
+  // a running Nomad job, or a stopped container app's data directory.
+  if (await fs.pathExists(staticAppDir(newName))) {
+    throw new RenameError('app_name_taken', `A static app named "${newName}" already exists on this host.`);
+  }
+  if (await jobInspect(newName)) {
+    throw new RenameError('app_name_taken', `A Nomad job named "${newName}" already exists on this host.`);
+  }
+  if (await fs.pathExists(appDataPathFor(newName))) {
+    throw new RenameError('app_name_taken', `A data directory for "${newName}" already exists on this host. Refusing to deploy over someone else's data.`);
+  }
+
+  const domain = defaultDomainFor(newName);
+  const steps = { moved: false, newRouter: false };
+
+  // Undo in reverse order. The OLD router file is untouched until the
+  // point of no return, so routing for the old name survives any failure
+  // here — only the files have to go back.
+  const rollback = async (why) => {
+    logger.error(`[${oldName}] Static rename to "${newName}" failed (${why}); rolling back`);
+    if (steps.newRouter) await removeStaticRouterFile(newName).catch((e) => logger.error(`[${newName}] Rollback: could not remove new router file: ${e.message}`));
+    if (steps.moved) {
+      await updateManifest(newName, { appName: oldName }).catch(() => {});
+      await fs.move(staticAppDir(newName), staticAppDir(oldName), { overwrite: false })
+        .catch((e) => logger.error(`[${oldName}] Rollback FAILED moving the site directory back — fix by hand: ${e.message}`));
+    }
+  };
+
+  try {
+    // --- 1. Move the site directory. `current` is a relative symlink
+    // (static-site.js pointCurrentAt), so it survives the move.
+    await fs.move(staticAppDir(oldName), staticAppDir(newName), { overwrite: false });
+    steps.moved = true;
+    await updateManifest(newName, { appName: newName });
+
+    // --- 2. Route the new hostname. Written before the old router is
+    // removed so there is no window in which neither name answers.
+    // isOrphan false for the same reason as the static config push: a
+    // rename only ever comes from hostnsoft-api for a claimed app.
+    await writeStaticRouterFile({
+      appName: newName,
+      domain,
+      customDomains: config.customDomains || [],
+      isOrphan: false,
+      spa: !!manifest.spa,
+    });
+    steps.newRouter = true;
+
+    if (!(await staticAppIsServing(newName))) {
+      throw new RenameError('rename_failed', `"${newName}" does not resolve to a servable directory after the move.`);
+    }
+    logger.info(`[${newName}] Static site serving under the new name`);
+
+    // --- 3. Point of no return. The old name goes away here.
+    await removeStaticRouterFile(oldName).catch((e) =>
+      // Not fatal: the app is already live under the new name. The stale
+      // router 404s (its middleware still names the old directory), but
+      // it should not linger.
+      logger.error(`[${oldName}] Could not remove the old router file after a successful rename — clean up by hand: ${e.message}`)
+    );
+
+    // Same per-name state the container path carries, minus what static
+    // apps do not have (job specs, snapshots, images).
+    await carryScaleToZeroEntry(oldName, newName);
+    carryAnalyticsHistory(oldName, newName);
+
+    return { renamed: true, from: oldName, to: newName, imageTag: `${newName}:${manifest.current}`, domain };
+  } catch (error) {
+    await rollback(error.message);
+    throw error;
+  }
+}
+
 // servesRealCertificate is exported for the certificate check to be
 // exercised on its own: it is the one thing here that decides when the
 // OLD name may be destroyed, and it is not otherwise reachable without a
 // full rename against live Nomad.
-module.exports = { renameApp, RenameError, servesRealCertificate };
+module.exports = { renameApp, renameStaticApp, RenameError, servesRealCertificate };

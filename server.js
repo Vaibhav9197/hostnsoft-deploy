@@ -73,7 +73,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
-const { renameApp } = require('./rename-app');
+const { renameApp, renameStaticApp } = require('./rename-app');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
 // asks Railpack whether an upload is a plain static site; if so it is
@@ -1500,15 +1500,20 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
   const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : MEMORY_CEILING_MB;
 
   try {
-    const result = await renameApp(appName, newName, {
-      imageTag,
-      taskMemory,
-      // Same universal floor the config endpoint applies: no build dir
-      // here either, so there is no dependency scan to infer one from.
-      schedulingFloorMb: SCHEDULING_FLOOR_MB,
-      customDomains: customDomains || [],
-      envVars: envVars || [],
-    });
+    // Kind decides the migration: a static app has no Nomad job, image or
+    // data dir to move (see renameStaticApp). imageTag/memory/envVars are
+    // container concerns and are ignored on that path.
+    const result = (await isStaticApp(appName))
+      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [] })
+      : await renameApp(appName, newName, {
+        imageTag,
+        taskMemory,
+        // Same universal floor the config endpoint applies: no build dir
+        // here either, so there is no dependency scan to infer one from.
+        schedulingFloorMb: SCHEDULING_FLOOR_MB,
+        customDomains: customDomains || [],
+        envVars: envVars || [],
+      });
 
     // The in-memory deploy state is keyed by app name, so carry it over
     // or GET /apps/<newName>/status reports "unknown" for an app that
