@@ -22,7 +22,6 @@ const execFileAsync = promisify(execFile);
 
 const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-spec');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
-const { SCALE_TO_ZERO_APPS } = require('./scale-to-zero-apps');
 const { allApps, hostnamesFor } = require('./scale-to-zero-registry');
 const { isBotRequest } = require('./analytics/bot-filter');
 
@@ -37,7 +36,7 @@ const HEALTH_PATH = '/__activator/health';
 // app can opt in at any time. Until the refresh lands it is not wakeable,
 // which is the safe direction to fail.
 const WAKEABLE_TTL_MS = Number(process.env.WAKEABLE_TTL_MS) || 30000;
-let wakeable = { hosts: new Map(), names: new Set(SCALE_TO_ZERO_APPS), at: 0 };
+let wakeable = { hosts: new Map(), names: new Set(), at: 0 };
 
 async function wakeableNow() {
   if (Date.now() - wakeable.at < WAKEABLE_TTL_MS) return wakeable;

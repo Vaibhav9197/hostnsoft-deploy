@@ -1028,6 +1028,25 @@ deploy, or add it to `EXCLUDED_APPS`.
 
 ---
 
+## Seed list retired, 2026-09-28
+
+The code seed (`SCALE_TO_ZERO_APPS`: `scale-to-zero-test-1`, `demo-python`,
+`pushpendra-agrawal`, `socket-ux`) is gone. With universal mode live in
+prod and test, it no longer decided eligibility. What it still did was
+harmful:
+
+- it kept those four apps at `priority: 500`, so every request to them
+  went through the activator while every other app went direct;
+- it could not be changed at runtime, so a rename had to refuse those
+  apps. The old name would have kept a priority-500 wake router for a job
+  that no longer existed.
+
+All apps now get `priority: 1`, and any app can be renamed. `allowlist`
+mode still exists and now means "opt-ins only". The "three lists" risk
+above is down to two: the registry and the generated routers.
+
+---
+
 ## Explicitly out of scope for this plan
 
 - **Making scale-to-zero the default** for new deploys — a separate,

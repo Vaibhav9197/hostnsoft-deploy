@@ -24,7 +24,7 @@ const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
-const { SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
+const { SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
 const { allApps } = require('./scale-to-zero-registry');
 
 // `node idle-report.js | head -3` closes stdout mid-write; without this
@@ -46,14 +46,15 @@ const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 // than the timer, and reports a different set of apps as eligible.
 const IDLE_THRESHOLD_MIN = Number(process.env.IDLE_THRESHOLD_MIN) || 360;
 
-// THE SAFETY RAIL. The code seed in scale-to-zero-apps.js plus anything
-// that opted in at deploy time (scale-to-zero-registry.js). Loaded once
-// per run in main(), before anything can consult it.
+// THE SAFETY RAIL. Whatever scale-to-zero-registry.js's allApps() says is
+// eligible under the current SCALE_TO_ZERO_MODE. Loaded once per run in
+// main(), before anything can consult it; empty until then, so nothing
+// can be stopped before it has loaded.
 //
 // Being on this list only means "may be considered". Every stop still has
 // to pass the spec, image and DATA_DIR checks below, none of which this
 // list can waive.
-let STOPPABLE_APPS = SCALE_TO_ZERO_APPS;
+let STOPPABLE_APPS = [];
 
 // A last-moment re-check window. The idle threshold is measured in tens
 // of minutes; this catches a request that landed between the report and
@@ -386,9 +387,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Registry first: an app that opted in at deploy time is not in the code
-  // seed, and reading it after the report was built would silently exclude
-  // exactly the apps Step 7 exists to include.
+  // Before the report is built: every check below reads it, and one made
+  // against the empty initial list would silently exclude every app.
   STOPPABLE_APPS = await allApps();
 
   const db = getDb();

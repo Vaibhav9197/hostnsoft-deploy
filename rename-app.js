@@ -87,17 +87,6 @@ class RenameError extends Error {
 }
 
 /**
- * Is this a hardcoded seed app?
- *
- * Seed apps are frozen in source code in scale-to-zero-apps.js with
- * priority 500 routers and cannot be renamed dynamically without
- * code changes. Normal customer apps under universal mode CAN be renamed.
- */
-function isScaleToZeroApp(appName) {
-  return scaleToZero.isSeedApp(appName);
-}
-
-/**
  * Returns { spec, raw } or null when the job isn't registered. `raw` is
  * kept verbatim because it is what rollback re-runs: `nomad job inspect`
  * emits `{"Job": {...}}`, which is exactly the API-format document
@@ -235,12 +224,14 @@ async function carrySnapshots(oldName, newName) {
 /**
  * Carry the scale-to-zero registry entry onto the new name.
  *
- * renameApp refuses eligible apps outright, so in allowlist mode there is
- * usually nothing here. In universal mode there can be: an opt-OUT is a
- * recorded entry, not an absence, and an app that opted out is not
- * eligible and so is not refused above. Losing that entry to a rename
- * would read as "never asked", and universal mode would put the app to
- * sleep against its owner's explicit request.
+ * An opt-in or an opt-OUT is a recorded entry, not an absence. Losing an
+ * opt-out to a rename would read as "never asked", and universal mode
+ * would put the app to sleep against its owner's explicit request.
+ *
+ * Most universal-mode apps have no entry at all. Their wake routers are
+ * derived from the saved job spec, which the rename has just moved, so
+ * they are regenerated to follow it: without that the old hostname keeps
+ * a router and the new one has none until the next regeneration.
  */
 async function carryScaleToZeroEntry(oldName, newName) {
   try {
@@ -304,12 +295,6 @@ async function renameApp(oldName, newName, config = {}) {
   }
   if (oldName === newName) {
     throw new RenameError('invalid_app_name', 'The new name is the same as the current one.');
-  }
-  if (await isScaleToZeroApp(oldName)) {
-    throw new RenameError(
-      'app_not_renameable',
-      'This app takes part in scale-to-zero. Its fallback router and allowlist entries are fixed infrastructure and must be moved by hand first.'
-    );
   }
 
   // --- Checks. Nothing below this block has changed anything yet. ---
@@ -502,4 +487,4 @@ async function renameApp(oldName, newName, config = {}) {
 // exercised on its own: it is the one thing here that decides when the
 // OLD name may be destroyed, and it is not otherwise reachable without a
 // full rename against live Nomad.
-module.exports = { renameApp, RenameError, isScaleToZeroApp, servesRealCertificate };
+module.exports = { renameApp, RenameError, servesRealCertificate };
