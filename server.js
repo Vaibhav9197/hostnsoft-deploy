@@ -391,7 +391,7 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
   // failing command is ever named. Retrievable afterwards via
   // GET /apps/:appName/logs, which now falls back to it.
   setBuildLog(appName, error);
-    
+
   // A stated cause for the exit codes that have one, appended to the
   // raw error rather than replacing it — nothing that was reported
   // before stops being reported.
@@ -403,8 +403,8 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
   // flaky dependency) would otherwise leave a build dir + upload behind
   // on every single retry, forever, with nothing to ever remove them.
 
-  await fs.remove(buildDir).catch(() => {});
-  await fs.remove(filePath).catch(() => {});
+  await fs.remove(buildDir).catch(() => { });
+  await fs.remove(filePath).catch(() => { });
 
   if (isIdentified(credential)) {
     await recordDeployment({
@@ -497,7 +497,7 @@ async function performBuildAndDeploy({
           : await scaleToZero.setOptedOut(appName);
         logger.info(
           `[${appName}] scale-to-zero ${scaleToZeroOptIn ? 'opt-IN' : 'opt-OUT'} recorded ` +
-            `(${result.routers} router(s) across ${result.apps} app(s))`
+          `(${result.routers} router(s) across ${result.apps} app(s))`
         );
       } catch (e) {
         // An opt-IN failure leaves the app always-on, which is safe. An
@@ -506,7 +506,7 @@ async function performBuildAndDeploy({
         // plainly rather than folded into a generic warning.
         logger.warn(
           `[${appName}] Could not record scale-to-zero ${scaleToZeroOptIn ? 'opt-in' : 'OPT-OUT'}: ${e.message}` +
-            (scaleToZeroOptOut ? ' — THIS APP MAY STILL BE PUT TO SLEEP' : ' (app stays always-on)')
+          (scaleToZeroOptOut ? ' — THIS APP MAY STILL BE PUT TO SLEEP' : ' (app stays always-on)')
         );
       }
     }
@@ -575,7 +575,7 @@ async function performStaticDeploy({
     } catch (routerError) {
       if (existingKind !== 'static') {
         logger.warn(`[${appName}] Router file write failed; undoing the static publish so the app stays a ${existingKind === 'service' ? 'server app' : 'new name'}: ${routerError.message}`);
-        await removeStaticRouterFile(appName).catch(() => {});
+        await removeStaticRouterFile(appName).catch(() => { });
         await removeStaticApp(appName).catch((e) => {
           logger.error(`[${appName}] Could not undo the static publish after the router failure — the app may now be wrongly marked static: ${e.message}`);
         });
@@ -651,6 +651,15 @@ app.get('/capabilities', (req, res) => {
 app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
 
+  // Multer has already written the upload to disk by the time this runs,
+  // so every rejection below must remove it — nothing else ever will.
+  // Once the 202 is sent, the background deploy owns the file instead.
+  const discardUpload = () => (req.file ? fs.remove(req.file.path).catch(() => { }) : Promise.resolve());
+  // Same for a THROW before the 202 (e.g. hostnsoft-api answering 2xx with
+  // a non-JSON proxy error page, so response.json() blows up): drop the
+  // upload, then let it fail as before.
+  const orDiscard = (p) => p.catch(async (e) => { await discardUpload(); throw e; });
+
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
   // Never fall back to "latest" — Nomad's Docker driver always re-pulls :latest tags
   // and ignores the locally built image, even with force_pull = false.
@@ -687,8 +696,9 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // if sent — a stale header can never re-point a token-authenticated
   // deploy at a different company. Only a proxy_auth_token needs the
   // header, because a PAT isn't scoped to one company.
-  const credentialResult = await readDeployCredential(req);
+  const credentialResult = await orDiscard(readDeployCredential(req));
   if (!credentialResult.ok) {
+    await discardUpload();
     return res
       .status(credentialResult.status)
       .json({ error: credentialResult.error, code: credentialResult.code });
@@ -696,6 +706,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   const credential = credentialResult.credential;
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    await discardUpload();
     return res.status(400).json({ error: "Invalid or missing X-App-Name header. Use lowercase letters and dashes.", code: "invalid_app_name" });
   }
 
@@ -710,12 +721,14 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // runs before any build resource is spent, so a rejected PAT costs
   // nothing, and keeping it to one call means the two services can't
   // reach different conclusions about the same deploy.
-  const claim = await claimProject(credential, appName);
+  const claim = await orDiscard(claimProject(credential, appName));
   if (!claim.ok) {
+    await discardUpload();
     return res.status(claim.status).json({ error: claim.error, code: claim.code });
   }
 
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
+    await discardUpload();
     return res.status(400).json({ error: "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", code: "invalid_app_version" });
   }
 
@@ -977,16 +990,16 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       kind: isStaticDeploy ? 'static' : 'service',
       message: isStaticDeploy
         ? `Static site detected — no build and no server needed, so it's being published ` +
-          `directly and should be live at the URL below within seconds. Confirm with ${statusUrl}.` +
-          (convertingFromService
-            ? ` NOTE: "${appName}" was running as a server app; this upload converts it to a ` +
-              `static site and its server job is being removed. If that was not intended, ` +
-              `redeploy the server version under a NEW app name — a static app cannot be turned ` +
-              `back into a server app.`
-            : '')
+        `directly and should be live at the URL below within seconds. Confirm with ${statusUrl}.` +
+        (convertingFromService
+          ? ` NOTE: "${appName}" was running as a server app; this upload converts it to a ` +
+          `static site and its server job is being removed. If that was not intended, ` +
+          `redeploy the server version under a NEW app name — a static app cannot be turned ` +
+          `back into a server app.`
+          : '')
         : `Deployment accepted and is building in the background — this can take a few ` +
-          `minutes for a fresh build. Check ${statusUrl} for progress (and ${logsUrl} for ` +
-          `build/runtime logs) before assuming it's live at the URL below.`,
+        `minutes for a fresh build. Check ${statusUrl} for progress (and ${logsUrl} for ` +
+        `build/runtime logs) before assuming it's live at the URL below.`,
       version: appVersion,
       image: imageName,
       // A static app runs no process, so there is nothing to size.
@@ -1038,16 +1051,16 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     // records success/failure; .catch() here is only a backstop.
     const backgroundDeploy = isStaticDeploy
       ? performStaticDeploy({
-          appName, appVersion, imageName, domain,
-          buildDir, filePath: req.file.path,
-          claim, credential, deploymentId, plan, existingKind,
-        })
+        appName, appVersion, imageName, domain,
+        buildDir, filePath: req.file.path,
+        claim, credential, deploymentId, plan, existingKind,
+      })
       : performBuildAndDeploy({
-          appName, appVersion, imageName, domain,
-          buildDir, filePath: req.file.path,
-          claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-          scaleToZeroOptIn, scaleToZeroOptOut,
-        });
+        appName, appVersion, imageName, domain,
+        buildDir, filePath: req.file.path,
+        claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+        scaleToZeroOptIn, scaleToZeroOptOut,
+      });
     backgroundDeploy.catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
@@ -1057,6 +1070,14 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     // storage scan, memory calc) can land here — the build/deploy itself
     // has its own error handling inside performBuildAndDeploy.
     logger.error(`[${appName}] Deploy request failed before accepting:`, error);
+
+    // Past the 202 the background deploy owns buildDir and the upload
+    // (and removes them itself); deleting them here would pull the files
+    // out from under a running build.
+    if (res.headersSent) return;
+
+    await fs.remove(buildDir).catch(() => { });
+    await discardUpload();
 
     if (isIdentified(credential)) {
       await recordDeployment({
@@ -1536,10 +1557,10 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
     // left behind.
     const status = error.code === 'app_not_found' ? 404
       : error.code === 'app_name_taken' ? 409
-      : error.code === 'image_unavailable' ? 404
-      : error.code === 'certificate_timeout' ? 504
-      : error.code === 'invalid_app_name' || error.code === 'invalid_config' ? 400
-      : 500;
+        : error.code === 'image_unavailable' ? 404
+          : error.code === 'certificate_timeout' ? 504
+            : error.code === 'invalid_app_name' || error.code === 'invalid_config' ? 400
+              : 500;
     logger.error(`[${appName}] Rename to "${newName}" failed: ${error.message}`);
     res.status(status).json({ error: error.message, code: error.code || 'rename_failed' });
   }
