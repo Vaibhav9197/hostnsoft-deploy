@@ -2,9 +2,8 @@
  * Which apps opted into scale-to-zero, and the Traefik routers that make a
  * stopped one reachable. Step 7 of docs/scale-to-zero-gated-plan.md.
  *
- * The code seed stays code and this can only ADD to it; opting in requires
- * an authenticated deploy for that app; and being listed only means "may
- * be considered" — idle-report still re-checks image, spec and DATA_DIR
+ * Opting in requires an authenticated deploy for that app, and being
+ * listed only means "may be considered" — idle-report still re-checks image, spec and DATA_DIR
  * before every stop.
  *
  * The router file is rewritten wholesale, never appended to.
@@ -24,9 +23,7 @@ if (require.main === module) {
 
 const { appDataPathFor, specPathFor, defaultDomainFor, isPlatformHost, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER } =
   require('./nomad-job-spec');
-const {
-  SCALE_TO_ZERO_APPS, SCALE_TO_ZERO_MODE, EXCLUDED_APPS, isAlwaysFront,
-} = require('./scale-to-zero-apps');
+const { SCALE_TO_ZERO_MODE, EXCLUDED_APPS } = require('./scale-to-zero-apps');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 
@@ -120,14 +117,13 @@ async function runningJobNames() {
 }
 
 /**
- * allowlist: the seed plus opt-ins. universal: every running app minus the
- * exclusions. The seed is the floor — no data failure can remove an app
- * from it.
+ * allowlist: the opt-ins. universal: every running app minus the
+ * exclusions and opt-outs, plus the opt-ins.
  */
 async function allApps() {
   const reg = await readRegistry();
   const optedIn = Object.entries(reg.apps).filter(([, v]) => !v.optedOut).map(([k]) => k);
-  const base = new Set([...SCALE_TO_ZERO_APPS, ...optedIn]);
+  const base = new Set(optedIn);
 
   if (SCALE_TO_ZERO_MODE !== 'universal') return [...base].sort();
 
@@ -180,7 +176,7 @@ async function hostnamesFor(appName) {
 // template literal and took deploy-service down, and once here.
 const BT = String.fromCharCode(96);
 
-function routerBlock(name, host, service, alwaysFront) {
+function routerBlock(name, host, service) {
   // Custom domains are not in this platform's Cloudflare zone, so they can
   // only be issued over HTTP-01 — the same split the app's own router uses.
   const resolver =
@@ -191,11 +187,10 @@ function routerBlock(name, host, service, alwaysFront) {
     '      entryPoints:',
     '        - websecure',
     `      service: ${service}`,
-    // 500: activator permanently in front, no post-stop 502 window, but it
-    // carries that app's every request. 1: below the ~25-44 Traefik derives
-    // from rule length, so a running app is reached directly and the
-    // activator only catches it once stopped. server-setup.md#universal-mode
-    alwaysFront ? '      priority: 500' : '      priority: 1',
+    // 1: below the ~25-44 Traefik derives from rule length, so a running
+    // app is reached directly and the activator only catches it once
+    // stopped. server-setup.md#s2z-routers
+    '      priority: 1',
     '      tls:',
     `        certResolver: ${resolver}`,
     '',
@@ -227,12 +222,6 @@ async function regenerateRouters() {
     // woken, so the activator would hold real traffic waiting on
     // something that cannot start.
     //
-    // Checked here rather than removing the app from the set, because an
-    // app in the frozen SCALE_TO_ZERO_APPS seed cannot be removed from it
-    // at runtime — not by forget(), not by setOptedOut(). Such an app is
-    // always-front (priority 500), which OUTRANKS the static router's
-    // rule-length ~44, so without this its site is unreachable.
-    //
     // The test is the presence of the static router file rather than a
     // call into static-site.js: that module fail-fasts at require time
     // when STATIC_SITES_ROOT is unset, which would break scale-to-zero
@@ -247,7 +236,7 @@ async function regenerateRouters() {
       // Router names must be unique across the whole file provider, and a
       // hostname can contain dots which read badly in Traefik's dashboard.
       lines.push(
-        routerBlock(`wake-${host.replace(/[^a-z0-9-]/gi, '-')}`, host, ACTIVATOR_SERVICE, isAlwaysFront(appName))
+        routerBlock(`wake-${host.replace(/[^a-z0-9-]/gi, '-')}`, host, ACTIVATOR_SERVICE)
       );
       count += 1;
     }
@@ -330,10 +319,6 @@ async function rekey(oldName, newName) {
   return regenerateRouters();
 }
 
-function isSeedApp(appName) {
-  return SCALE_TO_ZERO_APPS.includes(appName);
-}
-
 // Run directly to rewrite the router file: `node scale-to-zero-registry.js`.
 // Called by both server-setup.sh and redeploy.sh after .env exists, so the
 // routers are regenerated on every deploy rather than only on a
@@ -359,5 +344,4 @@ module.exports = {
   setOptedOut,
   forget,
   rekey,
-  isSeedApp,
 };

@@ -605,11 +605,9 @@ async function performStaticDeploy({
       // purged job CANNOT be woken — so a surviving router sends real
       // traffic to the activator to wait on something that can never start.
       //
-      // For a universal-tier app that router sits at priority 1 and loses
-      // to the static router's rule-length ~44, making this look harmless.
-      // For an always-front app it sits at 500 and WINS, and the static
-      // site is then unreachable. Hence unconditional, not best-effort on
-      // the tier.
+      // That router sits at priority 1 and loses to the static router's
+      // rule-length ~44, so the static site stays reachable either way —
+      // but the activator would still list the purged app as wakeable.
       await scaleToZero.forget(appName).catch((e) => {
         logger.warn(`[${appName}] Could not clear the scale-to-zero entry (continuing): ${e.message}`);
       });
@@ -1535,7 +1533,6 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
     // left behind.
     const status = error.code === 'app_not_found' ? 404
       : error.code === 'app_name_taken' ? 409
-      : error.code === 'app_not_renameable' ? 409
       : error.code === 'image_unavailable' ? 404
       : error.code === 'certificate_timeout' ? 504
       : error.code === 'invalid_app_name' || error.code === 'invalid_config' ? 400

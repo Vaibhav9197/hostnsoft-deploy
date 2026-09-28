@@ -74,7 +74,7 @@ const APP_NAME_PATTERN = /^[a-z0-9-]+$/;
 // certificate before giving up and rolling back. A DNS-01 order against
 // Cloudflare is the slow part (propagation, then issuance), so this is
 // minutes rather than seconds.
-const CERT_WAIT_MS = Number(process.env.RENAME_CERT_WAIT_MS) || 240000;
+const CERT_WAIT_MS = Number(process.env.RENAME_CERT_WAIT_MS) || 60000;
 const CERT_POLL_MS = Number(process.env.RENAME_CERT_POLL_MS) || 5000;
 
 // Traefik's placeholder, served for any hostname it has no certificate
@@ -88,29 +88,6 @@ class RenameError extends Error {
     super(message);
     this.code = code;
   }
-}
-
-/**
- * Is scale-to-zero allowed to park this app?
- *
- * Renaming one would strand two things this repo cannot rewrite from
- * here: its per-app fallback router in root-owned /opt/traefik/dynamic,
- * which is what serves the hostname while the app is stopped, and — for
- * a seed app — its entry in the frozen source list in
- * scale-to-zero-apps.js. Renaming would leave the fallback router
- * pointing at the OLD hostname and the app unwakeable under the new one.
- * Refused rather than half-handled — see docs/scale-to-zero-gated-plan.md.
- *
- * Asked of the registry rather than answered from a constant here.
- * Eligibility is not a fixed list: it is the frozen seed PLUS registry
- * opt-ins, and under SCALE_TO_ZERO_MODE=universal it is every running app
- * minus EXCLUDED_APPS. A copy of the seed list kept in this file went
- * stale within two commits of being written and, in universal mode, would
- * have matched almost nothing it was meant to catch.
- */
-async function isScaleToZeroApp(appName) {
-  const apps = await scaleToZero.allApps();
-  return apps.includes(appName);
 }
 
 /**
@@ -169,10 +146,8 @@ function servesRealCertificate(host, port, connectHost = '127.0.0.1') {
         const cert = socket.getPeerCertificate();
         const cn = cert?.subject?.CN || '';
         const isDefault = cn.toUpperCase().includes(TRAEFIK_DEFAULT_CERT_CN);
-        const covers =
-          cn === host ||
-          (Array.isArray(cert?.subjectaltname?.split(', ')) &&
-            String(cert?.subjectaltname || '').split(', ').includes(`DNS:${host}`));
+        // tls.checkServerIdentity returns undefined if the host matches the cert (including wildcards)
+        const covers = !tls.checkServerIdentity(host, cert);
         socket.end();
         resolve(!isDefault && covers);
       }
@@ -253,19 +228,28 @@ async function carrySnapshots(oldName, newName) {
 /**
  * Carry the scale-to-zero registry entry onto the new name.
  *
- * renameApp refuses eligible apps outright, so in allowlist mode there is
- * usually nothing here. In universal mode there can be: an opt-OUT is a
- * recorded entry, not an absence, and an app that opted out is not
- * eligible and so is not refused above. Losing that entry to a rename
- * would read as "never asked", and universal mode would put the app to
- * sleep against its owner's explicit request.
+ * An opt-in or an opt-OUT is a recorded entry, not an absence. Losing an
+ * opt-out to a rename would read as "never asked", and universal mode
+ * would put the app to sleep against its owner's explicit request.
+ *
+ * Most universal-mode apps have no entry at all. Their wake routers are
+ * derived from the saved job spec, which the rename has just moved, so
+ * they are regenerated to follow it: without that the old hostname keeps
+ * a router and the new one has none until the next regeneration.
  */
 async function carryScaleToZeroEntry(oldName, newName) {
   try {
     const result = await scaleToZero.rekey(oldName, newName);
-    if (result) logger.info(`[${newName}] Carried the scale-to-zero registry entry over from "${oldName}"`);
+    if (result) {
+      logger.info(`[${newName}] Carried the scale-to-zero registry entry over from "${oldName}"`);
+    } else {
+      // In universal mode, app had no explicit apps.json entry,
+      // but Traefik fallback routers still need to be updated.
+      await scaleToZero.regenerateRouters();
+      logger.info(`[${newName}] Regenerated scale-to-zero fallback routers`);
+    }
   } catch (e) {
-    logger.warn(`[${newName}] Could not move the scale-to-zero registry entry from "${oldName}": ${e.message}`);
+    logger.warn(`[${newName}] Could not update scale-to-zero routers: ${e.message}`);
   }
 }
 
@@ -315,12 +299,6 @@ async function renameApp(oldName, newName, config = {}) {
   }
   if (oldName === newName) {
     throw new RenameError('invalid_app_name', 'The new name is the same as the current one.');
-  }
-  if (await isScaleToZeroApp(oldName)) {
-    throw new RenameError(
-      'app_not_renameable',
-      'This app takes part in scale-to-zero. Its fallback router and allowlist entries are fixed infrastructure and must be moved by hand first.'
-    );
   }
 
   // --- Checks. Nothing below this block has changed anything yet. ---
@@ -611,4 +589,4 @@ async function renameStaticApp(oldName, newName, config = {}) {
 // exercised on its own: it is the one thing here that decides when the
 // OLD name may be destroyed, and it is not otherwise reachable without a
 // full rename against live Nomad.
-module.exports = { renameApp, renameStaticApp, RenameError, isScaleToZeroApp, servesRealCertificate };
+module.exports = { renameApp, renameStaticApp, RenameError, servesRealCertificate };
