@@ -97,7 +97,6 @@ function isScaleToZeroApp(appName) {
   return scaleToZero.isSeedApp(appName);
 }
 
-
 /**
  * Returns { spec, raw } or null when the job isn't registered. `raw` is
  * kept verbatim because it is what rollback re-runs: `nomad job inspect`
@@ -144,6 +143,9 @@ function servesRealCertificate(host, port, connectHost = '127.0.0.1') {
         host: connectHost,
         port,
         servername: host,
+        // The cert is very likely untrusted at this instant (that is what
+        // we are testing), so validation must not abort the handshake —
+        // we inspect the presented cert ourselves below.
         rejectUnauthorized: false,
         timeout: 10000,
       },
