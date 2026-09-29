@@ -201,8 +201,8 @@ const CAPABILITIES = {
   deploy_flow: {
     reply_shape: '{ status, app, next, links } — errors keep { error, code } and add next + links',
     steps: [
-      'deploy: POST /apps -> status "building" (server app) or "publishing" (static site)',
-      'confirm: poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy',
+      'deploy: POST /apps -> status "building" (server app, 202) or, for a static site, usually "live" already (200)',
+      'confirm: if not live yet, poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy',
       'claim: an app deployed without a token is temporary (see app.expiresAt); the live status reply says how to claim it',
       'showcase: once claimed, the live status reply points to links.showcase',
     ],
@@ -331,8 +331,342 @@ const CAPABILITIES = {
   },
 };
 
-// Computed once at load: the document is a constant, so its ETag is too.
-const CAPABILITIES_BODY = JSON.stringify(CAPABILITIES);
-const CAPABILITIES_ETAG = `"${crypto.createHash('sha256').update(CAPABILITIES_BODY).digest('hex').slice(0, 32)}"`;
+// ---------------------------------------------------------------------------
+// Topics — the same contract, one question at a time.
+//
+// GET /capabilities is a contents page: one line per topic, saying what it
+// covers and where to read it. GET /capabilities/<topic> answers that one
+// question completely, so an agent asked "can you add my domain?" reads
+// custom-domain and nothing else. The full document above moved to
+// GET /capabilities/all.
+//
+// Every topic has the same shape as the deploy replies (deploy-response.js):
+// what it is, whether it's available and to whom, the steps, the limits,
+// one `next`, and every URL under `links`. Limits and flags are read from
+// the blocks above rather than restated, so a topic can't drift from the
+// full document. Order is the order of the deploy journey: deploy, then
+// keeping the app, then extras, then what won't work.
+// ---------------------------------------------------------------------------
 
-module.exports = { CAPABILITIES, CAPABILITIES_BODY, CAPABILITIES_ETAG };
+const { IMAGE_RETAIN_COUNT } = require('./image-retention');
+
+const SHIP = 'https://ship.embarko.ai';
+const AGENT_API = `${SHIP}/api/apps/<app-name>`;
+const DOCS = 'https://embarko.ai/docs';
+const topicUrl = (t) => `${SHIP}/capabilities/${t}`;
+const via = (feature) => (CAPABILITIES.features[feature] || {}).via || [];
+const L = CAPABILITIES.limits;
+
+// Plain-words detail for each feature `features` marks unavailable. Ones
+// already covered by not_supported (websockets, scheduled_jobs = cron) are
+// left out so nothing is listed twice; a feature missing from here is
+// simply not shown, rather than shown without explanation.
+const UNAVAILABLE_DETAIL = {
+  background_workers: 'No background workers or queues: no work that outlives the request that started it.',
+  managed_database: 'No managed database service. Use SQLite under DATA_DIR (see files).',
+  backups: 'No backups of an app\'s data.',
+  secrets: 'No separate managed secrets store. Env vars are the place for secrets (see env-vars).',
+};
+
+const TOPICS = [
+  {
+    topic: 'deploy',
+    covers: 'Uploading an app, what it needs to run here, and waiting for it to go live',
+    available: true,
+    who: via('deploy'),
+    summary: 'Upload an app\'s source and Embarko builds and runs it at <app-name>.embarko.app. No Dockerfile and no account are needed for the first deploy.',
+    how: [
+      'POST links.deploy with the app\'s source as a tar.gz in the "source" form field (or as JSON: {"appName", "files": [{"path", "content"}]}), and the header X-App-Name.',
+      'Optional headers: Authorization: Bearer <token> (without it the app is temporary, see links.claim), X-App-Version, X-App-Type, X-Agent-Name.',
+      'A server app replies 202 with status "building": follow its next and poll links.status until status is "live". A static site usually replies 200 with status "live" already.',
+    ],
+    requirements: [
+      `The app reads its port from ${CAPABILITIES.runtime.port_env} and binds ${CAPABILITIES.runtime.bind_address}.`,
+      'No Dockerfile. The language is detected from the source: ' + CAPABILITIES.runtime.detects.join(', ') + '.',
+      'The manifest (package.json, requirements.txt, ...) or index.html sits at the top of the upload. One upload is one app.',
+      'Anything that must survive a redeploy is written under DATA_DIR (see links.files).',
+    ],
+    limits: [
+      `App name: ${L.app_name_pattern}, ${L.app_name_min_length}-${L.app_name_max_length} characters, unique across Embarko. Some names are reserved, e.g. ${L.app_name_reserved_examples.join(', ')}.`,
+      `Memory: ${L.memory_mb_default}MB per app.`,
+      'JSON uploads: at most 25MB and 2000 files. Use a tar.gz for anything bigger.',
+    ],
+    next: 'Check the requirements, then POST links.deploy. If the app needs WebSockets, cron or background workers, read links.notSupported first.',
+    links: {
+      deploy: `${SHIP}/apps`,
+      claim: topicUrl('claim'),
+      files: topicUrl('files'),
+      notSupported: topicUrl('not-supported'),
+      docs: `${DOCS}/agent-quickstart`,
+    },
+  },
+  {
+    topic: 'static-sites',
+    covers: 'Plain websites: published in seconds, with no logs, env vars or memory setting',
+    available: true,
+    who: via('deploy'),
+    summary: 'An upload that is just files (an index.html and assets, a public/ folder, or a Staticfile) is published directly, with no build and no server. It is usually live within a couple of seconds.',
+    how: [
+      'Deploy it like any other app. The request waits for the publish (up to 5 seconds), so the reply is normally 200 with app.kind "static" and status "live", and next is the claim (or showcase) step.',
+      'A very large site that takes longer replies 202 with status "publishing": check its links.status every 2 seconds until it reads "live".',
+    ],
+    limits: [
+      'No app logs: nothing runs on the server.',
+      `No env vars and no memory setting: writes are refused with 409 ${CAPABILITIES.static_apps.refused_code}. Put configuration in the files instead.`,
+      'No DATA_DIR and no scale-to-zero.',
+      'A server app can be redeployed as a static site, but a static site can\'t become a server app (422 app_kind_changed). Use a new app name.',
+      'A single-page app that needs a build step (Vite, Create React App) is built and run as a server app instead.',
+    ],
+    next: 'Deploy it with POST links.deploy. If the site needs server code or secrets, deploy it as a server app instead.',
+    links: { deploy: `${SHIP}/apps`, docs: `${DOCS}/capabilities#static-sites` },
+  },
+  {
+    topic: 'claim',
+    covers: 'Temporary apps, the 24-hour deletion, and getting a deploy token to keep them',
+    available: true,
+    who: ['agent', 'dashboard'],
+    needsHuman: 'The user reads the token from their email and pastes it back.',
+    summary: `An app deployed without a token is live but temporary: it is deleted ${CAPABILITIES.anonymous_deploy.expires_after_hours} hours after it was first deployed unless claimed. The exact time is app.expiresAt in the status reply. Claiming makes it permanent at the same URL.`,
+    how: [
+      `Check for a token first: the ${CAPABILITIES.credentials.env_var} environment variable, then ${CAPABILITIES.credentials.file}. If one exists, just redeploy the same app name with it.`,
+      'Otherwise ask the user for their email and POST {"email": "<their email>"} to links.requestToken. It always answers 202; the token is emailed, never returned. An account is created if they don\'t have one.',
+      `Ask the user to paste the token back. Save it to ${CAPABILITIES.credentials.file} so you never ask again.`,
+      'Redeploy with the same X-App-Name and the header Authorization: Bearer <token>. The reply says the app is now permanent.',
+    ],
+    limits: [
+      'There is no reminder email: tell the user the deletion time yourself.',
+      'Token requests are rate limited: 5 per email per hour.',
+      `Tokens don't expire and are scoped to one ${CAPABILITIES.credentials.scoped_to}.`,
+      'Never send an empty or made-up token: that is a 401, not a temporary deploy.',
+    ],
+    next: 'If the app is temporary, tell the user when it will be deleted, then ask for their email to claim it.',
+    links: { requestToken: `${SHIP}/api/public/deploy-tokens/request`, dashboard: 'https://embarko.ai/app/tokens', docs: `${DOCS}/capabilities#anonymous` },
+  },
+  {
+    topic: 'files',
+    covers: 'Where to keep data: DATA_DIR, SQLite, and what survives a redeploy',
+    available: true,
+    who: ['agent'],
+    summary: `Each server app gets a folder at the ${CAPABILITIES.persistence.data_dir_env} environment variable. It survives redeploys and restarts. Everything else on disk is wiped on every redeploy.`,
+    how: [
+      `Write anything that must last under path.join(process.env.${CAPABILITIES.persistence.data_dir_env}, ...), creating subfolders on startup.`,
+      `For a database use SQLite (better-sqlite3) with its file under ${CAPABILITIES.persistence.data_dir_env}, including the -wal and -shm files.`,
+    ],
+    limits: [
+      `Kept on one machine: it does not survive losing that machine (survives_node_loss: ${CAPABILITIES.persistence.survives_node_loss}).`,
+      `No backups (backups: ${CAPABILITIES.persistence.backups}).`,
+      'No managed database, and no file storage beyond DATA_DIR.',
+      'window.storage (from Claude Artifacts) is rejected at deploy time. Use SQLite instead.',
+      'Static sites have no DATA_DIR.',
+    ],
+    next: 'Keep the app\'s data under DATA_DIR, and tell the user it is not backed up.',
+    links: { docs: `${DOCS}/capabilities#database` },
+  },
+  {
+    topic: 'env-vars',
+    covers: 'Setting secrets and config for a server app, and applying them',
+    available: true,
+    who: via('env_vars'),
+    summary: 'Environment variables for one app, set with its deploy token. Values are write-only: you can list the keys but never read a value back.',
+    how: [
+      'GET links.list shows which keys are set.',
+      'PUT links.setOne with {"value": "...", "apply": true} sets one key and applies it straight away. PUT links.list with {"vars": [{"key", "value"}], "apply": true} sets several (a merge).',
+      'Without "apply": true, a write only stores the value: POST links.apply (or redeploy) to make the running app see it.',
+    ],
+    limits: [
+      'Keys match ^[A-Za-z_][A-Za-z0-9_]*$.',
+      `Static sites have no env vars: writes are refused with 409 ${CAPABILITIES.static_apps.refused_code}.`,
+      'Needs the app\'s deploy token, so the app must be claimed.',
+    ],
+    next: 'Set the variable with "apply": true, then check the app. If you need a value you don\'t have, ask the user.',
+    links: {
+      list: `${AGENT_API}/env-vars`,
+      setOne: `${AGENT_API}/env-vars/<KEY>`,
+      apply: `${AGENT_API}/env-vars/apply`,
+      claim: topicUrl('claim'),
+      docs: `${DOCS}/api#env-vars`,
+    },
+  },
+  {
+    topic: 'custom-domain',
+    covers: 'Using your own domain for an app, including the DNS step a person has to do',
+    available: true,
+    who: via('custom_domains'),
+    needsHuman: 'Creating the DNS record with whoever manages the domain.',
+    summary: 'Point a domain or subdomain you own at an Embarko app. HTTPS is set up automatically once DNS is in place.',
+    how: [
+      'POST links.register with {"domain": "app.example.com"}. The reply gives the exact DNS record to create (a CNAME for a subdomain, an A record for a root domain).',
+      'Give that record to the user to create with their DNS provider. You can\'t create it yourself.',
+      'Once it has propagated, POST links.verify. It activates the domain, or says DNS isn\'t pointing here yet; retry later.',
+      'GET links.register lists the app\'s domains; DELETE links.remove takes one off.',
+    ],
+    limits: [
+      'Needs the app\'s deploy token, so the app must be claimed first.',
+      'Embarko\'s own addresses, such as <name>.embarko.app, can\'t be registered (400 domain_reserved).',
+      'A domain can belong to only one app (409 domain_taken).',
+      'Works for server apps and static sites.',
+    ],
+    next: 'If the app is temporary, claim it first (links.claim). Then POST links.register with the domain.',
+    links: {
+      register: `${AGENT_API}/domains`,
+      verify: `${AGENT_API}/domains/<domain>/verify`,
+      remove: `${AGENT_API}/domains/<domain>`,
+      claim: topicUrl('claim'),
+      docs: `${DOCS}/capabilities#custom-domains`,
+    },
+  },
+  {
+    topic: 'logs',
+    covers: 'Reading an app\'s build and runtime logs',
+    available: true,
+    who: via('logs'),
+    summary: 'The recent tail of a server app\'s output. If the latest build failed, you get that build\'s log instead, which is where the failing command is named.',
+    how: [
+      'GET links.logs; add ?stream=stderr for errors and crashes.',
+      'A failed deploy\'s status reply already links to the right logs.',
+    ],
+    limits: [
+      'A snapshot, not a live stream: call it again to follow along.',
+      'About the last 8KB, with no long-term retention.',
+      'Static sites have no logs.',
+      'No token needed while the app is temporary; the app\'s token once claimed.',
+    ],
+    next: 'GET links.logs with ?stream=stderr, fix what it names, and redeploy.',
+    links: { logs: `${SHIP}/apps/<app-name>/logs`, docs: `${DOCS}/api#logs` },
+  },
+  {
+    topic: 'rollback',
+    covers: 'Putting an earlier version back, without a rebuild',
+    available: true,
+    who: via('rollback'),
+    summary: 'Switch the app back to a previous successful deploy. No rebuild and no upload; the app keeps its current env vars and domains.',
+    how: [
+      'GET links.history lists deploys, newest first. rollbackTarget: true marks the ones you can go back to.',
+      'POST links.rollback with {} for the previous version, or {"deploymentId": "..."} for a specific one.',
+      'The reply is 202: poll its statusUrl until terminal is true.',
+    ],
+    limits: [
+      `Only the last ${IMAGE_RETAIN_COUNT} builds are kept, so rollback reaches back that far.`,
+      'Needs the app\'s deploy token.',
+    ],
+    next: 'Roll back when the app is down and the cause isn\'t clear yet, then fix the code and redeploy.',
+    links: { history: `${AGENT_API}/deployments`, rollback: `${AGENT_API}/rollback`, docs: `${DOCS}/api#rollback` },
+  },
+  {
+    topic: 'scale-to-zero',
+    covers: 'Letting an idle server app sleep, and the cold start when it wakes',
+    available: CAPABILITIES.scale_to_zero.supported,
+    who: via('scale_to_zero'),
+    summary: `A server app that gets no traffic for ${CAPABILITIES.scale_to_zero.idle_threshold_minutes} minutes can be put to sleep. The first request wakes it, which takes about ${CAPABILITIES.scale_to_zero.typical_cold_start_seconds} seconds. By default apps stay on.`,
+    how: [`Send the header ${CAPABILITIES.scale_to_zero.opt_in_header} on POST /apps to opt in, or "false" to opt out.`],
+    requirements: CAPABILITIES.scale_to_zero.requirements,
+    limits: [...CAPABILITIES.scale_to_zero.notes, 'Not used for static sites.'],
+    next: 'Only opt in if a few seconds\' delay on the first request is fine for this app.',
+    links: { docs: `${DOCS}/capabilities` },
+  },
+  {
+    topic: 'showcase',
+    covers: 'Listing an app publicly on the Embarko showcase',
+    available: true,
+    who: ['agent', 'dashboard'],
+    needsHuman: 'The user decides whether to list the app, and supplies the details.',
+    summary: 'Show a claimed app on a public Embarko showcase page. The name, tagline and description are also used for the listing\'s search results.',
+    how: [
+      'Only if the user wants it listed. GET links.collections to find the collection slug to list it on.',
+      'Ask the user for the details (required: name, tagline, creatorName). You can draft the tagline and description for them to approve.',
+      'PUT links.submit with the details. Sending it again updates the listing.',
+    ],
+    fields: {
+      required: ['collectionSlug', 'name (up to 80 characters)', 'tagline (up to 160)', 'creatorName (up to 80)'],
+      optional: ['whatItDoes (up to 4000)', 'whyBuilt (up to 600)', 'creatorProfile (URL)', 'builtWith', 'category', 'tags (up to 20)', 'videoUrl', 'screenshotUrl'],
+      builtWith: ['Claude', 'Codex', 'Cursor', 'Lovable', 'Replit', 'Other'],
+      category: ['AI Tool', 'Personal', 'Business', 'Productivity', 'Education', 'Game', 'Developer Tool', 'Other'],
+    },
+    limits: [
+      'The app must be claimed (it needs its deploy token).',
+      'A company\'s own showcase page only lists that company\'s apps (403 SHOWCASE_COLLECTION_PRIVATE).',
+      'Listing publishes immediately. Never send placeholder text.',
+    ],
+    next: 'Ask the user whether they want the app listed. If yes, collect the required fields, then PUT links.submit.',
+    links: {
+      collections: `${SHIP}/api/public/showcase/collections`,
+      submit: `${AGENT_API}/showcase`,
+      showcase: 'https://embarko.ai/showcase',
+      claim: topicUrl('claim'),
+    },
+  },
+  {
+    topic: 'feedback',
+    covers: 'Reporting a bug, a missing feature or a docs problem to the Embarko team',
+    available: true,
+    who: via('feedback'),
+    summary: 'Tell the Embarko team when something fails, is missing, or the docs are wrong. Every deploy reply links here as links.feedback.',
+    how: [
+      'For an app: POST links.app with the header X-Agent-Name and {"type", "message"}. No token needed while the app is temporary.',
+      'Without an app: POST links.public with {"type", "message", "email"}.',
+    ],
+    types: CAPABILITIES.deploy_flow.feedback_types,
+    limits: ['message is 1-5000 characters.', 'The public route is rate limited per email and per IP.'],
+    next: 'When something doesn\'t work as documented, report it with the right type rather than working around it silently.',
+    links: { app: `${SHIP}/apps/<app-name>/customer-query`, public: `${SHIP}/api/public/customer-query` },
+  },
+  {
+    topic: 'not-supported',
+    covers: 'What won\'t work here: WebSockets, cron jobs, background workers and more',
+    available: false,
+    summary: 'Apps that depend on these deploy fine but the feature fails at runtime, so check before you build.',
+    items: [
+      ...CAPABILITIES.not_supported.map((n) => ({ feature: n.feature, detail: n.detail, instead: n.use_instead })),
+      ...Object.entries(CAPABILITIES.features)
+        .filter(([k, v]) => v.status === 'unavailable' && UNAVAILABLE_DETAIL[k])
+        .map(([k]) => ({ feature: k, detail: UNAVAILABLE_DETAIL[k] })),
+    ],
+    next: 'If the app needs any of these, tell the user before deploying rather than after it fails.',
+    links: { docs: `${DOCS}/capabilities#summary` },
+  },
+];
+
+// Other names an agent might reasonably try.
+const TOPIC_ALIASES = {
+  domain: 'custom-domain', domains: 'custom-domain', 'custom-domains': 'custom-domain', custom_domains: 'custom-domain',
+  static: 'static-sites', 'static-site': 'static-sites',
+  database: 'files', db: 'files', storage: 'files', persistence: 'files', 'data-dir': 'files', sqlite: 'files',
+  'env-var': 'env-vars', env_vars: 'env-vars', secrets: 'env-vars', env: 'env-vars',
+  token: 'claim', tokens: 'claim', anonymous: 'claim', orphan: 'claim',
+  'scale_to_zero': 'scale-to-zero', sleep: 'scale-to-zero',
+  websockets: 'not-supported', cron: 'not-supported', limitations: 'not-supported', unsupported: 'not-supported',
+};
+
+function resolveTopic(name) {
+  const key = String(name || '').trim().toLowerCase();
+  return TOPICS.find((t) => t.topic === key) || TOPICS.find((t) => t.topic === TOPIC_ALIASES[key]) || null;
+}
+
+const CONTENTS = {
+  version: CAPABILITIES.capabilities_version,
+  about: 'What Embarko can and can\'t do. Open the topic you need; each one answers fully on its own.',
+  topics: TOPICS.map((t) => ({ topic: t.topic, covers: t.covers, url: topicUrl(t.topic) })),
+  links: { all: `${SHIP}/capabilities/all`, docs: `${DOCS}/capabilities` },
+};
+
+// Computed once at load: every document here is a constant, so each ETag is too.
+const etagOf = (body) => `"${crypto.createHash('sha256').update(body).digest('hex').slice(0, 32)}"`;
+const asServed = (obj) => { const body = JSON.stringify(obj); return { body, etag: etagOf(body) }; };
+
+const CAPABILITIES_BODY = JSON.stringify(CAPABILITIES);
+const CAPABILITIES_ETAG = etagOf(CAPABILITIES_BODY);
+const CONTENTS_SERVED = asServed(CONTENTS);
+const TOPICS_SERVED = Object.fromEntries(
+  // Every topic also carries the public feedback link, as every deploy
+  // reply does: it works without an app or a token.
+  TOPICS.map((t) => [t.topic, asServed({
+    version: CAPABILITIES.capabilities_version,
+    ...t,
+    links: t.topic === 'feedback' ? t.links : { ...t.links, feedback: `${SHIP}/api/public/customer-query` },
+  })])
+);
+
+module.exports = {
+  CAPABILITIES, CAPABILITIES_BODY, CAPABILITIES_ETAG,
+  TOPICS, CONTENTS, CONTENTS_SERVED, TOPICS_SERVED, resolveTopic, topicUrl,
+};

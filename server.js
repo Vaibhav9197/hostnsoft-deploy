@@ -161,13 +161,22 @@ const { pushToRegistry } = require('./image-registry');
 // POST /internal/apps/:appName/config deploymentId branch below) back to
 // hostnsoft-api once it's known.
 const { reportConfigPushResult } = require('./report-config-push');
-const { CAPABILITIES_BODY, CAPABILITIES_ETAG } = require('./capabilities');
+const {
+  CAPABILITIES_BODY, CAPABILITIES_ETAG, CONTENTS_SERVED, TOPICS_SERVED, TOPICS, resolveTopic,
+} = require('./capabilities');
 // JSON { files: [...] } source for POST /apps — what an MCP tool call can
 // carry, since it can't attach a file. See json-source.js.
 const { jsonSource } = require('./json-source');
 // The { status, app, next, links } shape every agent-facing reply uses.
 // The docs URL lives there too, so every reply links the same one.
-const { acceptedBody, statusBody, staticLogsBody, errorBody, linksFor } = require('./deploy-response');
+const { acceptedBody, publishedBody, statusBody, staticLogsBody, errorBody, linksFor } = require('./deploy-response');
+
+// How long POST /apps waits for a static site to publish before answering
+// "check back" instead. Almost every static site is done in about a second,
+// so the agent gets the live result in one reply; a very large one falls
+// back to polling, well inside Cloudflare's ~100s and the dashboard
+// proxy's 120s request timeouts.
+const STATIC_WAIT_MS = Number(process.env.STATIC_WAIT_MS) || 5000;
 
 // Origins allowed to call this service from a BROWSER. Until the
 // dashboard's upload button (2026-09-17) every caller here was an agent,
@@ -646,16 +655,43 @@ async function performStaticDeploy({
 // features it can actually invoke itself. Unauthenticated on purpose: an
 // agent needs this BEFORE it has a token, and it's the same answer for
 // everyone. See capabilities.js for what may and may not go in it.
-app.get('/capabilities', (req, res) => {
-  res.setHeader('ETag', CAPABILITIES_ETAG);
+//
+// Served like a book: GET /capabilities is the contents page, one line per
+// topic; GET /capabilities/<topic> answers one question in full; and
+// GET /capabilities/all is the whole contract at once. ?feature=<topic> on
+// the contents URL is an alias for the topic path.
+function sendCapabilities(req, res, body, etag) {
+  res.setHeader('ETag', etag);
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-
   // A revalidating client costs us nothing and costs the agent no tokens.
-  if (req.headers['if-none-match'] === CAPABILITIES_ETAG) return res.status(304).end();
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  res.status(200).send(body);
+}
 
-  res.status(200).send(CAPABILITIES_BODY);
+function sendTopic(req, res, name) {
+  const topic = resolveTopic(name);
+  if (!topic) {
+    return res.status(404).json({
+      error: `No capabilities topic called "${name}".`,
+      code: 'unknown_topic',
+      topics: TOPICS.map((t) => t.topic),
+      next: 'Pick one of topics, or read links.contents for what each one covers.',
+      links: { contents: `https://${req.get('host')}/capabilities` },
+    });
+  }
+  const served = TOPICS_SERVED[topic.topic];
+  return sendCapabilities(req, res, served.body, served.etag);
+}
+
+app.get('/capabilities', (req, res) => {
+  if (req.query.feature) return sendTopic(req, res, req.query.feature);
+  return sendCapabilities(req, res, CONTENTS_SERVED.body, CONTENTS_SERVED.etag);
 });
+
+app.get('/capabilities/all', (req, res) => sendCapabilities(req, res, CAPABILITIES_BODY, CAPABILITIES_ETAG));
+
+app.get('/capabilities/:topic', (req, res) => sendTopic(req, res, req.params.topic));
 
 app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
