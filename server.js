@@ -545,9 +545,14 @@ async function performBuildAndDeploy({
 // Still runs in the background after the 202, purely so the response
 // contract (accepted -> poll statusUrl) is the same for both kinds of
 // app; in practice it is finished within a second.
+// `onOutcome` is told 'live' or 'failed' the moment that is known, so
+// POST /apps can wait (briefly) for a static publish and answer with the
+// real result instead of "check back". Anything slow that follows — retiring
+// a converted server app's job, pruning old versions — runs after that and
+// can't change the outcome, which is why it happens outside the try below.
 async function performStaticDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, credential, deploymentId, plan, existingKind,
+  claim, credential, deploymentId, plan, existingKind, onOutcome = () => { },
 }) {
   const convertingFromService = existingKind === 'service';
   try {
@@ -596,6 +601,22 @@ async function performStaticDeploy({
     }
     logger.info(`[${appName}] Static version ${appVersion} is live.`);
 
+    // Live from here: the files are published and routed. Record it now,
+    // before the best-effort cleanup below, so the status reply and
+    // deployment history say "live" as soon as it's true.
+    // No memoryMb: a static app runs no process, so there is nothing
+    // hostnsoft-api's Project.memoryMb could describe for it.
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static' });
+    onOutcome('live');
+  } catch (error) {
+    await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
+    onOutcome('failed');
+    return;
+  }
+
+  // Cleanup after the site is already live. Every step is best-effort and
+  // logged; none of them can turn a live deploy into a failed one.
+  try {
     // Server app -> static site (see app-kind.js for why this direction
     // is allowed). The router file above already sends the hostnames to
     // the static server, so purging the job — and with it the
@@ -641,12 +662,8 @@ async function performStaticDeploy({
 
     await fs.remove(buildDir);
     await fs.remove(filePath);
-
-    // No memoryMb: a static app runs no process, so there is nothing
-    // hostnsoft-api's Project.memoryMb could describe for it.
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static' });
   } catch (error) {
-    await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
+    logger.warn(`[${appName}] Cleanup after the static publish failed (the site is live): ${error.message}`);
   }
 }
 
@@ -807,6 +824,9 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   }
 
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
+  // Set once a publish or build starts: from then on it owns buildDir and
+  // the upload, and the error handler below must not delete them.
+  let backgroundOwnsFiles = false;
   const imageName = `${appName}:${appVersion}`; // CHANGED: versioned tag instead of :latest
   // Real domain via Cloudflare DNS, routed through Traefik with Let's Encrypt TLS.
   // Domain suffix comes from APPS_DOMAIN_SUFFIX (see nomad-job-spec.js's
@@ -1055,37 +1075,66 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       deploymentId,
     });
 
-    // One next step, not the whole journey: confirm the deploy. The claim
-    // and showcase steps come later, in the status reply, once the app is
-    // actually live — see deploy-response.js.
-    const responseBody = acceptedBody({
+    const replyFacts = {
       host,
       appName,
-      kind: isStaticDeploy ? 'static' : 'service',
       url: `https://${domain}`,
       claimed: !claim.isOrphan,
       claimedNow: !!claim.claimedNow,
       expiresAt: claim.orphanExpiresAt,
       convertingFromService,
-    });
-    res.status(202).json(responseBody);
+    };
+
+    // A static site publishes in about a second, so wait for it (up to
+    // STATIC_WAIT_MS) and answer with the real outcome: live, with the
+    // claim or showcase step next, or failed. A site that takes longer gets
+    // the same "check links.status" reply as before and finishes in the
+    // background. Nothing here can outlast the proxy timeouts.
+    if (isStaticDeploy) {
+      backgroundOwnsFiles = true;
+      let settle;
+      const outcome = new Promise((resolve) => { settle = resolve; });
+      performStaticDeploy({
+        appName, appVersion, imageName, domain,
+        buildDir, filePath: req.file.path,
+        claim, credential, deploymentId, plan, existingKind,
+        onOutcome: settle,
+      }).catch((err) => {
+        logger.error(`[${appName}] unexpected error in static deploy: ${err.message}`);
+        settle('failed');
+      });
+
+      let timer;
+      const result = await Promise.race([
+        outcome,
+        new Promise((resolve) => { timer = setTimeout(() => resolve('pending'), STATIC_WAIT_MS); }),
+      ]);
+      clearTimeout(timer);
+
+      if (result === 'pending') {
+        return res.status(202).json(acceptedBody({ ...replyFacts, kind: 'static' }));
+      }
+      const live = result === 'live';
+      return res.status(live ? 200 : 500).json(publishedBody({
+        ...replyFacts, deployState: getDeployState(appName), live,
+      }));
+    }
+
+    backgroundOwnsFiles = true;
+    // A server app's build takes minutes: answer at once and let the agent
+    // poll. The claim and showcase steps come later, in the status reply,
+    // once the app is actually live — see deploy-response.js.
+    res.status(202).json(acceptedBody({ ...replyFacts, kind: 'service' }));
 
     // Deliberately not awaited — everything from here happens after the
     // response above. performBuildAndDeploy has its own try/catch that
     // records success/failure; .catch() here is only a backstop.
-    const backgroundDeploy = isStaticDeploy
-      ? performStaticDeploy({
-        appName, appVersion, imageName, domain,
-        buildDir, filePath: req.file.path,
-        claim, credential, deploymentId, plan, existingKind,
-      })
-      : performBuildAndDeploy({
-        appName, appVersion, imageName, domain,
-        buildDir, filePath: req.file.path,
-        claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-        scaleToZeroOptIn, scaleToZeroOptOut,
-      });
-    backgroundDeploy.catch((err) => {
+    performBuildAndDeploy({
+      appName, appVersion, imageName, domain,
+      buildDir, filePath: req.file.path,
+      claim, taskMemory, schedulingFloorMb, credential, deploymentId,
+      scaleToZeroOptIn, scaleToZeroOptOut,
+    }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
     });
 
@@ -1095,9 +1144,18 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     // has its own error handling inside performBuildAndDeploy.
     logger.error(`[${appName}] Deploy request failed before accepting:`, error);
 
-    // Past the 202 the background deploy owns buildDir and the upload
+    // Once a publish or build has started it owns buildDir and the upload
     // (and removes them itself); deleting them here would pull the files
-    // out from under a running build.
+    // out from under it. If no reply went out yet, still answer.
+    if (backgroundOwnsFiles) {
+      if (!res.headersSent) {
+        res.status(500).json(errorBody({
+          host, appName, appExists: true,
+          error: "Deployment failed", code: "deploy_failed", extra: { details: error.message },
+        }));
+      }
+      return;
+    }
     if (res.headersSent) return;
 
     await fs.remove(buildDir).catch(() => { });
