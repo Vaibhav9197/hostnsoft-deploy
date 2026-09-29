@@ -7,12 +7,17 @@
  *   { status, app, next, links }
  *
  *   status — where things stand, one word
- *   app    — only the facts the next step needs
- *   next   — ONE instruction: the thing to do now. Later steps (claim,
- *            showcase) appear in later replies, once they apply, rather
- *            than all being front-loaded into the first one.
- *   links  — only the URLs `next` refers to, plus feedback. `next` names
- *            them (links.status) instead of repeating the URL in prose.
+ *   app    — only the facts the next step needs; never a URL
+ *   next   — ONE short sentence: the thing to do now. Later steps (claim,
+ *            showcase) appear in later replies, once they apply.
+ *   links  — every URL in the reply, and only here. `next` names them
+ *            (links.status) instead of repeating the URL in prose.
+ *
+ * `next` stays short on purpose. When a step needs more than a sentence —
+ * how to claim, what the showcase needs, the runtime rules behind a crash,
+ * how to send feedback — the detail lives in a capabilities topic
+ * (capabilities.js) and the reply links it as links.help. The agent reads
+ * it only if it needs to.
  *
  * Errors keep their existing `error` and `code` (callers branch on code)
  * and gain `next` + `links` on top.
@@ -30,8 +35,7 @@ const SHOWCASE_URL = 'https://embarko.ai/showcase';
 const POLL_SECONDS = { static: 2, service: 10 };
 
 // Every URL a reply can carry lives here, and only here: `app` and the
-// rest of the body never repeat one, and `next` refers to them by name
-// (links.status) instead of spelling the URL out.
+// rest of the body never repeat one.
 function linksFor(host, appName, appUrl) {
   const base = `https://${host}`;
   return {
@@ -55,23 +59,10 @@ function publicFeedbackUrl(host) {
   return `https://${host}/api/public/customer-query`;
 }
 
-// How to call links.feedback — appended only when `next` actually tells
-// the agent to report something, so it appears where it is needed and
-// nowhere else. The public route has no app to attach to, so it asks for
-// the user's email instead.
-// `type` says what kind of problem it was, so reports can be triaged
-// without reading each one. Same list as customer-query.js's FEEDBACK_TYPES,
-// minus the two the dashboard uses.
-const TYPE_HINT =
-  `"type" is one of "platform_bug" (Embarko itself misbehaved), "missing_capability" (the app needs ` +
-  `something Embarko lacks), "docs_issue" (the docs were wrong or unclear), "unexpected_behavior" ` +
-  `(it worked, but not as documented) or "other".`;
-
-function withFeedbackHow(next, { publicRoute = false } = {}) {
-  if (!next.includes('links.feedback')) return next;
-  return publicRoute
-    ? `${next} To report: POST {"type": "<type>", "message": "<what happened>", "email": "<the user's email>"} to links.feedback. ${TYPE_HINT}`
-    : `${next} To report: POST {"type": "<type>", "message": "<what happened>"} to links.feedback with the header "X-Agent-Name: <your name>". ${TYPE_HINT}`;
+// links.help: the capabilities topic that explains this reply's next step
+// in full. One per reply at most, and only where a sentence isn't enough.
+function helpUrl(host, topic) {
+  return `https://${host}/capabilities/${topic}`;
 }
 
 // `links` with only the named entries, and feedback always.
@@ -80,18 +71,6 @@ function pick(all, ...names) {
   for (const n of names) if (all[n]) out[n] = all[n];
   out.feedback = all.feedback;
   return out;
-}
-
-// The claim instruction, written once. Shown only when an app is live and
-// still anonymous — the moment it becomes the relevant next step.
-function claimInstruction(expiresAt) {
-  return (
-    `Tell the user it is temporary and will be deleted at ${expiresAt} unless claimed. ` +
-    `To claim it: ask the user for their email, POST {"email": "<their email>"} to links.claim ` +
-    `(it always answers 202; the token is emailed), ask them to paste the token back, save it to ` +
-    `~/.embarko/credentials, then redeploy with the same app name and the header ` +
-    `"Authorization: Bearer <token>". That redeploy makes the app permanent at the same URL.`
-  );
 }
 
 function appFacts({ appName, kind, claimed, expiresAt }) {
@@ -110,17 +89,11 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
   const poll = POLL_SECONDS[kind];
 
   let next = kind === 'static'
-    ? `Static site: nothing to build, so it is being published directly. Check links.status in ${poll} seconds; it should already be live.`
-    : `Accepted, not live yet. The build can take a few minutes. Poll links.status every ${poll} seconds until status is "live" or "failed", and don't give the user the URL as working before that.`;
-
-  if (claimedNow) {
-    next = `Claimed: this app is now permanent and will not be deleted. Tell the user. ${next}`;
-  }
+    ? `Static site, no build needed: check links.status in ${poll} seconds.`
+    : `Building: poll links.status every ${poll} seconds until it says "live" or "failed".`;
+  if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
   if (convertingFromService) {
-    next =
-      `Heads up: "${appName}" was a server app and is now being replaced by a static site; its server ` +
-      `is being removed and it cannot be turned back into a server app. If that was not intended, ` +
-      `deploy the server version under a new app name. ${next}`;
+    next = `This replaces the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
 
   return {
@@ -130,6 +103,27 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
     next,
     links: pick(all, 'status'),
   };
+}
+
+/**
+ * POST /apps for a static site that finished publishing while the request
+ * waited (see STATIC_WAIT_MS in server.js): the real outcome, so the agent
+ * goes straight to the next step (claim, or showcase) instead of polling.
+ * Same body the status reply would give, minus its deprecated `deploy`
+ * field, with the claim/convert notes the 202 would have carried.
+ */
+function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, convertingFromService, deployState, live }) {
+  const { deploy, ...body } = statusBody({
+    host, appName, kind: 'static', url, claimed, expiresAt, deployState, staticLive: live,
+  });
+  let next = body.next;
+  if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
+  if (convertingFromService) {
+    next = `This replaced the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
+  }
+  return live
+    ? { success: true, ...body, next }
+    : { success: false, code: 'publish_failed', ...body, next };
 }
 
 /**
@@ -144,70 +138,70 @@ function statusBody({ host, appName, kind, url, claimed, expiresAt, deployState,
   const attempt = deployState ? deployState.status : null;
   const poll = POLL_SECONDS[kind];
 
-  const liveNext = claimed
-    ? `Live. Give the user links.app. If they would like it listed publicly, point them to links.showcase.`
-    : `Live. Give the user links.app. ${claimInstruction(expiresAt)}`;
-  const liveLinks = claimed ? pick(all, 'app', 'showcase') : pick(all, 'app', 'claim');
+  // Live: give the user the URL, then the one next step for this app —
+  // claim it while it's temporary, offer the showcase once it's kept.
+  const live = claimed
+    ? {
+        status: 'live',
+        next: 'Live: give the user links.app. If they want it listed publicly, follow links.help.',
+        links: { ...pick(all, 'app'), help: helpUrl(host, 'showcase') },
+      }
+    : {
+        status: 'live',
+        next: `Live: give the user links.app and tell them it will be deleted at ${expiresAt} unless claimed. To claim it, follow links.help.`,
+        links: { ...pick(all, 'app'), help: helpUrl(host, 'claim') },
+      };
+  const feedbackHelp = helpUrl(host, 'feedback');
 
   let body;
   if (attempt === 'in_progress') {
     body = {
       status: kind === 'static' ? 'publishing' : 'building',
-      next: `Still ${kind === 'static' ? 'publishing' : 'building'}. Check links.status again in ${poll} seconds.`,
+      next: `Still ${kind === 'static' ? 'publishing' : 'building'}: check links.status again in ${poll} seconds.`,
       links: pick(all, 'status'),
     };
   } else if (attempt === 'failed') {
-    body = {
-      status: 'failed',
-      error: deployState.errorDetail || 'The deploy failed.',
-      next: kind === 'static'
-        ? `Publishing the files failed, which is on our side. Redeploy once; if it fails again, report it to links.feedback.`
-        : `Read links.logs to find the cause, fix it, and redeploy under the same app name. If the cause isn't clear, report it to links.feedback.`,
-      links: kind === 'static' ? pick(all) : { ...pick(all), logs: `${all.logs}?stream=stderr` },
-    };
+    body = kind === 'static'
+      ? {
+          status: 'failed',
+          error: deployState.errorDetail || 'The deploy failed.',
+          next: 'Publishing failed on our side: redeploy once, and if it fails again report it to links.feedback (see links.help).',
+          links: { ...pick(all), help: feedbackHelp },
+        }
+      : {
+          status: 'failed',
+          error: deployState.errorDetail || 'The deploy failed.',
+          next: 'Build failed: read links.logs, fix the cause, and redeploy with the same name. If it isn\'t clear, report it to links.feedback (see links.help).',
+          links: { ...pick(all), logs: `${all.logs}?stream=stderr`, help: feedbackHelp },
+        };
   } else if (kind === 'static') {
     // No job to ask: the site is live when its files and router exist.
     body = staticLive
-      ? { status: 'live', next: liveNext, links: liveLinks }
-      : {
-          status: 'not_deployed',
-          next: `Nothing is published under this name. Deploy it with POST /apps.`,
-          links: pick(all),
-        };
+      ? live
+      : { status: 'not_deployed', next: 'Nothing is published under this name: deploy it with POST /apps.', links: pick(all) };
   } else if (health === 'running') {
-    body = { status: 'live', next: liveNext, links: liveLinks };
+    body = live;
   } else if (health === 'stopped') {
     // Parked by scale-to-zero: reachable, woken by the first request.
-    body = {
-      status: 'live',
-      next: `${liveNext} It is asleep right now and wakes on the first request, which can take a few seconds.`,
-      links: liveLinks,
-    };
+    body = { ...live, next: `${live.next} It's asleep now and wakes on the first request.` };
   } else if (health === 'starting') {
     body = {
       status: 'starting',
-      next: `Built, and the app is starting. Check links.status again in ${poll} seconds.`,
+      next: `Built and starting: check links.status again in ${poll} seconds.`,
       links: pick(all, 'status'),
     };
   } else if (health === 'crashed') {
     body = {
       status: 'crashed',
-      next:
-        `The build worked but the app stops right after starting. Read links.logs (stderr has the crash), ` +
-        `fix it, and redeploy. Common causes: not listening on the PORT environment variable, or binding to ` +
-        `localhost instead of 0.0.0.0.`,
-      links: { ...pick(all), logs: `${all.logs}?stream=stderr` },
+      next: 'It builds but crashes on start: read links.logs, fix it, and redeploy. links.help lists the runtime rules (PORT, 0.0.0.0).',
+      links: { ...pick(all), logs: `${all.logs}?stream=stderr`, help: helpUrl(host, 'deploy') },
     };
   } else if (health === 'not_deployed') {
-    body = {
-      status: 'not_deployed',
-      next: `Nothing is running under this name. Deploy it with POST /apps.`,
-      links: pick(all),
-    };
+    body = { status: 'not_deployed', next: 'Nothing is running under this name: deploy it with POST /apps.', links: pick(all) };
   } else {
     body = {
       status: 'unknown',
-      next: `There's no record of a recent deploy (the deploy service may have restarted). If links.app responds, the app is live; if not, redeploy.`,
+      next: 'No record of a recent deploy (the service may have restarted): if links.app responds, it\'s live; if not, redeploy.',
       links: pick(all, 'app'),
     };
   }
@@ -216,7 +210,7 @@ function statusBody({ host, appName, kind, url, claimed, expiresAt, deployState,
     status: body.status,
     app,
     ...(body.error ? { error: body.error } : {}),
-    next: withFeedbackHow(body.next),
+    next: body.next,
     links: body.links,
     // DEPRECATED — the old field installed deploy scripts poll on
     // (in_progress | success | failed | unknown). Remove once those
@@ -235,56 +229,54 @@ function staticLogsBody({ host, appName }) {
     available: false,
     reason: 'This is a static site, so there are no app logs: nothing runs on the server.',
     app: { name: appName, kind: 'static' },
-    next: withFeedbackHow(
-      `This is a static site, so there are no app logs: nothing runs on the server. If a page looks wrong, ` +
-      `check the uploaded files and redeploy. If it still looks broken, report it to links.feedback.`
-    ),
-    links: pick(linksFor(host, appName)),
+    next: 'Static sites have no logs: if a page looks wrong, check the files and redeploy (see links.help).',
+    links: { ...pick(linksFor(host, appName)), help: helpUrl(host, 'static-sites') },
   };
 }
 
-// What to do about each error code. Anything not listed gets the generic
-// line — every error still carries a next step and the feedback link.
+// The one-sentence fix for each error code. Anything not listed gets the
+// generic line — every error still carries a next step and the feedback
+// link.
 const NEXT_FOR_CODE = {
-  unauthorized:
-    `The deploy token was rejected (unknown or revoked). Deploy without the Authorization header to get a ` +
-    `temporary app, or get a new token: POST {"email": "<the user's email>"} to links.claim and ask the user ` +
-    `to paste the emailed token. Never send an empty or made-up token.`,
-  invalid_app_name:
-    `Fix the app name: 3-63 characters, lowercase letters, digits and dashes, not starting or ending with a dash.`,
-  app_name_too_short: `Use an app name of at least 3 characters.`,
-  app_name_too_long: `Use an app name of at most 63 characters.`,
-  app_name_reserved: `That name is reserved and will never be available. Pick a different app name.`,
-  app_name_taken: `That name belongs to someone else. Pick a different app name (X-App-Name) and deploy again.`,
-  rename_in_progress:
-    `This app's web address is being changed. Wait a few minutes, then deploy again using its new name.`,
-  app_name_check_failed: `A temporary problem on our side. Retry once; if it keeps failing, report it to links.feedback.`,
-  invalid_app_version: `Use only letters, numbers, dots, dashes and underscores in X-App-Version.`,
-  invalid_app_type: `Shorten X-App-Type to a plain label such as "portfolio", or leave it out; it is optional.`,
-  invalid_agent_name: `Use a short plain name in X-Agent-Name such as "claude-code", or leave it out; it is optional.`,
-  missing_source_file: `Attach the app's code: a tar.gz as the "source" form field, or a JSON body with a non-empty "files" array.`,
-  invalid_json: `Send a valid JSON body, or upload a tar.gz as the "source" form field instead.`,
-  invalid_file_path: `Use relative paths inside the app for every files[].path (no leading "/" and no "..").`,
-  invalid_file_content: `Every files[].content must be a string. Base64-encode binary files and set "encoding": "base64".`,
-  invalid_file_encoding: `Set files[].encoding to "utf8" or "base64", or leave it out.`,
-  source_too_large: `Too big for a JSON upload. Upload a tar.gz as the "source" form field instead.`,
-  too_many_files: `Leave out node_modules, build output and .git, or upload a tar.gz instead.`,
-  no_manifest_at_root:
-    `Repackage so the app's package.json (or index.html for a static site) is at the top of the upload, not inside a folder. foundNestedAt says where it was found.`,
-  app_nested_in_subdirectory:
-    `Deploy the folder named in deployThisInstead, not the folder above it. A separate backend is a separate app with its own name.`,
-  unsupported_storage_pattern:
-    `Replace window.storage with SQLite (better-sqlite3) writing under the DATA_DIR environment variable, then redeploy. filesDetected lists where it is used.`,
-  invalid_static_root: `Point the Staticfile's root at a folder inside the upload, such as "root: dist", then redeploy.`,
-  app_kind_changed:
-    `This app is a static site and can't become a server app. Deploy this version under a new app name.`,
-  deploy_failed: `Something went wrong reading the upload. Check the archive is a valid tar.gz and redeploy; if it keeps failing, report it to links.feedback.`,
-  not_found:
-    `No app you can see has this name. Check the name. If the app is claimed, send the deploy token of the company that owns it.`,
-  lookup_failed: `A temporary problem on our side. Retry in a few seconds; if it keeps failing, report it to links.feedback.`,
+  unauthorized: 'The token was rejected: deploy without it for a temporary app, or get a new one (see links.help).',
+  invalid_app_name: 'Use 3-63 lowercase letters, digits and dashes, not starting or ending with a dash.',
+  app_name_too_short: 'Use an app name of at least 3 characters.',
+  app_name_too_long: 'Use an app name of at most 63 characters.',
+  app_name_reserved: 'That name is reserved and never becomes free: pick a different one.',
+  app_name_taken: 'That name belongs to someone else: pick a different one.',
+  rename_in_progress: 'This app\'s address is being changed: wait a few minutes, then deploy under its new name.',
+  app_name_check_failed: 'Temporary problem on our side: retry once, and report it to links.feedback if it keeps happening.',
+  invalid_app_version: 'Use only letters, numbers, dots, dashes and underscores in X-App-Version.',
+  invalid_app_type: 'Shorten X-App-Type to a plain label like "portfolio", or leave it out.',
+  invalid_agent_name: 'Use a short plain name in X-Agent-Name like "claude-code", or leave it out.',
+  missing_source_file: 'Attach the code: a tar.gz as the "source" field, or JSON with a non-empty "files" array.',
+  invalid_json: 'Send valid JSON, or upload a tar.gz as the "source" field instead.',
+  invalid_file_path: 'Use relative paths inside the app for every files[].path (no leading "/" or "..").',
+  invalid_file_content: 'Make every files[].content a string; base64-encode binary files and set "encoding": "base64".',
+  invalid_file_encoding: 'Set files[].encoding to "utf8" or "base64", or leave it out.',
+  source_too_large: 'Too big for JSON: upload a tar.gz as the "source" field instead.',
+  too_many_files: 'Leave out node_modules, build output and .git, or upload a tar.gz instead.',
+  no_manifest_at_root: 'Repackage so package.json (or index.html) is at the top of the upload; foundNestedAt says where it is.',
+  app_nested_in_subdirectory: 'Deploy the folder named in deployThisInstead, not the one above it.',
+  unsupported_storage_pattern: 'Replace window.storage with SQLite under DATA_DIR (see links.help), then redeploy.',
+  invalid_static_root: 'Point the Staticfile\'s root at a folder inside the upload, like "root: dist".',
+  app_kind_changed: 'A static site can\'t become a server app: deploy this version under a new name (see links.help).',
+  deploy_failed: 'Couldn\'t read the upload: check it\'s a valid tar.gz and redeploy, then report it to links.feedback if it keeps failing.',
+  not_found: 'No app you can see has this name: check the name, and send the owning company\'s token if it\'s claimed.',
+  lookup_failed: 'Temporary problem on our side: retry in a few seconds, and report it to links.feedback if it keeps happening.',
 };
 
-const GENERIC_NEXT = `Fix the request as the error describes and try again. If it doesn't make sense, report it to links.feedback.`;
+// The capabilities topic that explains the error in full, for the few codes
+// where a sentence can't: how to get a token, where data lives, and what a
+// static site can't do.
+const HELP_FOR_CODE = {
+  unauthorized: 'claim',
+  unsupported_storage_pattern: 'files',
+  invalid_static_root: 'static-sites',
+  app_kind_changed: 'static-sites',
+};
+
+const GENERIC_NEXT = 'Fix the request as the error says and retry, or report it to links.feedback if it doesn\'t make sense.';
 
 /**
  * Error body. `extra` carries a response's own fields (detail,
@@ -294,9 +286,13 @@ const GENERIC_NEXT = `Fix the request as the error describes and try again. If i
  */
 function errorBody({ host, appName, error, code, extra = {}, appExists = false, next }) {
   const links = {};
-  if (code === 'unauthorized') links.claim = `https://${host}/api/public/deploy-tokens/request`;
-  const docsAnchored = ['no_manifest_at_root', 'app_nested_in_subdirectory', 'unsupported_storage_pattern', 'invalid_static_root', 'app_kind_changed'];
+  const docsAnchored = ['no_manifest_at_root', 'app_nested_in_subdirectory', 'invalid_static_root'];
   if (docsAnchored.includes(code)) links.docs = DOCS_URL;
+  const text = next || NEXT_FOR_CODE[code] || GENERIC_NEXT;
+  // An error with no topic of its own that asks for a report points at the
+  // feedback topic, which says what to send.
+  const topic = HELP_FOR_CODE[code] || (text.includes('links.feedback') ? 'feedback' : null);
+  if (topic) links.help = helpUrl(host, topic);
   const publicRoute = !(appExists && appName);
   links.feedback = publicRoute ? publicFeedbackUrl(host) : linksFor(host, appName).feedback;
 
@@ -306,7 +302,7 @@ function errorBody({ host, appName, error, code, extra = {}, appExists = false, 
     error,
     code,
     ...rest,
-    next: withFeedbackHow(next || NEXT_FOR_CODE[code] || GENERIC_NEXT, { publicRoute }),
+    next: text,
     links,
   };
 }
@@ -316,6 +312,7 @@ module.exports = {
   SHOWCASE_URL,
   linksFor,
   acceptedBody,
+  publishedBody,
   statusBody,
   staticLogsBody,
   errorBody,

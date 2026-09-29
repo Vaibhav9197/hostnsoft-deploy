@@ -1259,9 +1259,7 @@ app.get('/apps/:appName/logs', async (req, res) => {
     stream: 'combined',
     logs: buildLog.output,
     capturedAt: buildLog.capturedAt,
-    next:
-      'These are the most recent BUILD logs. The cause of a failed deploy is in here: fix it and redeploy ' +
-      'under the same app name. If it isn\'t clear, report it to links.feedback.',
+    next: 'These are the latest build logs: fix what they name and redeploy with the same name.',
     links: feedbackLink,
   });
 
@@ -1292,7 +1290,7 @@ app.get('/apps/:appName/logs', async (req, res) => {
   if (!result.available) {
     return res.json({
       ...result,
-      next: 'No logs yet: the app has not started. Check links.status; if it says "building", wait and try again.',
+      next: 'No logs yet because the app hasn\'t started: check links.status.',
       links: { status: linksFor(host, appName).status, ...feedbackLink },
     });
   }
