@@ -38,4 +38,18 @@ async function submitCustomerQuery({ type, message, projectSlug, agentName, comp
   return response.json();
 }
 
-module.exports = { submitCustomerQuery };
+// Mirrors FEATURE_REQUEST_TYPES in hostnsoft-api's
+// src/services/featureRequests.ts — hostnsoft-api validates again, so the
+// two lists must change together. The last five let an agent say what kind
+// of problem it hit; the first three are what people send from the dashboard.
+const FEEDBACK_TYPES = [
+  'platform_bug',
+  'missing_capability',
+  'docs_issue',
+  'unexpected_behavior',
+  'other',
+  'feature',
+  'feedback',
+];
+
+module.exports = { submitCustomerQuery, FEEDBACK_TYPES };

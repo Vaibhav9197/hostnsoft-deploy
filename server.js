@@ -149,7 +149,7 @@ const { getAppLogs } = require('./app-logs');
 // other query in the context of the app it's deploying — see
 // docs/request-feature-req.md (Path C). Forwards to hostnsoft-api, same
 // shape as recordDeployment.
-const { submitCustomerQuery } = require('./customer-query');
+const { submitCustomerQuery, FEEDBACK_TYPES } = require('./customer-query');
 
 // NEW: keeps only the last N local images per app so one-click rollback
 // always has a bounded, known-good window to roll back into (and disk
@@ -1307,8 +1307,11 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
   }
 
   const { type, message } = req.body || {};
-  if (type !== 'feature' && type !== 'feedback' && type !== 'other') {
-    return res.status(400).json({ error: 'type must be "feature", "feedback", or "other"' });
+  if (!FEEDBACK_TYPES.includes(type)) {
+    return res.status(400).json({
+      error: `type must be one of: ${FEEDBACK_TYPES.map((t) => `"${t}"`).join(', ')}`,
+      code: 'invalid_feedback_type',
+    });
   }
   if (typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: "message is required" });
