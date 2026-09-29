@@ -56,6 +56,7 @@ async function recordDeployment({
   errorDetail,
   deploymentId,
   kind,
+  agentName,
 }) {
   try {
     const response = await fetch(`${HOSTNSOFT_API_URL}/internal/deployments/record`, {
@@ -71,6 +72,7 @@ async function recordDeployment({
         errorDetail,
         deploymentId,
         kind,
+        agentName,
       }),
     });
 

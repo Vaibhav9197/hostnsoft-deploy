@@ -4,7 +4,7 @@
  * Lets POST /apps take the source as JSON instead of a multipart tarball:
  *
  *   Content-Type: application/json
- *   { "appName": "my-app", "files": [ { "path": "index.html", "content": "..." },
+ *   { "appName": "my-app", "appType": "portfolio", "agentName": "claude", "files": [ { "path": "index.html", "content": "..." },
  *                                     { "path": "logo.png", "content": "<b64>", "encoding": "base64" } ] }
  *
  * Why this exists: an MCP tool call (claude.ai connector -> viasocket ->
@@ -66,6 +66,8 @@ function jsonSource(req, res, next) {
     if (body.appName !== undefined && !req.headers['x-app-name']) req.headers['x-app-name'] = String(body.appName);
     if (body.version !== undefined && !req.headers['x-app-version']) req.headers['x-app-version'] = String(body.version);
     if (body.scaleToZero !== undefined && !req.headers['x-scale-to-zero']) req.headers['x-scale-to-zero'] = String(body.scaleToZero);
+    if (body.appType !== undefined && !req.headers['x-app-type']) req.headers['x-app-type'] = String(body.appType);
+    if (body.agentName !== undefined && !req.headers['x-agent-name']) req.headers['x-agent-name'] = String(body.agentName);
 
     const files = body.files;
     if (!Array.isArray(files) || files.length === 0) {

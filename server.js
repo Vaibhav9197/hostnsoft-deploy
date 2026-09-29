@@ -618,6 +618,12 @@ async function performStaticDeploy({
       await scaleToZero.forget(appName).catch((e) => {
         logger.warn(`[${appName}] Could not clear the scale-to-zero entry (continuing): ${e.message}`);
       });
+      // The saved spec names an image just removed above. Left behind, it
+      // lists a static app as a server app to everything that reads
+      // .specs (scale-to-zero's router generation, the registry backfill).
+      await fs.remove(specPathFor(appName)).catch((e) => {
+        logger.warn(`[${appName}] Could not remove the old job spec (continuing): ${e.message}`);
+      });
     }
 
     // Best-effort, same as pruneOldImages on the container path.
@@ -679,6 +685,20 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // alone" has to be RECORDED — otherwise the next pass re-enrols it.
   const scaleToZeroOptOut = scaleToZeroHeader === 'false';
 
+  // Optional: what the app is for ("portfolio", "task management",
+  // "feedback system"...), in the deployer's own words — stored on the
+  // project by hostnsoft-api (Project.appType). Free text, but kept short
+  // and printable so it stays a label rather than a payload.
+  const rawAppType = req.headers['x-app-type'];
+  const appType = typeof rawAppType === 'string' ? rawAppType.trim() : '';
+
+  // Optional: which agent is deploying, in its own words ("claude-code",
+  // "chatgpt", "cursor"...). Recorded on the deployment by hostnsoft-api
+  // (Deployment.agentName) — self-reported attribution, never used for
+  // access. Same shape rules as X-App-Type.
+  const rawAgentName = req.headers['x-agent-name'];
+  const agentName = typeof rawAgentName === 'string' ? rawAgentName.trim() : '';
+
   const rawVersion = req.headers['x-app-version'];
   const appVersion = (rawVersion && /^[a-zA-Z0-9._-]+$/.test(rawVersion))
     ? rawVersion
@@ -725,7 +745,17 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // runs before any build resource is spent, so a rejected PAT costs
   // nothing, and keeping it to one call means the two services can't
   // reach different conclusions about the same deploy.
-  const claim = await orDiscard(claimProject(credential, appName));
+  if (appType && (appType.length > 60 || !/^[\x20-\x7E]+$/.test(appType))) {
+    await discardUpload();
+    return res.status(400).json({ error: "Invalid X-App-Type header. Use a short plain-text label of at most 60 characters, e.g. \"portfolio\" or \"task management\".", code: "invalid_app_type" });
+  }
+
+  if (agentName && (agentName.length > 60 || !/^[\x20-\x7E]+$/.test(agentName))) {
+    await discardUpload();
+    return res.status(400).json({ error: "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".", code: "invalid_agent_name" });
+  }
+
+  const claim = await orDiscard(claimProject(credential, appName, appType || undefined));
   if (!claim.ok) {
     await discardUpload();
     return res.status(claim.status).json({ error: claim.error, code: claim.code });
@@ -968,6 +998,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
         projectSlug: appName,
         appVersion,
         status: 'in_progress',
+        agentName: agentName || undefined,
       });
     }
     setDeployState(appName, {
@@ -1090,6 +1121,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
         appVersion,
         status: 'failed',
         errorDetail: error.message,
+        agentName: agentName || undefined,
       });
     }
 

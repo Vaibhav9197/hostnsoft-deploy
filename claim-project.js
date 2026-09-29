@@ -41,13 +41,13 @@ const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/val
 // (fail closed), same as before.
 const RELAYED_STATUSES = new Set([400, 401, 403, 409]);
 
-async function claimProject(credential, slug) {
+async function claimProject(credential, slug, appType) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/projects/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...credentialHeaders(credential) },
-      body: JSON.stringify({ ...credentialBody(credential), slug }),
+      body: JSON.stringify({ ...credentialBody(credential), slug, ...(appType ? { appType } : {}) }),
     });
   } catch (e) {
     logger.error(`[claim-project] could not reach hostnsoft-api to claim "${slug}": ${e.message}`);

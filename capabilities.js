@@ -149,6 +149,28 @@ const CAPABILITIES = {
     backups: false,
   },
 
+  // Optional `X-App-Type` on POST /apps (`appType` in a JSON-source body).
+  // Listed here so an agent knows to fill it in or ask for it BEFORE the
+  // first deploy, instead of learning about it afterwards.
+  app_type: {
+    header: 'X-App-Type',
+    required: false,
+    max_length: 60,
+    examples: ['personal website', 'portfolio', 'landing page', 'blog', 'task management', 'feedback system', 'dashboard', 'e-commerce store'],
+    how_to_choose: 'Use what you already know about the app. If it is unclear, ask the user once and say they can skip it. If they skip it, omit the header. A redeploy without it keeps the previous value.',
+  },
+
+  // Optional `X-Agent-Name` on POST /apps (`agentName` in a JSON body) and
+  // on the agent API's rollback / env-var apply calls. Recorded on each
+  // deployment so the owner can see which agent deployed what.
+  agent_name: {
+    header: 'X-Agent-Name',
+    required: false,
+    max_length: 60,
+    examples: ['claude-code', 'claude', 'chatgpt', 'codex', 'cursor', 'copilot', 'gemini', 'windsurf'],
+    how_to_choose: 'Send the name of the agent or product you are running as, in lowercase. It is only a label: it does not change what you can do.',
+  },
+
   // Opt-in at deploy time via `X-Scale-To-Zero: true` on POST /apps.
   //
   // Stated here because an agent has to decide BEFORE writing the app

@@ -24,6 +24,8 @@ that claim.
 | Wrong/missing token | `401` | `{ "error": "Unauthorized" }` |
 | Invalid/missing `X-App-Name` | `400` | `{ "error": "Invalid or missing X-App-Name header. Use lowercase letters and dashes." }` |
 | Invalid `X-App-Version` | `400` | `{ "error": "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only." }` |
+| Invalid `X-App-Type` (over 60 chars, or non-printable/non-ASCII) | `400` | `{ "error": "Invalid X-App-Type header. Use a short plain-text label of at most 60 characters, e.g. \"portfolio\" or \"task management\"." }` |
+| Invalid `X-Agent-Name` (over 60 chars, or non-printable/non-ASCII) | `400` | `{ "error": "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\"." }` |
 | No file uploaded | `400` | `{ "error": "No source code uploaded" }` |
 | `window.storage` detected | `422` | `{ "error": "Unsupported storage pattern detected", "detail": "...", "filesDetected": [...], "docs": "..." }` — **no `code` field today, despite what any internal doc may claim** |
 | Build/deploy failure | `500` | `{ "error": "Deployment failed", "details": "<error.message>" }` |
@@ -39,6 +41,8 @@ reading `error`/`detail`/`details` keep working unchanged).
 | Wrong/missing token | `401` | `unauthorized` |
 | Invalid/missing `X-App-Name` | `400` | `invalid_app_name` |
 | Invalid `X-App-Version` | `400` | `invalid_app_version` |
+| Invalid `X-App-Type` | `400` | `invalid_app_type` |
+| Invalid `X-Agent-Name` | `400` | `invalid_agent_name` |
 | No file uploaded | `400` | `missing_source_file` |
 | `window.storage` detected | `422` | `unsupported_storage_pattern` |
 | Build/deploy failure | `500` | `deploy_failed` |
