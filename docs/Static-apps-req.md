@@ -4,6 +4,17 @@
 `staticfile` provider). Build-time SPAs (Vite, CRA, …) still go through
 the container path — see "Next".**
 
+**2026-09-29: POST /apps waits for the publish.** A static publish is a local
+file copy plus a router file, about a second, so the request now waits for it
+(`STATIC_WAIT_MS`, default 5000) and answers with the real outcome: `200`
+`status: "live"` with the claim or showcase step in `next`, or `500`
+`publish_failed`. A site that takes longer than the cap gets the old `202`
+`"publishing"` reply and finishes in the background, so no request can run
+into Cloudflare's ~100s or the dashboard proxy's 120s timeout. The site is
+recorded as live as soon as its files and router are in place; retiring a
+converted server app's job and pruning old versions run afterwards and can't
+change the outcome (`performStaticDeploy`'s `onOutcome`, in `server.js`).
+
 ## Why
 
 A plain static app — an `index.html` at the upload root, a `public/`
@@ -42,9 +53,11 @@ container they did not need.
    mode), which reads the expiry and login URL from two more request
    headers the router sets.
 
-The response is still a 202 with `statusUrl`, now with `kind: "static"`
-and `memory: null`, and the deploy finishes within a second in the
-background.
+The response used to be a 202 like a server app's, with the deploy
+finishing in the background within a second. Since 2026-09-29 the request
+waits for it instead (see the note at the top): normally `200` with
+`status: "live"` and `app.kind: "static"`, falling back to `202`
+`"publishing"` for a site slower than `STATIC_WAIT_MS`.
 
 ## How a static app is told apart from a Nomad job
 

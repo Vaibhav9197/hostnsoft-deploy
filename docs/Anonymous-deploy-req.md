@@ -54,6 +54,14 @@ does **not** reset `orphanExpiresAt` — the 24h clock starts once, at
 first creation, regardless of how many anonymous redeploys happen before
 it's claimed or expires.
 
+> **Response shape changed 2026-09-29.** The `orphan` block described below
+> no longer exists. Every deploy reply is now `{ status, app, next, links }`:
+> the expiry is `app.expiresAt`, the claim steps live in the
+> `capabilities/claim` topic (linked as `links.help` from the live status
+> reply), and `memory`, `image`, `version`, `statusUrl`, `logsUrl` and `url`
+> were removed. See `hostnsoft-deploy/deploy-response.js`. The rest of this
+> doc (TTL, banner, cleanup, claiming by redeploy) still holds.
+
 ### 4. Deploy response for an anonymous deploy
 
 The success response gets one additional field, `orphan`, alongside the

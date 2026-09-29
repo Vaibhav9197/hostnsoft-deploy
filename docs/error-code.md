@@ -47,6 +47,11 @@ reading `error`/`detail`/`details` keep working unchanged).
 | `window.storage` detected | `422` | `unsupported_storage_pattern` |
 | Build/deploy failure | `500` | `deploy_failed` |
 | A static site is redeployed as a server app (the reverse is allowed) | `422` | `app_kind_changed` — added 2026-09-22 with the static fast path, see `Static-apps-req.md`; response also carries `previousKind`/`uploadedKind` |
+| A static site's publish fails (router file or copy error) | `500` | `publish_failed` — added 2026-09-29 with the capped wait on static publishes; `status: "failed"`, `success: false` |
+| Feedback with an unknown `type` | `400` | `invalid_feedback_type` — added 2026-09-29; the error lists the valid types |
+| Unknown capabilities topic | `404` | `unknown_topic` — added 2026-09-29; the body lists the topics |
+| Status/logs for an app the caller can't see | `404` | `not_found` — added 2026-09-29 (these used to carry no `code`) |
+| Status/logs when hostnsoft-api can't be reached | `502` | `lookup_failed` — added 2026-09-29 |
 
 Example — the storage-rejection response becomes:
 
