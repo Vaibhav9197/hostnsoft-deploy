@@ -27,7 +27,7 @@
 const crypto = require('crypto');
 
 const CAPABILITIES = {
-  capabilities_version: '2026-09-25',
+  capabilities_version: '2026-09-29',
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -65,6 +65,23 @@ const CAPABILITIES = {
     builder: 'railpack',
     detects: ['node', 'python', 'go', 'ruby', 'php', 'rust', 'java', 'static'],
   },
+
+  // App shapes that will not work here, stated up front so an agent rules
+  // them out BEFORE it writes the code. Not rejected at deploy time (unlike
+  // unsupported_apis below) — the deploy succeeds and the feature silently
+  // fails at runtime, which is exactly why it has to be said here.
+  not_supported: [
+    {
+      feature: 'websockets',
+      detail: 'WebSocket connections are not supported — this includes libraries built on them (Socket.IO, ws, Pusher-style realtime). Apps that need live push (chat, multiplayer, live dashboards) will not work.',
+      use_instead: 'Plain HTTP requests, polling the server on an interval from the browser.',
+    },
+    {
+      feature: 'cron_jobs',
+      detail: 'Cron jobs and scheduled tasks are not supported. There is no platform scheduler, and an in-process one (node-cron, APScheduler, setInterval loops) is not guaranteed to run: the process restarts on every redeploy and may be stopped when idle.',
+      use_instead: 'Expose an HTTP route that does the work, protect it with a secret env var, and call it from an external scheduler.',
+    },
+  ],
 
   // A plain static site — Railpack's "staticfile" provider: an index.html
   // at the upload root, a public/ directory, or a Staticfile — is not
@@ -196,7 +213,7 @@ const CAPABILITIES = {
       'tolerates the process restarting between requests — in-memory state is lost',
     ],
     notes: [
-      'WebSockets are NOT supported under scale-to-zero: a live connection is invisible to idle detection, so the app can be slept while users are connected.',
+      'WebSockets are not supported at all (see not_supported above), with or without scale-to-zero.',
       'Automated traffic (credential scanners, crawlers) will NOT wake a sleeping app; it gets a 404.',
       'A stopped app is woken by the first real request, which is held until the app answers.',
     ],
@@ -236,6 +253,7 @@ const CAPABILITIES = {
     delete_app: { status: 'available', via: ['agent', 'dashboard'] },
     analytics: { status: 'available', via: ['agent', 'dashboard'] },
     secrets: { status: 'unavailable' },
+    websockets: { status: 'unavailable' },
     scheduled_jobs: { status: 'unavailable' },
     background_workers: { status: 'unavailable' },
     managed_database: { status: 'unavailable' },
