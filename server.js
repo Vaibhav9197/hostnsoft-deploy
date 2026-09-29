@@ -165,12 +165,9 @@ const { CAPABILITIES_BODY, CAPABILITIES_ETAG } = require('./capabilities');
 // JSON { files: [...] } source for POST /apps — what an MCP tool call can
 // carry, since it can't attach a file. See json-source.js.
 const { jsonSource } = require('./json-source');
-
-// Public docs site — one shared constant so every reference to it stays in
-// sync. Canonical path is "/docs" (plural); "/doc" still works via a 308
-// redirect on the frontend, but new references should use this directly
-// rather than take the extra redirect hop.
-const DOCS_URL = 'https://embarko.ai/docs';
+// The { status, app, next, links } shape every agent-facing reply uses.
+// The docs URL lives there too, so every reply links the same one.
+const { acceptedBody, statusBody, staticLogsBody, errorBody, linksFor } = require('./deploy-response');
 
 // Origins allowed to call this service from a BROWSER. Until the
 // dashboard's upload button (2026-09-17) every caller here was an agent,
@@ -670,6 +667,15 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // upload, then let it fail as before.
   const orDiscard = (p) => p.catch(async (e) => { await discardUpload(); throw e; });
 
+  // Every rejection below: the upload is dropped and the reply carries a
+  // next step plus the feedback link (deploy-response.js). `appExists`
+  // once the claim has succeeded, so feedback can point at this app.
+  const host = req.get('host');
+  const reject = async (status, code, error, extra = {}, appExists = false) => {
+    await discardUpload();
+    return res.status(status).json(errorBody({ host, appName, error, code, extra, appExists }));
+  };
+
   // NEW: read version from header, fall back to a timestamp-based tag if not provided.
   // Never fall back to "latest" — Nomad's Docker driver always re-pulls :latest tags
   // and ignores the locally built image, even with force_pull = false.
@@ -722,16 +728,12 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // header, because a PAT isn't scoped to one company.
   const credentialResult = await orDiscard(readDeployCredential(req));
   if (!credentialResult.ok) {
-    await discardUpload();
-    return res
-      .status(credentialResult.status)
-      .json({ error: credentialResult.error, code: credentialResult.code });
+    return reject(credentialResult.status, credentialResult.code, credentialResult.error);
   }
   const credential = credentialResult.credential;
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
-    await discardUpload();
-    return res.status(400).json({ error: "Invalid or missing X-App-Name header. Use lowercase letters and dashes.", code: "invalid_app_name" });
+    return reject(400, 'invalid_app_name', "Invalid or missing X-App-Name header. Use lowercase letters, digits and dashes.");
   }
 
   // NEW: the app name is also the live subdomain and the Nomad job name —
@@ -746,28 +748,24 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // nothing, and keeping it to one call means the two services can't
   // reach different conclusions about the same deploy.
   if (appType && (appType.length > 60 || !/^[\x20-\x7E]+$/.test(appType))) {
-    await discardUpload();
-    return res.status(400).json({ error: "Invalid X-App-Type header. Use a short plain-text label of at most 60 characters, e.g. \"portfolio\" or \"task management\".", code: "invalid_app_type" });
+    return reject(400, 'invalid_app_type', "Invalid X-App-Type header. Use a short plain-text label of at most 60 characters, e.g. \"portfolio\" or \"task management\".");
   }
 
   if (agentName && (agentName.length > 60 || !/^[\x20-\x7E]+$/.test(agentName))) {
-    await discardUpload();
-    return res.status(400).json({ error: "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".", code: "invalid_agent_name" });
+    return reject(400, 'invalid_agent_name', "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".");
   }
 
   const claim = await orDiscard(claimProject(credential, appName, appType || undefined));
   if (!claim.ok) {
-    await discardUpload();
-    return res.status(claim.status).json({ error: claim.error, code: claim.code });
+    return reject(claim.status, claim.code, claim.error);
   }
 
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
-    await discardUpload();
-    return res.status(400).json({ error: "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", code: "invalid_app_version" });
+    return reject(400, 'invalid_app_version', "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", {}, true);
   }
 
   if (!req.file) {
-    return res.status(400).json({ error: "No source code uploaded", code: "missing_source_file" });
+    return reject(400, 'missing_source_file', "No source code uploaded", {}, true);
   }
 
   const buildDir = `/tmp/platform-builds/${appName}-${Date.now()}`;
@@ -782,7 +780,6 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // than a separate env var — same https-hardcoding the response already
   // relied on (this platform is always served through Traefik's TLS
   // termination in practice).
-  const selfHost = req.get('host');
 
   try {
     // 2. Extract the uploaded tar.gz file
@@ -807,19 +804,21 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       logger.info(`[${appName}] Rejected: no buildable manifest at the archive root${rootCheck.hint ? ` (found one nested at ${rootCheck.hint})` : ''}`);
       await fs.remove(buildDir);
       await fs.remove(req.file.path);
-      return res.status(422).json({
+      return res.status(422).json(errorBody({
+        host, appName, appExists: true,
         error: "No buildable app found at the archive root",
         code: "no_manifest_at_root",
-        detail:
-          "No package.json, requirements.txt, pyproject.toml, go.mod, Gemfile, composer.json, " +
-          "Cargo.toml, or index.html was found at the top level of the uploaded archive" +
-          (rootCheck.hint ? `, but one was found nested at '${rootCheck.hint}'` : "") +
-          ". Railpack only looks at the archive root — re-package so the app's manifest (or " +
-          "index.html for a static site) sits at the top level, not inside an extra wrapping " +
-          "folder, then redeploy.",
-        foundNestedAt: rootCheck.hint || null,
-        docs: DOCS_URL,
-      });
+        extra: {
+          detail:
+            "No package.json, requirements.txt, pyproject.toml, go.mod, Gemfile, composer.json, " +
+            "Cargo.toml, or index.html was found at the top level of the uploaded archive" +
+            (rootCheck.hint ? `, but one was found nested at '${rootCheck.hint}'` : "") +
+            ". Railpack only looks at the archive root — re-package so the app's manifest (or " +
+            "index.html for a static site) sits at the top level, not inside an extra wrapping " +
+            "folder, then redeploy.",
+          foundNestedAt: rootCheck.hint || null,
+        },
+      }));
     }
 
     // NEW 2a-pre2. The root looks buildable, but only because a wrapper
@@ -833,20 +832,22 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       logger.info(`[${appName}] Rejected: root package.json delegates its build to '${delegating.subdir}/'`);
       await fs.remove(buildDir);
       await fs.remove(req.file.path);
-      return res.status(422).json({
+      return res.status(422).json(errorBody({
+        host, appName, appExists: true,
         error: "The app to deploy is in a subdirectory, not at the archive root",
         code: "app_nested_in_subdirectory",
-        detail:
-          `The package.json at the archive root declares no dependencies of its own and hands its ` +
-          `build to '${delegating.subdir}/'` +
-          (delegating.script ? ` (${delegating.script})` : '') +
-          `. Only the archive root is installed, so '${delegating.subdir}/node_modules' would never ` +
-          `be created and the build would fail on a missing command (exit code 127). Deploy the ` +
-          `'${delegating.subdir}' directory directly — upload that folder, or point the deploy ` +
-          `script at it — instead of the folder above it.`,
-        deployThisInstead: delegating.subdir,
-        docs: DOCS_URL,
-      });
+        extra: {
+          detail:
+            `The package.json at the archive root declares no dependencies of its own and hands its ` +
+            `build to '${delegating.subdir}/'` +
+            (delegating.script ? ` (${delegating.script})` : '') +
+            `. Only the archive root is installed, so '${delegating.subdir}/node_modules' would never ` +
+            `be created and the build would fail on a missing command (exit code 127). Deploy the ` +
+            `'${delegating.subdir}' directory directly — upload that folder, or point the deploy ` +
+            `script at it — instead of the folder above it.`,
+          deployThisInstead: delegating.subdir,
+        },
+      }));
     }
 
     // NEW 2a. Read package.json once, up front — shared by the embedded-DB
@@ -880,17 +881,19 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
         logger.info(`[${appName}] Rejected: window.storage usage detected in: ${storageUsage.files.join(', ')}`);
         await fs.remove(buildDir);
         await fs.remove(req.file.path);
-        return res.status(422).json({
+        return res.status(422).json(errorBody({
+          host, appName, appExists: true,
           error: "Unsupported storage pattern detected",
           code: "unsupported_storage_pattern",
-          detail:
-            "This app calls window.storage, an API specific to Claude Artifacts' sandbox. " +
-            "It does not exist outside that environment and will fail at runtime if deployed " +
-            "here as-is. Please update the app to persist data with a real database before " +
-            "redeploying: use SQLite (better-sqlite3), writing under DATA_DIR.",
-          filesDetected: storageUsage.files,
-          docs: DOCS_URL,
-        });
+          extra: {
+            detail:
+              "This app calls window.storage, an API specific to Claude Artifacts' sandbox. " +
+              "It does not exist outside that environment and will fail at runtime if deployed " +
+              "here as-is. Please update the app to persist data with a real database before " +
+              "redeploying: use SQLite (better-sqlite3), writing under DATA_DIR.",
+            filesDetected: storageUsage.files,
+          },
+        }));
       }
     }
 
@@ -913,14 +916,16 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       logger.info(`[${appName}] Rejected: ${plan.error}`);
       await fs.remove(buildDir);
       await fs.remove(req.file.path);
-      return res.status(422).json({
+      return res.status(422).json(errorBody({
+        host, appName, appExists: true,
         error: "Invalid static root",
         code: "invalid_static_root",
-        detail:
-          `The Staticfile sets root: ${plan.invalidStaticRoot}, which points outside the uploaded files. ` +
-          `The root must be a directory inside the upload (for example "root: dist" or "root: public").`,
-        docs: DOCS_URL,
-      });
+        extra: {
+          detail:
+            `The Staticfile sets root: ${plan.invalidStaticRoot}, which points outside the uploaded files. ` +
+            `The root must be a directory inside the upload (for example "root: dist" or "root: public").`,
+        },
+      }));
     }
     if (!plan.ok) {
       logger.info(`[${appName}] railpack could not inspect this upload (${plan.error}) — keeping the app's existing kind (${existingKind === 'none' ? 'new app, so server' : existingKind})`);
@@ -940,20 +945,22 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       logger.info(`[${appName}] Rejected: app is a static site, this upload is ${now}`);
       await fs.remove(buildDir);
       await fs.remove(req.file.path);
-      return res.status(422).json({
+      return res.status(422).json(errorBody({
+        host, appName, appExists: true,
         error: "App kind changed",
         code: "app_kind_changed",
-        detail:
-          `"${appName}" is deployed as a static site, but this upload is ${now}. A static site is ` +
-          `served directly from its files with no server process; a server app runs as its own job ` +
-          `with routing, a data directory and settings this app never had, so a static app cannot ` +
-          `be turned into one. To ship this version, deploy it under a NEW app name (X-App-Name). ` +
-          `If the change is a mistake, restore the static files (e.g. an index.html at the upload ` +
-          `root) and redeploy under this name.`,
-        previousKind: 'static',
-        uploadedKind: 'service',
-        docs: DOCS_URL,
-      });
+        extra: {
+          detail:
+            `"${appName}" is deployed as a static site, but this upload is ${now}. A static site is ` +
+            `served directly from its files with no server process; a server app runs as its own job ` +
+            `with routing, a data directory and settings this app never had, so a static app cannot ` +
+            `be turned into one. To ship this version, deploy it under a NEW app name (X-App-Name). ` +
+            `If the change is a mistake, restore the static files (e.g. an index.html at the upload ` +
+            `root) and redeploy under this name.`,
+          previousKind: 'static',
+          uploadedKind: 'service',
+        },
+      }));
     }
     const convertingFromService = isStaticDeploy && existingKind === 'service';
     if (convertingFromService) {
@@ -1010,75 +1017,19 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       deploymentId,
     });
 
-    const statusUrl = `https://${selfHost}/apps/${appName}/status`;
-    const logsUrl = `https://${selfHost}/apps/${appName}/logs`;
-    const customerQueryUrl = `https://${selfHost}/apps/${appName}/customer-query`;
-    const docsUrl = DOCS_URL;
-
-    // 7. Send Accepted Response — the build/deploy hasn't run yet; see
-    // performBuildAndDeploy above, kicked off (unawaited) below.
-    const responseBody = {
-      success: true,
-      accepted: true,
-      // "static": a plain static site, served directly from its files
-      // (docs/Static-apps-req.md); "service": built and run as a job.
+    // One next step, not the whole journey: confirm the deploy. The claim
+    // and showcase steps come later, in the status reply, once the app is
+    // actually live — see deploy-response.js.
+    const responseBody = acceptedBody({
+      host,
+      appName,
       kind: isStaticDeploy ? 'static' : 'service',
-      message: isStaticDeploy
-        ? `Static site detected — no build and no server needed, so it's being published ` +
-        `directly and should be live at the URL below within seconds. Confirm with ${statusUrl}.` +
-        (convertingFromService
-          ? ` NOTE: "${appName}" was running as a server app; this upload converts it to a ` +
-          `static site and its server job is being removed. If that was not intended, ` +
-          `redeploy the server version under a NEW app name — a static app cannot be turned ` +
-          `back into a server app.`
-          : '')
-        : `Deployment accepted and is building in the background — this can take a few ` +
-        `minutes for a fresh build. Check ${statusUrl} for progress (and ${logsUrl} for ` +
-        `build/runtime logs) before assuming it's live at the URL below.`,
-      version: appVersion,
-      image: imageName,
-      // A static app runs no process, so there is nothing to size.
-      memory: isStaticDeploy ? null : `${taskMemory}MB`,
       url: `https://${domain}`,
-      statusUrl,
-      logsUrl,
-      // 2026-09-13: surfaced on EVERY deploy response (orphan or claimed —
-      // added above the isOrphan branch below, not inside it), not just
-      // documented separately, so an AI agent doing the deploying learns
-      // about this the moment it deploys, without needing to have already
-      // read the docs. Written as a direct instruction TO the agent, not
-      // a human-facing explanation of the feature — see
-      // docs/request-feature-req.md (Path C) and customer-query.js.
-      support: {
-        message:
-          `If deploying, building, or fixing this app ever fails or behaves ` +
-          `unexpectedly, report it automatically — don't just work around it ` +
-          `silently and say nothing. POST ${customerQueryUrl} with header ` +
-          `"X-Agent-Name: <your agent's name>" and JSON body ` +
-          `{"type": "feedback", "message": "<what went wrong, what you tried, ` +
-          `and any error output>"} ("type" can also be "feature" for a missing ` +
-          `capability, or "other"). Same access rules as ${statusUrl} and ` +
-          `${logsUrl} above: no credential needed while this app is unclaimed, ` +
-          `or the same deploy token / proxy_auth_token you're already using ` +
-          `once it's claimed. Full docs: ${docsUrl}`,
-        customerQueryUrl,
-        docsUrl,
-      },
-    };
-    // NEW: see docs/Anonymous-deploy-req.md #4 — orphanMessage is a
-    // complete, self-contained instruction sequence, written so an AI
-    // agent relaying this to a human can explain every step unaided.
-    // statusUrl/logsUrl are repeated here (not just top-level) so that
-    // same self-contained instruction sequence doesn't force the reader
-    // to also go look at sibling fields to find them.
-    if (claim.isOrphan) {
-      responseBody.orphan = {
-        expiresAt: claim.orphanExpiresAt,
-        message: claim.orphanMessage,
-        statusUrl,
-        logsUrl,
-      };
-    }
+      claimed: !claim.isOrphan,
+      claimedNow: !!claim.claimedNow,
+      expiresAt: claim.orphanExpiresAt,
+      convertingFromService,
+    });
     res.status(202).json(responseBody);
 
     // Deliberately not awaited — everything from here happens after the
@@ -1125,7 +1076,10 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       });
     }
 
-    res.status(500).json({ error: "Deployment failed", code: "deploy_failed", details: error.message });
+    res.status(500).json(errorBody({
+      host, appName, appExists: true,
+      error: "Deployment failed", code: "deploy_failed", extra: { details: error.message },
+    }));
   }
 });
 
@@ -1164,21 +1118,22 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
   if (authHeader) {
     deployTokenPresented = true;
     const token = authHeader.split(' ')[1];
-    if (!token) return { ok: false, status: 401, error: "Unauthorized" };
+    if (!token) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
     const validation = await validateDeployTokenWithCompany(token);
-    if (!validation) return { ok: false, status: 401, error: "Unauthorized" };
+    if (!validation) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
     callerCompanyId = validation.companyId;
   }
 
   const lookup = await lookupProject(appName);
   if (!lookup.ok) {
-    return { ok: false, status: lookup.status, error: lookup.error };
+    return { ok: false, status: lookup.status, code: lookup.code, error: lookup.error };
   }
   if (lookup.isOrphan) {
     // companyId returned here too (null for a still-orphan app) so
     // callers that need it (e.g. the customer-query route, to attribute
     // the row) don't have to look the project up a second time.
-    return { ok: true, companyId: null, isOrphan: true };
+    // orphanExpiresAt: the status reply tells the agent the deadline.
+    return { ok: true, companyId: null, isOrphan: true, orphanExpiresAt: lookup.orphanExpiresAt };
   }
 
   // Only reached for a CLAIMED app, and only when no deploy token was
@@ -1186,13 +1141,13 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
   // path for every existing agent/CI caller.
   if (!deployTokenPresented && proxyAuthTokenHeader) {
     const membership = await verifyProxyAuthCompanyAccess(proxyAuthTokenHeader, lookup.companyId);
-    if (!membership.valid) return { ok: false, status: 401, error: "Unauthorized" };
-    if (!membership.isMember) return { ok: false, status: 404, error: "Not found" };
+    if (!membership.valid) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
+    if (!membership.isMember) return { ok: false, status: 404, code: 'not_found', error: "Not found" };
     callerCompanyId = lookup.companyId;
   }
 
   if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
-    return { ok: false, status: 404, error: "Not found" };
+    return { ok: false, status: 404, code: 'not_found', error: "Not found" };
   }
   return { ok: true, companyId: callerCompanyId, isOrphan: false };
 }
@@ -1205,31 +1160,34 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
 // read differently instead of both just looking like silence.
 app.get('/apps/:appName/status', async (req, res) => {
   const { appName } = req.params;
+  const host = req.get('host');
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
-    return res.status(400).json({ error: "Invalid app name" });
+    return res.status(400).json(errorBody({ host, error: "Invalid app name", code: 'invalid_app_name' }));
   }
 
   const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
   if (!auth.ok) {
-    return res.status(auth.status).json({ error: auth.error });
+    return res.status(auth.status).json(errorBody({ host, appName, error: auth.error, code: auth.code }));
   }
 
-  const deployState = getDeployState(appName) || {};
-  const health = await getAppHealth(appName);
-  const kind = (await isStaticApp(appName)) ? 'static' : 'service';
+  // A static site has no Nomad job, so Nomad's health says nothing about
+  // it (it would read "not_deployed" for a live site). Its manifest only
+  // exists once a publish has succeeded — a failed one is undone — so
+  // that is what "live" means for it.
+  const isStatic = await isStaticApp(appName);
+  const kind = isStatic ? 'static' : 'service';
 
-  res.json({
+  res.json(statusBody({
+    host,
     appName,
     kind,
-    deploy: {
-      status: deployState.status || 'unknown',
-      appVersion: deployState.appVersion || null,
-      startedAt: deployState.startedAt || null,
-      finishedAt: deployState.finishedAt || null,
-      errorDetail: deployState.errorDetail || null,
-    },
-    health,
-  });
+    url: `https://${defaultDomainFor(appName)}`,
+    claimed: !auth.isOrphan,
+    expiresAt: auth.orphanExpiresAt || null,
+    deployState: getDeployState(appName),
+    health: isStatic ? null : await getAppHealth(appName),
+    staticLive: isStatic,
+  }));
 });
 
 // Public — same auth as .../status above. Recent (tail, not streaming)
@@ -1240,42 +1198,68 @@ app.get('/apps/:appName/status', async (req, res) => {
 // ?stream=stderr for the error stream; stdout is the default.
 app.get('/apps/:appName/logs', async (req, res) => {
   const { appName } = req.params;
+  const host = req.get('host');
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
-    return res.status(400).json({ error: "Invalid app name" });
+    return res.status(400).json(errorBody({ host, error: "Invalid app name", code: 'invalid_app_name' }));
   }
 
   const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
   if (!auth.ok) {
-    return res.status(auth.status).json({ error: auth.error });
+    return res.status(auth.status).json(errorBody({ host, appName, error: auth.error, code: auth.code }));
+  }
+
+  // Nothing runs for a static site, so there is nothing to log — say so
+  // plainly rather than "no allocation", which reads as a failed deploy.
+  if (await isStaticApp(appName)) {
+    return res.json(staticLogsBody({ host, appName }));
+  }
+
+  const feedbackLink = { feedback: linksFor(host, appName).feedback };
+  const buildLogBody = (buildLog) => ({
+    available: true,
+    source: 'build',
+    stream: 'combined',
+    logs: buildLog.output,
+    capturedAt: buildLog.capturedAt,
+    next:
+      'These are the most recent BUILD logs. The cause of a failed deploy is in here: fix it and redeploy ' +
+      'under the same app name. If it isn\'t clear, report it to links.feedback.',
+    links: feedbackLink,
+  });
+
+  // A failed REdeploy leaves the previous version's allocation behind, so
+  // runtime logs exist — but they belong to the old version and say
+  // nothing about why this build failed. When the latest attempt failed
+  // and its build log is from that attempt, that log is the answer.
+  const deployState = getDeployState(appName);
+  const buildLog = getBuildLog(appName);
+  if (
+    deployState && deployState.status === 'failed' && buildLog &&
+    deployState.startedAt && buildLog.capturedAt >= deployState.startedAt
+  ) {
+    return res.json(buildLogBody(buildLog));
   }
 
   const stream = req.query.stream === 'stderr' ? 'stderr' : 'stdout';
   const result = await getAppLogs(appName, { stream });
 
-  // NEW: Nomad allocation logs only exist once something has actually been
-  // scheduled, so a build that FAILED has none — which used to mean the
-  // one case people reach for logs hardest returned nothing at all. Fall
-  // back to the most recent build's own output (build-diagnostics.js),
-  // which is where the real failure is named. Runtime logs still win
-  // whenever they exist, so nothing about a healthy app's response
-  // changes.
-  if (!result.available) {
-    const buildLog = getBuildLog(appName);
-    if (buildLog) {
-      return res.json({
-        available: true,
-        source: 'build',
-        stream: 'combined',
-        logs: buildLog.output,
-        capturedAt: buildLog.capturedAt,
-        note:
-          "Runtime logs aren't available for this app yet, so these are its most recent BUILD " +
-          'logs instead. If the deploy failed, the cause is in here.',
-      });
-    }
+  // Nomad allocation logs only exist once something has actually been
+  // scheduled, so a first build that FAILED has none. Fall back to the
+  // most recent build's own output (build-diagnostics.js), which is where
+  // the real failure is named.
+  if (!result.available && buildLog) {
+    return res.json(buildLogBody(buildLog));
   }
 
-  res.json(result);
+  if (!result.available) {
+    return res.json({
+      ...result,
+      next: 'No logs yet: the app has not started. Check links.status; if it says "building", wait and try again.',
+      links: { status: linksFor(host, appName).status, ...feedbackLink },
+    });
+  }
+
+  res.json({ ...result, links: feedbackLink });
 });
 
 // Path C of docs/request-feature-req.md — an AI agent (Claude Code,

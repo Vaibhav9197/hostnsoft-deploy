@@ -110,6 +110,9 @@ async function claimProject(credential, slug, appType) {
     envVars: body.envVars || [],
     memoryMb: typeof body.memoryMb === 'number' ? body.memoryMb : null,
     isOrphan: !!body.isOrphan,
+    // True only on the deploy that adopted a previously anonymous app —
+    // the reply tells the agent the app is now permanent.
+    claimedNow: !!body.claimedNow,
     orphanExpiresAt: body.orphanExpiresAt || null,
     orphanMessage: body.orphanMessage || null,
     orphanLoginUrl: body.orphanLoginUrl || null,

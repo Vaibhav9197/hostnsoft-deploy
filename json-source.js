@@ -26,6 +26,7 @@ const fs = require('fs-extra');
 const tar = require('tar');
 const express = require('express');
 const { randomUUID } = require('crypto');
+const { errorBody } = require('./deploy-response');
 
 const UPLOAD_DIR = '/tmp/platform-uploads/';
 // The body is the whole app, generated token by token by an agent — well
@@ -36,8 +37,10 @@ const MAX_FILES = 2000;
 
 const parseJson = express.json({ limit: MAX_BODY });
 
+// Same { error, code, next, links } shape as the handler's own rejections.
+// Runs before the claim, so the app may not exist: public feedback link.
 function fail(res, status, code, error) {
-  return res.status(status).json({ error, code });
+  return res.status(status).json(errorBody({ host: res.req.get('host'), error, code }));
 }
 
 // A relative path that stays inside the build dir — no absolute paths, no
