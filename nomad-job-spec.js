@@ -170,9 +170,9 @@ function defaultRouterTags(appName, domain) {
     `traefik.http.routers.${appName}.tls.certresolver=${DNS01_CERT_RESOLVER}`,
     ...(wildcard
       ? [
-          `traefik.http.routers.${appName}.tls.domains[0].main=${wildcard.main}`,
-          `traefik.http.routers.${appName}.tls.domains[0].sans=${wildcard.sans.join(',')}`,
-        ]
+        `traefik.http.routers.${appName}.tls.domains[0].main=${wildcard.main}`,
+        `traefik.http.routers.${appName}.tls.domains[0].sans=${wildcard.sans.join(',')}`,
+      ]
       : []),
     `traefik.http.routers.${appName}.middlewares=${securityHeadersMiddlewareName(appName)}`,
   ];
@@ -241,7 +241,9 @@ function buildNomadJobSpec({
   isOrphan = false,
   orphanExpiresAt,
   orphanLoginUrl,
+  isFreePlan = false,
 }) {
+  const showBanner = isOrphan || isFreePlan;
   const projectEnvLines = projectEnvVarLines(envVars);
   const resolvedAppDataPath = appDataPath || appDataPathFor(appName);
   const tags = [
@@ -264,9 +266,9 @@ function buildNomadJobSpec({
   // — and the sidecar task itself — is automatically gone the moment a
   // project is claimed and redeployed (isOrphan false): see #6. No
   // separate removal step exists or is needed.
-  const appPortLabel = isOrphan ? 'app' : 'http';
+  const appPortLabel = showBanner ? 'app' : 'http';
 
-  const sidecarNetworkPort = isOrphan ? '\n      port "app"  {}' : '';
+  const sidecarNetworkPort = showBanner ? '\n      port "app"  {}' : '';
 
   // Memory oversubscription (see docs/Memory-oversubscription-req.md).
   // `memory` is what Nomad's scheduler PACKS against; `memory_max` is the
@@ -287,7 +289,7 @@ function buildNomadJobSpec({
   // rebuild, check that setting first.
   const memoryLines = memoryResourceLines(taskMemory, schedulingFloorMb);
 
-  const sidecarTask = isOrphan ? `
+  const sidecarTask = showBanner ? `
     # Only present for orphan (anonymous, unclaimed) deploys — see above.
     task "orphan-proxy" {
       driver = "docker"
@@ -304,8 +306,9 @@ function buildNomadJobSpec({
         # is that same address (see this module's fail-fast check below).
         TARGET_HOST       = "${ORIGIN_IP}"
         TARGET_PORT       = "\${NOMAD_PORT_app}"
-        BANNER_EXPIRES_AT = "${orphanExpiresAt}"
-        BANNER_LOGIN_URL  = "${orphanLoginUrl}"
+        FOOTER            = "1"
+        BANNER_EXPIRES_AT = "${isOrphan ? orphanExpiresAt : ''}"
+        BANNER_LOGIN_URL  = "${isOrphan ? orphanLoginUrl : ''}"
       }
       resources {
         cpu    = 50
@@ -389,8 +392,8 @@ module.exports = { buildNomadJobSpec, DNS01_CERT_RESOLVER, HTTP01_CERT_RESOLVER,
 if (!process.env.APPS_DOMAIN_SUFFIX) {
   throw new Error(
     'APPS_DOMAIN_SUFFIX environment variable is not set. This is the ' +
-      'domain suffix deployed apps live under (e.g. "embarko.app") — ' +
-      'see server-setup.sh, which computes and exports it per environment.'
+    'domain suffix deployed apps live under (e.g. "embarko.app") — ' +
+    'see server-setup.sh, which computes and exports it per environment.'
   );
 }
 const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
@@ -406,10 +409,10 @@ const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
 if (!process.env.ORIGIN_IP) {
   throw new Error(
     'ORIGIN_IP environment variable is not set. This must be the same address ' +
-      "Docker actually publishes app container ports to on this box (this platform's " +
-      "Nomad setup binds published ports to the box's own advertised/public IP, not " +
-      '0.0.0.0 or 127.0.0.1 — confirmed in practice, not an assumption) — ' +
-      'see server-setup.sh, which computes and exports it per environment.'
+    "Docker actually publishes app container ports to on this box (this platform's " +
+    "Nomad setup binds published ports to the box's own advertised/public IP, not " +
+    '0.0.0.0 or 127.0.0.1 — confirmed in practice, not an assumption) — ' +
+    'see server-setup.sh, which computes and exports it per environment.'
   );
 }
 const ORIGIN_IP = process.env.ORIGIN_IP;
@@ -438,8 +441,8 @@ const ORIGIN_IP = process.env.ORIGIN_IP;
 if (!process.env.APP_DATA_ROOT) {
   throw new Error(
     'APP_DATA_ROOT environment variable is not set. This is the host directory ' +
-      "under which each app's DATA_DIR is stored (one subdirectory per app) — " +
-      'see server-setup.sh, which creates and exports it per environment.'
+    "under which each app's DATA_DIR is stored (one subdirectory per app) — " +
+    'see server-setup.sh, which creates and exports it per environment.'
   );
 }
 const APP_DATA_ROOT = process.env.APP_DATA_ROOT;

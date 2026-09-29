@@ -116,6 +116,7 @@ async function claimProject(credential, slug, appType) {
     orphanExpiresAt: body.orphanExpiresAt || null,
     orphanMessage: body.orphanMessage || null,
     orphanLoginUrl: body.orphanLoginUrl || null,
+    isFreePlan: !!body.isFreePlan,
   };
 }
 

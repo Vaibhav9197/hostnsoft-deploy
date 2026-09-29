@@ -469,6 +469,7 @@ async function performBuildAndDeploy({
       isOrphan: claim.isOrphan,
       orphanExpiresAt: claim.orphanExpiresAt,
       orphanLoginUrl: claim.orphanLoginUrl,
+      isFreePlan: claim.isFreePlan,
     });
     const nomadFilePath = path.join(buildDir, `${appName}.nomad`);
     await fs.writeFile(nomadFilePath, nomadJobSpec);
@@ -572,6 +573,7 @@ async function performStaticDeploy({
         isOrphan: claim.isOrphan,
         orphanExpiresAt: claim.orphanExpiresAt,
         orphanLoginUrl: claim.orphanLoginUrl,
+        isFreePlan: claim.isFreePlan,
       });
     } catch (routerError) {
       if (existingKind !== 'static') {
