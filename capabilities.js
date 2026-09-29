@@ -89,16 +89,22 @@ const CAPABILITIES = {
   // published to a shared static file server behind Traefik and are live
   // seconds after the upload is accepted (see docs/Static-apps-req.md).
   // Everything under `runtime` and `persistence` is about a SERVER app
-  // and does not apply to it: nothing listens on PORT, DATA_DIR does not
-  // exist, env vars are accepted by the control plane but reach nothing.
+  // and does not apply to it: nothing listens on PORT and DATA_DIR does
+  // not exist. Env var and memory writes are refused (409
+  // not_supported_for_static) rather than accepted and silently ignored.
   // A build-time SPA (Vite, CRA, ...) is still built and served in a
-  // container today. The deploy response and status carry `kind`.
+  // container today. The deploy response and status carry `app.kind`.
   static_apps: {
     served_directly: ['staticfile'],
     detected_by: 'railpack',
     build: false,
     container: false,
-    env_vars_apply: false,
+    live_within_seconds: true,
+    env_vars: 'refused',
+    memory_config: 'refused',
+    refused_code: 'not_supported_for_static',
+    logs: false,
+    scale_to_zero: 'not_applicable',
     data_dir: false,
     // A server app may be redeployed as a static site (its job is
     // retired). A static site can NOT be redeployed as a server app: that
@@ -186,6 +192,28 @@ const CAPABILITIES = {
     max_length: 60,
     examples: ['claude-code', 'claude', 'chatgpt', 'codex', 'cursor', 'copilot', 'gemini', 'windsurf'],
     how_to_choose: 'Send the name of the agent or product you are running as, in lowercase. It is only a label: it does not change what you can do.',
+  },
+
+  // What every reply from POST /apps, GET /apps/<name>/status and
+  // GET /apps/<name>/logs looks like, so an agent knows how to read them
+  // before the first deploy. Each reply gives the ONE next step for the
+  // app's current state; later steps appear in later replies.
+  deploy_flow: {
+    reply_shape: '{ status, app, next, links } — errors keep { error, code } and add next + links',
+    steps: [
+      'deploy: POST /apps -> status "building" (server app) or "publishing" (static site)',
+      'confirm: poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy',
+      'claim: an app deployed without a token is temporary (see app.expiresAt); the live status reply says how to claim it',
+      'showcase: once claimed, the live status reply points to links.showcase',
+    ],
+    feedback: 'Every reply carries links.feedback. Report anything that fails or is confusing, with a type saying what kind of problem it was.',
+    feedback_types: {
+      platform_bug: 'Embarko itself misbehaved',
+      missing_capability: 'the app needs something Embarko does not have',
+      docs_issue: 'the docs were wrong or unclear',
+      unexpected_behavior: 'it worked, but not as documented',
+      other: 'anything else',
+    },
   },
 
   // Opt-in at deploy time via `X-Scale-To-Zero: true` on POST /apps.
