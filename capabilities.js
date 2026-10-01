@@ -565,35 +565,67 @@ const TOPICS = [
     links: { docs: `${DOCS}/capabilities` },
   },
   {
-    topic: 'showcase',
-    covers: 'Listing an app publicly on the Embarko showcase',
+    topic: "showcase",
+    covers: "Show an app on Embarko Showcase or an event Showcase page.",
     available: true,
-    who: ['agent', 'dashboard'],
-    needsHuman: 'The user decides whether to list the app, and supplies the details.',
-    summary: 'Show a claimed app on a public Embarko showcase page. The name, tagline and description are also used for the listing\'s search results.',
-    how: [
-      'Only if the user wants it listed. GET links.collections to find the collection slug to list it on.',
-      'Ask the user for the details (required: name, tagline, creatorName). You can draft the tagline and description for them to approve.',
-      'PUT links.submit with the details. Sending it again updates the listing.',
-    ],
-    fields: {
-      required: ['collectionSlug', 'name (up to 80 characters)', 'tagline (up to 160)', 'creatorName (up to 80)'],
-      optional: ['whatItDoes (up to 4000)', 'whyBuilt (up to 600)', 'creatorProfile (URL)', 'builtWith', 'category', 'tags (up to 20)', 'videoUrl', 'screenshotUrl'],
-      builtWith: ['Claude', 'Codex', 'Cursor', 'Lovable', 'Replit', 'Other'],
-      category: ['AI Tool', 'Personal', 'Business', 'Productivity', 'Education', 'Game', 'Developer Tool', 'Other'],
+    who: ["agent"],
+    needsHuman: "User confirms the listing before publishing or changing it.",
+    summary: "Showcase is a public gallery of apps built with AI agents. Each app has one listing reused across the public and event pages.",
+    pages: {
+      public: "PUT /showcase without collectionSlug → publishes immediately.",
+      event: "PUT /showcase with collectionSlug → requires organiser approval unless a valid code is provided."
     },
-    limits: [
-      'The app must be claimed (it needs its deploy token).',
-      'A company\'s own showcase page only lists that company\'s apps (403 SHOWCASE_COLLECTION_PRIVATE).',
-      'Listing publishes immediately. Never send placeholder text.',
+    flow: [
+      "Only act when the user wants Showcase.",
+      "GET existing first; reuse current details and send only changes.",
+      "If new, draft accurate listing details from the app/codebase. Ask only for unknown information.",
+      "Never invent creator details, links, screenshots, event slug, or code.",
+      "Show the listing and get user confirmation before PUT.",
+      "A valid event code skips organiser approval and publishes immediately.",
+      "Without a code, event listing stays pending until the organiser approves.",
+      "App must be claimed; otherwise provide the claim link."
     ],
-    next: 'Ask the user whether they want the app listed. If yes, collect the required fields, then PUT links.submit.',
+    request: {
+      intent: "This is a user-built app showcased on Embarko. Create the page to maximize discoverability and help the creator promote the app. Write clear, accurate, SEO-friendly content based on what the app actually does, who it is for, and the problem it solves.",
+      endpoint: `PUT ${AGENT_API}/showcase`,
+      headers: {
+        Authorization: "Bearer <deploy token>",
+        "Content-Type": "application/json"
+      },
+      body: {
+        collectionSlug: "<showcase-page-slug>",   // omit for the public Showcase page
+        code: "<submit-code>",                     // optional — page's submit code from the organiser; skips approval
+        name: "<app-name>",                        // optional — defaults to the app's current name; becomes the page title and renames the app on the dashboard
+        tagline: "<one line>",                     // required on first submit — meta description; what it does + who it's for, ~60–160 chars
+        creatorName: "<name of the person or organization that built the app>",               // required on first submit — shown as the author
+        description: "<what it does>",             // page body; plain searchable words, features and use cases, up to 4000 chars
+        story: "<why they built it>",              // the problem it solves, in their words, up to 600 chars
+        creatorProfile: "<https-profile-url>",     // links the author; e.g. GitHub, X, LinkedIn or personal site
+        contactEmail: "<email>",                   // opt-in "Contact Dev" address; ask before sending
+        builtWith: "<tool used to build the app>", // e.g. Claude, Codex, Cursor, Lovable, Replit, or another tool
+        category: "<closest category>",            // e.g. AI Tool, Personal, Business, Productivity, Education, Game, Developer Tool
+        tags: ["<search term>", "<search term>"],  // max 8 — terms people would search for, not the category again
+        screenshotUrls: ["<https-image-url>"],      // max 10 — first is the card/social-share image; real screenshot, not a logo
+        videoUrl: "<https-video-url>",              // demo video; e.g. YouTube or Loom
+        customHtml: "<raw HTML>"                    // optional extra page content, up to 50k; headings/text are indexed
+      }
+    },
+    merge: "Only supplied fields change. Empty string clears a field; empty arrays clear arrays. Safe to retry.",
+    responses: {
+      "approved": "Live; return next URL.",
+      "pending": "Event organiser must approve." // or can be other response as well
+    },
+    next: {
+      noVideo: "App is publicly discoverable. Help the user promote it with platform-specific posts focused on what they built, who it helps, and why people should try it. Suggest adding a short demo video to make the app easier to understand; qualifying approved videos get 1 year of Embarko Pro for this project. For Instagram, suggest tagging @Embarko and inviting @Embarko as collaborator for possible additional reach.",
+      videoAdded: "App is publicly discoverable with a demo video. Help the user promote it with platform-specific posts focused on what they built, who it helps, and why people should try it. For Instagram, suggest tagging @Embarko and inviting @Embarko as collaborator for possible additional reach."
+    },
+
     links: {
-      collections: `${SHIP}/api/public/showcase/collections`,
+      existing: `${SHIP}/api/public/showcase/apps/<app-name>`,
       submit: `${AGENT_API}/showcase`,
-      showcase: 'https://embarko.ai/showcase',
-      claim: topicUrl('claim'),
-    },
+      showcase: "https://embarko.ai/showcase",
+      claim: topicUrl('claim')
+    }
   },
   {
     topic: 'feedback',
