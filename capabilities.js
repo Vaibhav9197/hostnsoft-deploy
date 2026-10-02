@@ -27,7 +27,7 @@
 const crypto = require('crypto');
 
 const CAPABILITIES = {
-  capabilities_version: '2026-09-29',
+  capabilities_version: '2026-10-02',
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -202,9 +202,9 @@ const CAPABILITIES = {
     reply_shape: '{ status, app, next, links } — errors keep { error, code } and add next + links',
     steps: [
       'deploy: POST /apps -> status "building" (server app, 202) or, for a static site, usually "live" already (200)',
-      'confirm: if not live yet, poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy',
+      'confirm: if not live yet, poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy. If the deploy sent Authorization, send the same header on status and logs: a claimed app answers 404 without it',
       'claim: an app deployed without a token is temporary (see app.expiresAt); the live status reply says how to claim it',
-      'showcase: once claimed, the live status reply points to links.showcase',
+      'showcase: once claimed, the live status reply points links.help at the showcase topic; the app\'s page ends up at https://embarko.ai/showcase/app/<app-name>',
     ],
     feedback: 'Every reply carries links.feedback. Report anything that fails or is confusing, with a type saying what kind of problem it was.',
     feedback_types: {
@@ -432,6 +432,7 @@ const TOPICS = [
       'Otherwise ask the user for their email and POST {"email": "<their email>"} to links.requestToken. It always answers 202; the token is emailed, never returned. An account is created if they don\'t have one.',
       `Ask the user to paste the token back. Save it to ${CAPABILITIES.credentials.file} so you never ask again.`,
       'Redeploy with the same X-App-Name and the header Authorization: Bearer <token>. The reply says the app is now permanent.',
+      'From then on send the same Authorization header on links.status and links.logs too: once claimed, the app is only visible to its owner, and a bare request gets a 404.',
     ],
     limits: [
       'There is no reminder email: tell the user the deletion time yourself.',
@@ -569,7 +570,7 @@ const TOPICS = [
     covers: "Show an app on Embarko Showcase or an event Showcase page.",
     available: true,
     who: ["agent"],
-    needsHuman: "User confirms the listing before publishing or changing it.",
+    needsHuman: "User confirms the listing before it is published or changed, unless they already asked for it and supplied the details (see flow).",
     summary: "Showcase is a public gallery of apps built with AI agents. Each app has one listing reused across the public and event pages.",
     pages: {
       public: "PUT /showcase without collectionSlug → publishes immediately.",
@@ -577,14 +578,16 @@ const TOPICS = [
     },
     flow: [
       "Only act when the user wants Showcase.",
-      "GET existing first; reuse current details and send only changes.",
-      "If new, draft accurate listing details from the app/codebase. Ask only for unknown information.",
+      "App must be claimed; otherwise follow links.claim first. The deploy token that claimed it is the one to send here.",
+      "GET links.existing first (no auth; 404 means not listed yet). Reuse current details and send only changes.",
+      "If new, draft accurate listing details from the app/codebase, including customHtml if the app needs more than the description can hold. Ask only for unknown information.",
+      "Then ask the user once for the optional fields only they can supply: creatorProfile, contactEmail (its own question), builtWith, videoUrl, screenshotUrls, and the event slug and code if it is for an event. Say each can be skipped; leave skipped ones out of the body.",
       "Never invent creator details, links, screenshots, event slug, or code.",
-      "Show the listing and get user confirmation before PUT.",
+      "Show the user the drafted listing and get their go-ahead before the PUT. Prior consent counts: if the user already said to list it and gave the details in this conversation, send it and show them what went live instead of asking again.",
       "A valid event code skips organiser approval and publishes immediately.",
       "Without a code, event listing stays pending until the organiser approves.",
-      "App must be claimed; otherwise provide the claim link."
     ],
+    auth: "If an Embarko connector tool is listed but not authorized, do not stop: call this endpoint over HTTP with the deploy token, and tell the user to authorize the connector so next time it is one tool call.",
     request: {
       intent: "This is a user-built app showcased on Embarko. Create the page to maximize discoverability and help the creator promote the app. Write clear, accurate, SEO-friendly content based on what the app actually does, who it is for, and the problem it solves.",
       endpoint: `PUT ${AGENT_API}/showcase`,
@@ -595,25 +598,26 @@ const TOPICS = [
       body: {
         collectionSlug: "<showcase-page-slug>",   // omit for the public Showcase page
         code: "<submit-code>",                     // optional — page's submit code from the organiser; skips approval
-        name: "<app-name>",                        // optional — defaults to the app's current name; becomes the page title and renames the app on the dashboard
+        name: "<display name>",                    // optional — defaults to the app's current name; display only (page title, dashboard label); slug and subdomain stay the same, rename the app itself with PATCH /api/apps/<app-name>
         tagline: "<one line>",                     // required on first submit — meta description; what it does + who it's for, ~60–160 chars
         creatorName: "<name of the person or organization that built the app>",               // required on first submit — shown as the author
         description: "<what it does>",             // page body; plain searchable words, features and use cases, up to 4000 chars
         story: "<why they built it>",              // the problem it solves, in their words, up to 600 chars
         creatorProfile: "<https-profile-url>",     // links the author; e.g. GitHub, X, LinkedIn or personal site
-        contactEmail: "<email>",                   // opt-in "Contact Dev" address; ask before sending
+        contactEmail: "<email>",                   // opt-in "Contact Dev" button that mails this address; ask as its own question, the token email is not consent
         builtWith: "<tool used to build the app>", // e.g. Claude, Codex, Cursor, Lovable, Replit, or another tool
         category: "<closest category>",            // e.g. AI Tool, Personal, Business, Productivity, Education, Game, Developer Tool
-        tags: ["<search term>", "<search term>"],  // max 8 — terms people would search for, not the category again
+        tags: ["<search-term>", "<search-term>"],  // max 8 — lowercase slugs people would search for, not the category again; normalized to "landing-page" form
         screenshotUrls: ["<https-image-url>"],      // max 10 — first is the card/social-share image; real screenshot, not a logo
         videoUrl: "<https-video-url>",              // demo video; e.g. YouTube or Loom
-        customHtml: "<raw HTML>"                    // optional extra page content, up to 50k; headings/text are indexed
+        customHtml: "<plain HTML>"                  // optional extra content below the details, up to 50k; sections, headings, lists, https images only; no script/style/forms/iframes
       }
     },
     merge: "Only supplied fields change. Empty string clears a field; empty arrays clear arrays. Safe to retry.",
     responses: {
-      "approved": "Live; return next URL.",
-      "pending": "Event organiser must approve." // or can be other response as well
+      approved: "Live on the page. Give the user links.appPage for this app.",
+      pending: "Event organiser must approve; it appears once they do. Resend with the event's code to skip the wait.",
+      rejected: "The organiser turned it down; next carries the reason. Fix that and send again.",
     },
     next: {
       noVideo: "App is publicly discoverable. Help the user promote it with platform-specific posts focused on what they built, who it helps, and why people should try it. Suggest adding a short demo video to make the app easier to understand; qualifying approved videos get 1 year of Embarko Pro for this project. For Instagram, suggest tagging @Embarko and inviting @Embarko as collaborator for possible additional reach.",
@@ -624,7 +628,9 @@ const TOPICS = [
       existing: `${SHIP}/api/public/showcase/apps/<app-name>`,
       submit: `${AGENT_API}/showcase`,
       showcase: "https://embarko.ai/showcase",
-      claim: topicUrl('claim')
+      event: "https://embarko.ai/showcase/<collectionSlug>",
+      appPage: "https://embarko.ai/showcase/app/<app-name>",
+      claim: topicUrl('claim'),
     }
   },
   {
@@ -666,6 +672,7 @@ const TOPIC_ALIASES = {
   'env-var': 'env-vars', env_vars: 'env-vars', secrets: 'env-vars', env: 'env-vars',
   token: 'claim', tokens: 'claim', anonymous: 'claim', orphan: 'claim',
   'scale_to_zero': 'scale-to-zero', sleep: 'scale-to-zero',
+  listing: 'showcase', gallery: 'showcase', publish: 'showcase', 'list-app': 'showcase', promote: 'showcase',
   websockets: 'not-supported', cron: 'not-supported', limitations: 'not-supported', unsupported: 'not-supported',
 };
 
