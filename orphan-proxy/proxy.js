@@ -226,7 +226,9 @@ const FOOTER_TAG = `<script>(function () {
 
   var host = document.createElement('div');
   host.id = '__embarko_orphan_footer';
-  host.style.cssText = 'all:initial;display:block;width:100%;';
+  // Normal flow, last child of <body>. High z-index so a page's fixed
+  // sidebar/nav cannot sit over it.
+  host.style.cssText = 'all:initial;display:block;width:100%;position:relative;z-index:2147483647;';
   var root = host.attachShadow({ mode: 'open' });
   root.innerHTML =
     '<style>' + ${JSON.stringify(FOOTER_CSS)} + '</style>' +
@@ -263,7 +265,14 @@ const FOOTER_TAG = `<script>(function () {
     setTimeout(function () { btn.innerHTML = orig; }, 1800);
   });
 
-  function mount() { document.body.appendChild(host); }
+  function mount() {
+    document.body.appendChild(host);
+    // SPAs (Next/React hydration) append their root AFTER this script
+    // ran, which pushed the footer above the app. Keep it last.
+    new MutationObserver(function () {
+      if (document.body.lastElementChild !== host) document.body.appendChild(host);
+    }).observe(document.body, { childList: true });
+  }
   if (document.body) mount();
   else document.addEventListener('DOMContentLoaded', mount);
 })();</script>`;
