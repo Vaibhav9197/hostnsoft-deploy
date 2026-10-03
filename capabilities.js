@@ -581,7 +581,7 @@ const TOPICS = [
       "App must be claimed; otherwise follow links.claim first. The deploy token that claimed it is the one to send here.",
       "GET links.existing first (no auth; 404 means not listed yet). Reuse current details and send only changes.",
       "If new, draft accurate listing details from the app/codebase, including customHtml if the app needs more than the description can hold. Ask only for unknown information.",
-      "Then ask the user once for the optional fields only they can supply: creatorProfile, contactEmail (its own question), builtWith, videoUrl, screenshotUrls, and the event slug and code if it is for an event. Say each can be skipped; leave skipped ones out of the body.",
+      "Then ask the user once for the optional fields only they can supply: creatorProfile, contributorEmails (its own question: who built the app, the person showcasing it first), builtWith, videoUrl, screenshotUrls, and the event slug and code if it is for an event. Say each can be skipped; leave skipped ones out of the body.",
       "Never invent creator details, links, screenshots, event slug, or code.",
       "Show the user the drafted listing and get their go-ahead before the PUT. Prior consent counts: if the user already said to list it and gave the details in this conversation, send it and show them what went live instead of asking again.",
       "A valid event code skips organiser approval and publishes immediately.",
@@ -604,7 +604,7 @@ const TOPICS = [
         description: "<what it does>",             // page body; plain searchable words, features and use cases, up to 4000 chars
         story: "<why they built it>",              // the problem it solves, in their words, up to 600 chars
         creatorProfile: "<https-profile-url>",     // links the author; e.g. GitHub, X, LinkedIn or personal site
-        contactEmail: "<email>",                   // opt-in "Contact Dev" button that mails this address; ask as its own question, the token email is not consent
+        contributorEmails: ["<email>", "<email>"], // opt-in — everyone who built the app; the FIRST is the person showcasing it and the main contact. "Contact Dev" mails all of them. Ask as its own question, the token email is not consent
         builtWith: "<tool used to build the app>", // e.g. Claude, Codex, Cursor, Lovable, Replit, or another tool
         category: "<closest category>",            // e.g. AI Tool, Personal, Business, Productivity, Education, Game, Developer Tool
         tags: ["<search-term>", "<search-term>"],  // max 8 — lowercase slugs people would search for, not the category again; normalized to "landing-page" form
