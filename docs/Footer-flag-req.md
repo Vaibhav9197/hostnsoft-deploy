@@ -25,6 +25,9 @@ sidecar:   /embarko-footer/show                  (directory bind-mounted read-on
 - `proxy.js` starts from env `FOOTER`, then re-reads `FOOTER_FLAG_FILE`
   every 5s. Missing, unreadable or unexpected content keeps the last
   value, so a file problem never flips the footer.
+- The flag controls the footer only. An orphan's expiry banner is shown
+  regardless; its footer follows the flag like any other app's (written
+  `1` on deploy, so it shows unless switched off).
 - The directory is mounted, not the file: the flag is replaced by
   rename (`footer-flag.js`), and a single-file bind mount would keep
   pointing at the old file.

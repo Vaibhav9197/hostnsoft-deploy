@@ -297,18 +297,22 @@ const FOOTER_TAG = `<script>(function () {
   else document.addEventListener('DOMContentLoaded', mount);
 })();</script>`;
 
-// One tag per distinct (expiry, login URL) pair — for the sidecar that
-// is exactly one entry, built once. Bounded so a stream of made-up
-// header values (only Traefik sets them, but still) cannot grow it
-// without limit.
+// One tag per distinct (expiry, login URL, footer) combination — for the
+// sidecar that is at most two entries, footer on and off. Bounded so a
+// stream of made-up header values (only Traefik sets them, but still)
+// cannot grow it without limit. The expiry banner and the footer are
+// independent: an orphan always has the banner, and has the footer for
+// as long as its flag says so (it is written "1" on deploy).
 const bannerCache = new Map();
 const BANNER_CACHE_MAX = 500;
-function bannerTagFor(expiresAt, loginUrl) {
-  const key = `${expiresAt}\n${loginUrl}`;
+function bannerTagFor(expiresAt, loginUrl, footer) {
+  const key = `${expiresAt}\n${loginUrl}\n${footer}`;
   let tag = bannerCache.get(key);
   if (!tag) {
     if (bannerCache.size >= BANNER_CACHE_MAX) bannerCache.clear();
-    tag = expiresAt ? `${buildBannerTag(expiresAt, loginUrl)}\n${FOOTER_TAG}` : FOOTER_TAG;
+    tag = [expiresAt ? buildBannerTag(expiresAt, loginUrl) : '', footer ? FOOTER_TAG : '']
+      .filter(Boolean)
+      .join('\n');
     bannerCache.set(key, tag);
   }
   return tag;
@@ -327,11 +331,11 @@ function bannerConfigFor(req) {
   const orphan = !!(expiresAt && loginUrl);
   const footer = footerOn || req.headers['x-embarko-footer'] === '1';
   if (!orphan && !footer) return null;
-  return { expiresAt: orphan ? String(expiresAt) : '', loginUrl: orphan ? String(loginUrl) : '' };
+  return { expiresAt: orphan ? String(expiresAt) : '', loginUrl: orphan ? String(loginUrl) : '', footer };
 }
 
-function injectBanner(html, { expiresAt, loginUrl }) {
-  const tag = bannerTagFor(expiresAt, loginUrl);
+function injectBanner(html, { expiresAt, loginUrl, footer }) {
+  const tag = bannerTagFor(expiresAt, loginUrl, footer);
   return html.includes('</body>')
     ? html.replace('</body>', `${tag}\n</body>`)
     : `${html}\n${tag}\n`;
