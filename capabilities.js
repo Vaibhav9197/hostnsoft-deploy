@@ -470,6 +470,7 @@ const TOPICS = [
     who: via('env_vars'),
     summary: 'Environment variables for one app, set with its deploy token. Values are write-only: you can list the keys but never read a value back.',
     how: [
+      'On the first deploy of an app that needs config, name the keys the code reads, confirm the production values with the user, then set them here.',
       'GET links.list shows which keys are set.',
       'PUT links.setOne with {"value": "...", "apply": true} sets one key and applies it straight away. PUT links.list with {"vars": [{"key", "value"}], "apply": true} sets several (a merge).',
       'Without "apply": true, a write only stores the value: POST links.apply (or redeploy) to make the running app see it.',
