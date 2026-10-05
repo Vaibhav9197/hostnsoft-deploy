@@ -81,6 +81,11 @@ const CAPABILITIES = {
       detail: 'Cron jobs and scheduled tasks are not supported. There is no platform scheduler, and an in-process one (node-cron, APScheduler, setInterval loops) is not guaranteed to run: the process restarts on every redeploy and may be stopped when idle.',
       use_instead: 'Expose an HTTP route that does the work, protect it with a secret env var, and call it from an external scheduler.',
     },
+    {
+      feature: 'multiple_processes',
+      detail: 'One upload runs one process in one language. A folder holding a frontend and a backend (or two backends) is not one app: the build picks one manifest and the rest is never built or started.',
+      use_instead: 'Deploy each part as its own app (backend as a server app, the built frontend as a static site that calls the backend URL), or build the frontend and serve its files from the backend.',
+    },
   ],
 
   // A plain static site — Railpack's "staticfile" provider: an index.html
@@ -383,7 +388,7 @@ const TOPICS = [
     requirements: [
       `The app reads its port from ${CAPABILITIES.runtime.port_env} and binds ${CAPABILITIES.runtime.bind_address}.`,
       'No Dockerfile. The language is detected from the source: ' + CAPABILITIES.runtime.detects.join(', ') + '.',
-      'The manifest (package.json, requirements.txt, ...) or index.html sits at the top of the upload. One upload is one app.',
+      'The manifest (package.json, requirements.txt, ...) or index.html sits at the top of the upload. One upload is one app running one process: a frontend plus a backend is two apps (see links.notSupported).',
       'Anything that must survive a redeploy is written under DATA_DIR (see links.files).',
     ],
     limits: [
