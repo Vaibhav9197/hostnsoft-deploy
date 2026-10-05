@@ -98,8 +98,9 @@ URL>)"*, computed from the same `orphanExpiresAt` stored on the project.
 
 **Runtime, language/framework-agnostic, not a build-time step**: while a
 project is orphaned, Traefik routes its traffic through a small sidecar
-(`orphan-proxy/`, added to the app's Nomad job only when `isOrphan` is
-true — see `nomad-job-spec.js`) that sits in front of the real app
+(`orphan-proxy/`, added to the app's Nomad job when `isOrphan` is true —
+and, since the free-plan footer, also when `isFreePlan` is; see
+`nomad-job-spec.js` and `Footer-flag-req.md`) that sits in front of the real app
 container and rewrites any `text/html` response to inject the banner
 before `</body>` (or appends it, if none is found). Everything else —
 JSON, assets, streaming responses, WebSocket upgrades — passes through
@@ -133,7 +134,10 @@ project:
   its extra port is automatic the moment a deploy carries a valid token,
   not a separate removal step against the already-running job. Traefik's
   service goes back to pointing directly at the app container the moment
-  this new job spec is applied.
+  this new job spec is applied. **Exception:** if the claiming company is
+  on the free plan, the sidecar stays for the "hosted on Embarko" footer
+  — without the expiry banner, which needs `isOrphan`. See
+  `Footer-flag-req.md`.
 - From this point on the project behaves exactly like any other
   token-created project — no trace of having been orphaned.
 

@@ -125,7 +125,8 @@ history first).
   sidecar from before the flag existed — it answers 409
   `config_push_required` and the caller uses `POST .../config` with
   `isFreePlan` instead. Both `.../config` and `.../rename` now take
-  `isFreePlan` (optional, default false = previous behavior).
+  `isFreePlan` (optional, default false = previous behavior). Full
+  contract: `docs/Footer-flag-req.md`.
 - **`app-registry.js`** — a **stopgap** flat-JSON-file record of what
   each app last deployed with (`version`, `dbType`, `memory`,
   `deployedAt`). This exists only because this service has no real

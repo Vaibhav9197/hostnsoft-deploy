@@ -76,8 +76,10 @@ inspect` and health trusts `nomad job status`.
   apply) — `imageTag` keeps its `<app>:<version>` shape and the version
   names a directory. A missing version is the same `image_unavailable`
   404 with `retainCount`. `memoryMb`/`envVars` are ignored (nothing to
-  apply them to); a push always clears orphan routing, as the container
-  path drops the sidecar.
+  apply them to); a push always clears the orphan banner, as the container
+  path drops it. The footer follows the push's `isFreePlan`: free keeps
+  the `X-Embarko-Footer` header and the route through the shared proxy,
+  paid goes straight to the static server (see `Footer-flag-req.md`).
 - `DELETE /internal/apps/:app` — kind-agnostic: purges the Nomad job if
   any, removes the router file, then the static directory, then the data
   dir / saved spec / images exactly as before. It never needs to know
