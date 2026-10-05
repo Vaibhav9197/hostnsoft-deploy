@@ -114,6 +114,18 @@ history first).
   server app may be redeployed as a static site (its job is retired); a
   static site can NOT become a server app — refused with 422
   `app_kind_changed`. Four new required env vars — see `.env.example`.
+- **`footer-flag.js`** (added 2026-10-05) — switches a container app's
+  "hosted on Embarko" footer without a restart. Each app has a flag at
+  `$APP_DATA_ROOT/.footer/<app>/show` ("1"/"0"), written on every deploy,
+  config push and rename, removed on delete. The `orphan-proxy` sidecar
+  mounts that directory read-only and re-reads it every 5s
+  (`FOOTER_FLAG_FILE`). `POST /internal/apps/:appName/footer { show }`
+  (called by hostnsoft-api on a plan change) rewrites it; when the flag
+  alone can't take effect — static app, no sidecar to switch on, or a
+  sidecar from before the flag existed — it answers 409
+  `config_push_required` and the caller uses `POST .../config` with
+  `isFreePlan` instead. Both `.../config` and `.../rename` now take
+  `isFreePlan` (optional, default false = previous behavior).
 - **`app-registry.js`** — a **stopgap** flat-JSON-file record of what
   each app last deployed with (`version`, `dbType`, `memory`,
   `deployedAt`). This exists only because this service has no real

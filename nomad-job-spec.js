@@ -133,6 +133,13 @@ function projectEnvVarLines(envVars) {
 // those scripts pass to `docker build -t`.
 const ORPHAN_PROXY_IMAGE = 'orphan-banner-proxy:local';
 
+// Where the sidecar sees its app's footer flag directory (footerFlagDirFor
+// below, bind-mounted read-only). The sidecar re-reads FOOTER_FLAG_FILE
+// every few seconds, so a plan change flips the footer by rewriting one
+// file — no job change, no restart. See footer-flag.js.
+const FOOTER_FLAG_MOUNT = '/embarko-footer';
+const FOOTER_FLAG_FILE = `${FOOTER_FLAG_MOUNT}/show`;
+
 // ONE wildcard certificate for the whole apps zone, instead of one per app.
 //
 // Let's Encrypt allows 50 new certificates per REGISTERED DOMAIN per week.
@@ -290,13 +297,17 @@ function buildNomadJobSpec({
   const memoryLines = memoryResourceLines(taskMemory, schedulingFloorMb);
 
   const sidecarTask = showBanner ? `
-    # Only present for orphan (anonymous, unclaimed) deploys — see above.
+    # Only present for orphan and free-plan deploys — see above.
     task "orphan-proxy" {
       driver = "docker"
       config {
         image        = "${ORPHAN_PROXY_IMAGE}"
         network_mode = "host" # shares the host's network stack, needed to reach the app task's published port at all
         force_pull   = false  # built once by server-setup.sh, not per-deploy
+        # This app's footer flag only, read-only. A directory, not the file
+        # itself: the flag is replaced by rename, and a single-file bind
+        # mount would keep pointing at the old file.
+        volumes      = ["${footerFlagDirFor(appName)}:${FOOTER_FLAG_MOUNT}:ro"]
       }
       env {
         LISTEN_PORT       = "\${NOMAD_PORT_http}"
@@ -306,7 +317,9 @@ function buildNomadJobSpec({
         # is that same address (see this module's fail-fast check below).
         TARGET_HOST       = "${ORIGIN_IP}"
         TARGET_PORT       = "\${NOMAD_PORT_app}"
+        # Starting value only; FOOTER_FLAG_FILE overrides it once read.
         FOOTER            = "1"
+        FOOTER_FLAG_FILE  = "${FOOTER_FLAG_FILE}"
         BANNER_EXPIRES_AT = "${isOrphan ? orphanExpiresAt : ''}"
         BANNER_LOGIN_URL  = "${isOrphan ? orphanLoginUrl : ''}"
       }
@@ -481,3 +494,13 @@ function specPathFor(appName) {
   return `${appDataPathFor('.specs')}/${appName}.json`;
 }
 module.exports.specPathFor = specPathFor;
+
+// Host directory holding an app's footer flag (footer-flag.js writes it,
+// the sidecar reads it). Beside .specs and .snapshots rather than inside
+// the app's own data directory: that one is mounted read-write into the
+// app at /data, and an app must not be able to switch its own footer off.
+function footerFlagDirFor(appName) {
+  return `${appDataPathFor('.footer')}/${appName}`;
+}
+module.exports.footerFlagDirFor = footerFlagDirFor;
+module.exports.FOOTER_FLAG_FILE = FOOTER_FLAG_FILE;

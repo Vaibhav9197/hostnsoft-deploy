@@ -68,6 +68,7 @@ const {
   isStaticApp, staticAppDir, readManifest, updateManifest, staticAppIsServing,
 } = require('./static-site');
 const { writeStaticRouterFile, removeStaticRouterFile } = require('./traefik-router-file');
+const { writeFooterFlag, removeFooterFlag } = require('./footer-flag');
 
 const APP_NAME_PATTERN = /^[a-z0-9-]+$/;
 
@@ -342,7 +343,7 @@ async function renameApp(oldName, newName, config = {}) {
   const appVersion = imageTag.slice(imageTag.indexOf(':') + 1);
   const renamedImageTag = `${newName}:${appVersion}`;
 
-  const steps = { retagged: [], stopped: false, moved: false, newJobRan: false };
+  const steps = { retagged: [], stopped: false, moved: false, footerFlag: false, newJobRan: false };
 
   async function rollback(reason) {
     logger.error(`[${oldName}] Rename to "${newName}" failed (${reason}) — rolling back`);
@@ -350,6 +351,11 @@ async function renameApp(oldName, newName, config = {}) {
       await stopNomadJob(newName, { purge: true }).catch((e) =>
         logger.error(`[${newName}] Rollback: could not purge the new job: ${e.message}`)
       );
+    }
+    // The old name's flag was never touched, so the restarted old job
+    // finds it exactly as it was.
+    if (steps.footerFlag) {
+      await removeFooterFlag(newName).catch(() => { });
     }
     if (steps.moved) {
       await fs.move(newDataDir, oldDataDir, { overwrite: false }).catch((e) =>
@@ -428,7 +434,11 @@ async function renameApp(oldName, newName, config = {}) {
       schedulingFloorMb: config.schedulingFloorMb,
       customDomains: config.customDomains || [],
       envVars: config.envVars || [],
+      isFreePlan: config.isFreePlan === true,
     });
+    // Before the job runs: its sidecar mounts the flag's directory.
+    await writeFooterFlag(newName, config.isFreePlan === true);
+    steps.footerFlag = true;
     const nomadFilePath = `/tmp/platform-builds/${newName}-rename-${Date.now()}.nomad`;
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
@@ -481,6 +491,9 @@ async function renameApp(oldName, newName, config = {}) {
     await carrySnapshots(oldName, newName);
     await carryScaleToZeroEntry(oldName, newName);
     carryAnalyticsHistory(oldName, newName);
+    await removeFooterFlag(oldName).catch((e) =>
+      logger.warn(`[${oldName}] Could not remove the old footer flag: ${e.message}`)
+    );
 
     return { renamed: true, from: oldName, to: newName, imageTag: renamedImageTag, domain };
   } catch (error) {
@@ -558,6 +571,7 @@ async function renameStaticApp(oldName, newName, config = {}) {
       domain,
       customDomains: config.customDomains || [],
       isOrphan: false,
+      isFreePlan: config.isFreePlan === true,
       spa: !!manifest.spa,
     });
     steps.newRouter = true;

@@ -29,6 +29,7 @@
  */
 'use strict';
 
+const fs = require('fs');
 const http = require('http');
 const net = require('net');
 
@@ -47,11 +48,30 @@ const TARGET_PORT = process.env.TARGET_PORT;
 // neither source is proxied untouched, without a banner.
 const BANNER_EXPIRES_AT = process.env.BANNER_EXPIRES_AT;
 const BANNER_LOGIN_URL = process.env.BANNER_LOGIN_URL;
-// Footer: always injected for orphan AND free-plan apps. Sidecar: env
-// FOOTER=1; shared static instance: X-Embarko-Footer: 1 request header.
-// The expiry banner (header) is only injected when expiry/login are set,
-// i.e. only for orphan apps.
-const FOOTER_ALWAYS = process.env.FOOTER === '1';
+// Footer: injected for orphan AND free-plan apps. Shared static
+// instance: X-Embarko-Footer: 1 request header, per request. Sidecar:
+// starts from env FOOTER, then follows FOOTER_FLAG_FILE ("1" or "0"),
+// re-read every few seconds so a plan change switches the footer without
+// restarting anything (../footer-flag.js writes it). An unreadable or
+// unexpected value keeps the last known one: a file problem never flips
+// the footer. The expiry banner (header) is only injected when
+// expiry/login are set, i.e. only for orphan apps.
+const FOOTER_FLAG_FILE = process.env.FOOTER_FLAG_FILE;
+const FOOTER_POLL_MS = 5000;
+let footerOn = process.env.FOOTER === '1';
+
+function refreshFooterFlag() {
+  fs.readFile(FOOTER_FLAG_FILE, 'utf8', (err, text) => {
+    if (err) return;
+    const value = text.trim();
+    if (value === '1' || value === '0') footerOn = value === '1';
+  });
+}
+
+if (FOOTER_FLAG_FILE) {
+  refreshFooterFlag();
+  setInterval(refreshFooterFlag, FOOTER_POLL_MS).unref();
+}
 // Shown as "Join N+ apps live on Embarko" in the footer.
 const APPS_LIVE_COUNT = 1000;
 
@@ -305,7 +325,7 @@ function bannerConfigFor(req) {
   const expiresAt = req.headers['x-orphan-expires-at'] || BANNER_EXPIRES_AT;
   const loginUrl = req.headers['x-orphan-login-url'] || BANNER_LOGIN_URL;
   const orphan = !!(expiresAt && loginUrl);
-  const footer = FOOTER_ALWAYS || req.headers['x-embarko-footer'] === '1';
+  const footer = footerOn || req.headers['x-embarko-footer'] === '1';
   if (!orphan && !footer) return null;
   return { expiresAt: orphan ? String(expiresAt) : '', loginUrl: orphan ? String(loginUrl) : '' };
 }
@@ -382,8 +402,8 @@ server.on('upgrade', (req, clientSocket, head) => {
 });
 
 server.listen(Number(LISTEN_PORT), LISTEN_HOST, () => {
-  const mode = FOOTER_ALWAYS
-    ? 'banner from env (per-app sidecar)'
+  const mode = process.env.FOOTER === '1'
+    ? `banner from env (per-app sidecar), footer flag ${FOOTER_FLAG_FILE || 'not set'}`
     : 'banner from X-Orphan-* request headers (shared instance)';
   console.log(`[orphan-proxy] listening on ${LISTEN_HOST}:${LISTEN_PORT}, proxying to ${TARGET_HOST}:${TARGET_PORT} — ${mode}`);
 });

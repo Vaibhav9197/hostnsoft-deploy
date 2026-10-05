@@ -75,6 +75,7 @@ const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
 const { getNomadJob, stopNomadJob } = require('./nomad-job');
 const { renameApp, renameStaticApp } = require('./rename-app');
+const { writeFooterFlag, removeFooterFlag, footerSwitchState } = require('./footer-flag');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
 // asks Railpack whether an upload is a plain static site; if so it is
@@ -468,6 +469,10 @@ async function performBuildAndDeploy({
     // needs this to exist and be writable at container start.
     const appDataDir = await ensureAppDataDir(appName);
     logger.info(`[${appName}] Data directory ready at ${appDataDir}`);
+    // Same reason: the sidecar mounts the flag's directory at start.
+    // Written for every container app, sidecar or not, so a later
+    // POST .../footer always starts from the app's real state.
+    await writeFooterFlag(appName, claim.isOrphan || claim.isFreePlan);
 
     logger.info(`[${appName}] Generating Nomad file...`);
     const nomadJobSpec = buildNomadJobSpec({
@@ -1427,7 +1432,7 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
 // actually changed.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { imageTag, memoryMb, customDomains, envVars, deploymentId } = req.body || {};
+  const { imageTag, memoryMb, customDomains, envVars, deploymentId, isFreePlan } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -1445,6 +1450,14 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   if (envVars !== undefined && (!Array.isArray(envVars) || !envVars.every((v) => v && typeof v.key === 'string' && typeof v.value === 'string'))) {
     return res.status(400).json({ error: "envVars must be an array of {key, value} strings" });
   }
+  // Whether the company is on the free plan, i.e. whether the app keeps
+  // its "hosted on Embarko" footer. Without it, every push (custom domain,
+  // env vars, rollback) rebuilt the app without the footer. Optional so
+  // a hostnsoft-api that doesn't send it yet behaves exactly as before.
+  if (isFreePlan !== undefined && typeof isFreePlan !== 'boolean') {
+    return res.status(400).json({ error: "isFreePlan must be a boolean" });
+  }
+  const showFooter = isFreePlan === true;
 
   // imageTag is always "<appName>:<appVersion>" (see how it's built in
   // POST /apps above and stored as Deployment.imageTag in hostnsoft-api)
@@ -1486,7 +1499,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
       // rebuilt by this same endpoint without isOrphan.
       const manifest = await updateManifest(appName, { customDomains, isOrphan: false });
       await writeStaticRouterFile({
-        appName, domain, customDomains, isOrphan: false, spa: !!(manifest && manifest.spa),
+        appName, domain, customDomains, isOrphan: false, isFreePlan: showFooter, spa: !!(manifest && manifest.spa),
       });
     };
 
@@ -1549,6 +1562,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     schedulingFloorMb,
     customDomains,
     envVars: envVars || [],
+    isFreePlan: showFooter,
   });
 
   const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
@@ -1570,6 +1584,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     (async () => {
       try {
         await ensureAppDataDir(appName);
+        await writeFooterFlag(appName, showFooter);
         await fs.ensureDir(path.dirname(nomadFilePath));
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
@@ -1588,6 +1603,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
 
   try {
     await ensureAppDataDir(appName);
+    await writeFooterFlag(appName, showFooter);
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
@@ -1598,6 +1614,54 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   } catch (error) {
     logger.error(`[${appName}] Applying config update failed:`, error);
     res.status(500).json({ error: "Applying config update failed", details: error.message });
+  }
+});
+
+// Switches a container app's "hosted on Embarko" footer on or off without
+// touching its job: rewrites the flag its sidecar re-reads every few
+// seconds (footer-flag.js). Called by hostnsoft-api when a company's plan
+// changes.
+//
+// Only answers { applied: true } when visitors will actually see the
+// change. When the flag alone can't do it — a static app (its footer is a
+// router-file header), a job with no sidecar being switched ON, or a
+// sidecar from before the flag existed — it answers 409
+// config_push_required, and the caller sends the app's full config with
+// isFreePlan to POST .../config instead. The flag is written either way,
+// so it always matches the plan.
+app.post('/internal/apps/:appName/footer', express.json(), requireInternalSecret, async (req, res) => {
+  const { appName } = req.params;
+  const { show } = req.body || {};
+
+  if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
+    return res.status(400).json({ error: "Invalid app name" });
+  }
+  if (typeof show !== 'boolean') {
+    return res.status(400).json({ error: "show must be a boolean" });
+  }
+
+  try {
+    if (await isStaticApp(appName)) {
+      return res.status(409).json({ applied: false, code: 'config_push_required', kind: 'static' });
+    }
+
+    const state = await footerSwitchState(appName);
+    if (state === 'no_job') {
+      return res.status(404).json({ error: `No app named "${appName}" on this host`, code: 'app_not_found' });
+    }
+
+    await writeFooterFlag(appName, show);
+
+    // No sidecar means no footer, so switching it OFF is already done.
+    if (state === 'switchable' || (state === 'no_sidecar' && !show)) {
+      logger.info(`[${appName}] Footer ${show ? 'on' : 'off'} (flag only, no restart)`);
+      return res.json({ applied: true });
+    }
+    logger.info(`[${appName}] Footer ${show ? 'on' : 'off'} needs a config push (${state})`);
+    return res.status(409).json({ applied: false, code: 'config_push_required', kind: 'service' });
+  } catch (error) {
+    logger.error(`[${appName}] Switching the footer failed:`, error);
+    res.status(500).json({ error: "Switching the footer failed", details: error.message });
   }
 });
 
@@ -1627,7 +1691,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
  */
 app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { newName, imageTag, memoryMb, customDomains, envVars } = req.body || {};
+  const { newName, imageTag, memoryMb, customDomains, envVars, isFreePlan } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name", code: 'invalid_app_name' });
@@ -1641,6 +1705,10 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
   if (envVars !== undefined && (!Array.isArray(envVars) || !envVars.every((v) => v && typeof v.key === 'string' && typeof v.value === 'string'))) {
     return res.status(400).json({ error: "envVars must be an array of {key, value} strings", code: 'invalid_config' });
   }
+  // Same meaning and default as on the config endpoint above.
+  if (isFreePlan !== undefined && typeof isFreePlan !== 'boolean') {
+    return res.status(400).json({ error: "isFreePlan must be a boolean", code: 'invalid_config' });
+  }
 
   const taskMemory = typeof memoryMb === 'number' && memoryMb > 0 ? memoryMb : MEMORY_CEILING_MB;
 
@@ -1649,7 +1717,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
     // data dir to move (see renameStaticApp). imageTag/memory/envVars are
     // container concerns and are ignored on that path.
     const result = (await isStaticApp(appName))
-      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [] })
+      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [], isFreePlan: isFreePlan === true })
       : await renameApp(appName, newName, {
         imageTag,
         taskMemory,
@@ -1658,6 +1726,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
         schedulingFloorMb: SCHEDULING_FLOOR_MB,
         customDomains: customDomains || [],
         envVars: envVars || [],
+        isFreePlan: isFreePlan === true,
       });
 
     // The in-memory deploy state is keyed by app name, so carry it over
@@ -1746,6 +1815,9 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
       // a leftover directory is a disk-usage problem, not a reason to
       // fail a teardown that has otherwise completed.
       logger.warn(`[${appName}] Could not remove data directory ${appDataDir}: ${e.message}`);
+    });
+    await removeFooterFlag(appName).catch((e) => {
+      logger.warn(`[${appName}] Could not remove footer flag: ${e.message}`);
     });
 
     // idle-report.js saves a stopped app's Nomad job spec under
