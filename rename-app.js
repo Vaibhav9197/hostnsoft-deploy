@@ -62,6 +62,7 @@ const logger = require('./logger');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const scaleToZero = require('./scale-to-zero-registry');
+const { getNomadJob, stopNomadJob } = require('./nomad-job');
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const {
   isStaticApp, staticAppDir, readManifest, updateManifest, staticAppIsServing,
@@ -98,12 +99,13 @@ class RenameError extends Error {
  * only way to restart a stopped job — there is no `nomad job start`.
  */
 async function jobInspect(appName) {
-  try {
-    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
-    return { spec: JSON.parse(stdout), raw: stdout };
-  } catch {
-    return null; // not registered
-  }
+  // Exact lookup, not `nomad job inspect`: that resolves by prefix, so
+  // "pushpendra" came back as pushpendra-agrawal and a free name was
+  // reported as taken (see nomad-job.js). Wrapped the way inspect prints it.
+  const job = await getNomadJob(appName);
+  if (!job) return null; // not registered
+  const spec = { Job: job };
+  return { spec, raw: JSON.stringify(spec, null, 2) };
 }
 
 /**
@@ -345,7 +347,7 @@ async function renameApp(oldName, newName, config = {}) {
   async function rollback(reason) {
     logger.error(`[${oldName}] Rename to "${newName}" failed (${reason}) — rolling back`);
     if (steps.newJobRan) {
-      await execPromise(`nomad job stop -purge ${newName}`).catch((e) =>
+      await stopNomadJob(newName, { purge: true }).catch((e) =>
         logger.error(`[${newName}] Rollback: could not purge the new job: ${e.message}`)
       );
     }
@@ -398,7 +400,7 @@ async function renameApp(oldName, newName, config = {}) {
 
     // --- 2. Stop the old job. Not purged: its spec stays registered so
     // rollback can bring it straight back.
-    await execPromise(`nomad job stop ${oldName}`);
+    await stopNomadJob(oldName);
     steps.stopped = true;
     logger.info(`[${oldName}] Stopped, ready to move data`);
 
@@ -455,7 +457,7 @@ async function renameApp(oldName, newName, config = {}) {
     logger.info(`[${newName}] Certificate issued for ${domain}`);
 
     // --- 6. Point of no return. The old name goes away here.
-    await execPromise(`nomad job stop -purge ${oldName}`).catch((e) =>
+    await stopNomadJob(oldName, { purge: true }).catch((e) =>
       // Not fatal: the app is already live and certificated under the new
       // name, so failing the whole rename now would be worse than a
       // leftover stopped job. Loud, because it does need cleaning up.
@@ -534,7 +536,7 @@ async function renameStaticApp(oldName, newName, config = {}) {
     logger.error(`[${oldName}] Static rename to "${newName}" failed (${why}); rolling back`);
     if (steps.newRouter) await removeStaticRouterFile(newName).catch((e) => logger.error(`[${newName}] Rollback: could not remove new router file: ${e.message}`));
     if (steps.moved) {
-      await updateManifest(newName, { appName: oldName }).catch(() => {});
+      await updateManifest(newName, { appName: oldName }).catch(() => { });
       await fs.move(staticAppDir(newName), staticAppDir(oldName), { overwrite: false })
         .catch((e) => logger.error(`[${oldName}] Rollback FAILED moving the site directory back — fix by hand: ${e.message}`));
     }

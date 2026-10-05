@@ -20,6 +20,7 @@ const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const logger = require('./logger');
+const { getNomadJob } = require('./nomad-job');
 const { isStaticApp, staticAppIsServing } = require('./static-site');
 
 function parseJobStatus(stdout) {
@@ -67,8 +68,12 @@ async function getAppHealth(appName) {
     return (await staticAppIsServing(appName)) ? 'running' : 'unknown';
   }
 
+  // Exact lookup first: `nomad job status demo` with no job "demo"
+  // resolves by prefix and reports another app's health (see
+  // nomad-job.js). Once the exact ID is known to exist, the CLI picks it.
   let stdout;
   try {
+    if (!(await getNomadJob(appName))) return 'not_deployed';
     ({ stdout } = await execPromise(`nomad job status ${appName}`));
   } catch (e) {
     const output = `${e.stdout || ''}${e.stderr || ''}`;

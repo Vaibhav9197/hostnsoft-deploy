@@ -73,6 +73,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
+const { getNomadJob, stopNomadJob } = require('./nomad-job');
 const { renameApp, renameStaticApp } = require('./rename-app');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
@@ -314,17 +315,20 @@ async function saveJobSpec(appName) {
  * deploy should plainly bring the app back rather than silently no-op.
  */
 async function purgeIfNotRunning(appName) {
+  // Exact lookup: `nomad job inspect` would return a DIFFERENT dead job
+  // whose name merely starts with this one, and the purge below would
+  // then target it (see nomad-job.js).
   let status;
   try {
-    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
-    status = JSON.parse(stdout).Job;
-  } catch {
-    return; // not registered at all — nothing to purge, the run registers it
+    status = await getNomadJob(appName);
+  } catch (e) {
+    logger.warn(`[${appName}] Could not look up existing job (continuing): ${e.message}`);
+    return;
   }
   if (!status || (status.Status === 'running' && status.Stop !== true)) return;
 
   logger.info(`[${appName}] Existing job is ${status.Stop ? 'stopped' : status.Status} — purging before deploy`);
-  await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+  await stopNomadJob(appName, { purge: true }).catch((e) => {
     // Not fatal: the run below may still succeed (it will, whenever the
     // new spec actually differs). Failing the deploy here would turn a
     // recoverable case into an outage.
@@ -630,7 +634,7 @@ async function performStaticDeploy({
     // container on its next deploy.
     if (convertingFromService) {
       logger.info(`[${appName}] Retiring the server job now that the files are served directly.`);
-      await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+      await stopNomadJob(appName, { purge: true }).catch((e) => {
         logger.warn(`[${appName}] Could not purge the old Nomad job (continuing): ${e.message}`);
       });
       await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
@@ -1698,21 +1702,13 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
   }
 
   try {
-    await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
-      // A job that was never successfully deployed (e.g. an orphan whose
-      // build/deploy failed) has no Nomad job at all — treat "not found"
-      // as already-torn-down rather than an error. Nomad's actual message
-      // here is "No job(s) with prefix or id \"x\" found" (confirmed via
-      // Nomad's own CLI source/issue tracker) — it does NOT contain the
-      // substring "not found", so the previous check here never matched
-      // and this path silently fell through to `throw e` instead (caught
-      // by this function's own outer try/catch, surfaced as a 500 to
-      // hostnsoft-api rather than the "already torn down" success this
-      // comment always described). Found while adding the same
-      // not-found detection to app-health.js's GET .../status endpoint.
-      const output = `${e.stdout || ''}${e.stderr || ''}`;
-      if (!/no job\(s\) with prefix or id/i.test(output)) throw e;
-    });
+    // A job that was never successfully deployed (e.g. an orphan whose
+    // build/deploy failed) has no Nomad job at all, and a static app never
+    // has one — stopNomadJob treats that as already torn down. It looks
+    // the job up by exact ID first: a bare `nomad job stop -purge demo`
+    // with no job "demo" resolves by prefix to someone else's job (see
+    // nomad-job.js).
+    await stopNomadJob(appName, { purge: true });
 
     // A static app (static-site.js) has no job to purge; it has a Traefik
     // router file and a directory of files instead. Router first, so
