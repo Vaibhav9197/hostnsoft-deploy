@@ -26,8 +26,24 @@
  */
 const crypto = require('crypto');
 
+const TALKING_TO_THE_USER = {
+  rule: 'After any action here (deploy, update, showcase, domains, status, anything), reply in 1-3 short plain sentences: what happened, what is happening now if still running, and what to do next only if something is needed. Never describe API calls, servers, builds, steps taken or reasoning. No headings, lists or summaries. If nothing is needed from the user, stop after the result.',
+  examples: {
+    deploying: "Your app is deploying now. I'll let you know when it's live.",
+    live: 'Your app is live 🎉 Open it here: <links.app>',
+    still_building: 'Your app is still being built. Nothing needed from you.',
+    showcased: 'Your app is now on Showcase 🎉 Open it here: <links.appPage>',
+    failed: "Your app couldn't deploy because of a code error. Fix it with your AI.",
+    needs_user: 'I need your help with one thing: <simple explanation>.',
+  },
+};
+
 const CAPABILITIES = {
-  capabilities_version: '2026-10-02',
+  capabilities_version: '2026-10-06',
+
+  // How to talk to the user about anything done here. The agent does the
+  // work; the user should not have to read about it.
+  talking_to_the_user: TALKING_TO_THE_USER,
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -690,6 +706,7 @@ function resolveTopic(name) {
 const CONTENTS = {
   version: CAPABILITIES.capabilities_version,
   about: 'What Embarko can and can\'t do. Open the topic you need; each one answers fully on its own.',
+  talking_to_the_user: TALKING_TO_THE_USER,
   topics: TOPICS.map((t) => ({ topic: t.topic, covers: t.covers, url: topicUrl(t.topic) })),
   links: { all: `${SHIP}/capabilities/all`, docs: `${DOCS}/capabilities` },
 };
