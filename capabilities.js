@@ -604,7 +604,7 @@ const TOPICS = [
         description: "<what it does>",             // page body; plain searchable words, features and use cases, up to 4000 chars
         story: "<why they built it>",              // the problem it solves, in their words, up to 600 chars
         creatorProfile: "<https-profile-url>",     // links the author; e.g. GitHub, X, LinkedIn or personal site
-        contributorEmails: ["<email>", "<email>"], // opt-in — everyone who built the app; the FIRST is the person showcasing it and the main contact. "Contact Dev" mails all of them. Ask as its own question, the token email is not consent
+        contributorEmails: ["<email>", "<email>"], // opt-in — everyone who built the app; the FIRST is the person showcasing it and the main contact. "Contact Dev" mails all of them; anyone without an Embarko account is mailed an invite, and those who sign up are credited by name on the app page. Ask as its own question, the token email is not consent
         builtWith: "<tool used to build the app>", // e.g. Claude, Codex, Cursor, Lovable, Replit, or another tool
         category: "<closest category>",            // e.g. AI Tool, Personal, Business, Productivity, Education, Game, Developer Tool
         tags: ["<search-term>", "<search-term>"],  // max 8 — lowercase slugs people would search for, not the category again; normalized to "landing-page" form
