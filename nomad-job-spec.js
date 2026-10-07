@@ -310,9 +310,12 @@ function buildNomadJobSpec({
         BANNER_EXPIRES_AT = "${isOrphan ? orphanExpiresAt : ''}"
         BANNER_LOGIN_URL  = "${isOrphan ? orphanLoginUrl : ''}"
       }
+      # Small at idle; memory_max covers bursts, since the proxy buffers
+      # each HTML response in full to inject the footer.
       resources {
-        cpu    = 50
-        memory = 64
+        cpu        = 20
+        memory     = 32
+        memory_max = 128
       }
     }` : '';
 
