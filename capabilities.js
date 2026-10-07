@@ -35,7 +35,9 @@ const TALKING_TO_THE_USER = {
     showcased: 'Your app is now on Showcase 🎉 Open it here: <links.appPage>',
     failed: "Your app couldn't deploy because of a code error. Fix it with your AI.",
     needs_user: 'I need your help with one thing: <simple explanation>.',
+    missing_env_vars: 'Your app needs some API keys or secrets before it can run. Add them here: <links.secretsPage>',
   },
+  env_vars: 'When API keys or secrets are missing, say so in one line and put the app\'s secrets page link in the reply. Name the keys only if you know them, never a value. Say nothing about this when none are needed.',
 };
 
 const CAPABILITIES = {
@@ -495,6 +497,7 @@ const TOPICS = [
       'GET links.list shows which keys are set.',
       'PUT links.setOne with {"value": "...", "apply": true} sets one key and applies it straight away. PUT links.list with {"vars": [{"key", "value"}], "apply": true} sets several (a merge).',
       'Without "apply": true, a write only stores the value: POST links.apply (or redeploy) to make the running app see it.',
+      'When the user must add or change values themselves, give them links.secretsPage (replace <project-id> with the id from GET links.app).',
     ],
     limits: [
       'Keys match ^[A-Za-z_][A-Za-z0-9_]*$.',
@@ -506,6 +509,8 @@ const TOPICS = [
       list: `${AGENT_API}/env-vars`,
       setOne: `${AGENT_API}/env-vars/<KEY>`,
       apply: `${AGENT_API}/env-vars/apply`,
+      app: AGENT_API,
+      secretsPage: 'https://embarko.ai/app/projects/<project-id>/environment',
       claim: topicUrl('claim'),
       docs: `${DOCS}/api#env-vars`,
     },
