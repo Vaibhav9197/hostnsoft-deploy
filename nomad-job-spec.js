@@ -324,6 +324,20 @@ job "${appName}" {
   datacenters = ["dc1"]
   type        = "service"
 
+  # Rolling update: the new allocation is placed (on its own dynamic
+  # port) and must be healthy before the old one is stopped, so a config
+  # push — e.g. the free<->paid plan change that adds/removes the footer
+  # sidecar — is not a visible outage. Both allocs briefly share /data.
+  update {
+    max_parallel     = 1
+    canary           = 1
+    auto_promote     = true
+    auto_revert      = true
+    health_check     = "task_states"
+    min_healthy_time = "5s"
+    healthy_deadline = "3m"
+  }
+
   group "web" {
     network {
       port "http" {}${sidecarNetworkPort}

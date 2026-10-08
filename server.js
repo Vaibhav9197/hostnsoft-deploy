@@ -1427,7 +1427,7 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
 // actually changed.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { imageTag, memoryMb, customDomains, envVars, deploymentId } = req.body || {};
+  const { imageTag, memoryMb, customDomains, envVars, deploymentId, isFreePlan = false } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -1486,7 +1486,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
       // rebuilt by this same endpoint without isOrphan.
       const manifest = await updateManifest(appName, { customDomains, isOrphan: false });
       await writeStaticRouterFile({
-        appName, domain, customDomains, isOrphan: false, spa: !!(manifest && manifest.spa),
+        appName, domain, customDomains, isOrphan: false, isFreePlan: !!isFreePlan, spa: !!(manifest && manifest.spa),
       });
     };
 
@@ -1549,6 +1549,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     schedulingFloorMb,
     customDomains,
     envVars: envVars || [],
+    isFreePlan: !!isFreePlan,
   });
 
   const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
@@ -1627,7 +1628,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
  */
 app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { newName, imageTag, memoryMb, customDomains, envVars } = req.body || {};
+  const { newName, imageTag, memoryMb, customDomains, envVars, isFreePlan = false } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name", code: 'invalid_app_name' });
@@ -1649,7 +1650,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
     // data dir to move (see renameStaticApp). imageTag/memory/envVars are
     // container concerns and are ignored on that path.
     const result = (await isStaticApp(appName))
-      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [] })
+      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [], isFreePlan: !!isFreePlan })
       : await renameApp(appName, newName, {
         imageTag,
         taskMemory,
@@ -1658,6 +1659,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
         schedulingFloorMb: SCHEDULING_FLOOR_MB,
         customDomains: customDomains || [],
         envVars: envVars || [],
+        isFreePlan: !!isFreePlan,
       });
 
     // The in-memory deploy state is keyed by app name, so carry it over
