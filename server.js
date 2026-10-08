@@ -62,7 +62,7 @@ const { claimProject } = require('./claim-project');
 // deploy as the logged-in person instead of making them mint a
 // company-wide deploy token first. One module reads whichever credential
 // came in and packages it for the hostnsoft-api calls below.
-const { readDeployCredential, isIdentified } = require('./deploy-credential');
+const { readDeployCredential } = require('./deploy-credential');
 
 // NEW: shared Nomad job spec builder — see docs/Customdomain-req.md. Used
 // here after a fresh build, and by the /internal/apps/:appName/config
@@ -362,28 +362,26 @@ async function ensureAppDataDir(appName) {
 // Shared tail of every background deploy, container or static: reports
 // the outcome to hostnsoft-api so its dashboard deployment history is
 // actually populated, and to this process's own deploy-status.js.
-// Skipped for anonymous deploys — see docs/Anonymous-deploy-req.md's
-// "out of scope": there's no company to attribute history to
-// until/unless the project is claimed. deploymentId (from the
-// in_progress call in the request handler) updates that same row in
-// place rather than creating a second one for this attempt. `kind`
+// Anonymous deploys are reported too (since 2026-10-08): the recorded
+// image tag is what lets the claim link keep the app without a rebuild
+// — see record-deployment.js. deploymentId (from the in_progress call
+// in the request handler) updates that same row in place rather than
+// creating a second one for this attempt. `kind`
 // ("static" | "service") is what hostnsoft-api persists as
 // Project.kind — reported only here, on success, because that is
 // the first moment the app's kind on this host is actually settled
 // (a failed static publish is undone, see performStaticDeploy).
 async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind }) {
-  if (isIdentified(credential)) {
-    await recordDeployment({
-      credential,
-      projectSlug: appName,
-      appVersion,
-      status: 'success',
-      imageTag: imageName,
-      memoryMb: taskMemory,
-      deploymentId,
-      kind,
-    });
-  }
+  await recordDeployment({
+    credential,
+    projectSlug: appName,
+    appVersion,
+    status: 'success',
+    imageTag: imageName,
+    memoryMb: taskMemory,
+    deploymentId,
+    kind,
+  });
   setDeployState(appName, {
     status: 'success',
     finishedAt: new Date().toISOString(),
@@ -417,16 +415,14 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
   await fs.remove(buildDir).catch(() => { });
   await fs.remove(filePath).catch(() => { });
 
-  if (isIdentified(credential)) {
-    await recordDeployment({
-      credential,
-      projectSlug: appName,
-      appVersion,
-      status: 'failed',
-      errorDetail,
-      deploymentId,
-    });
-  }
+  await recordDeployment({
+    credential,
+    projectSlug: appName,
+    appVersion,
+    status: 'failed',
+    errorDetail,
+    deploymentId,
+  });
   setDeployState(appName, {
     status: 'failed',
     finishedAt: new Date().toISOString(),
@@ -1058,18 +1054,16 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     // the upload was accepted, not wait out the whole build inline.
     // Progress is tracked via deploy-status.js (see GET
     // /apps/:appName/status, whose URL is included in the response
-    // below) and, for token-authenticated deploys, mirrored into
-    // hostnsoft-api's own deployment history too.
-    let deploymentId = null;
-    if (isIdentified(credential)) {
-      deploymentId = await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'in_progress',
-        agentName: agentName || undefined,
-      });
-    }
+    // below) and mirrored into hostnsoft-api's own deployment history —
+    // for anonymous deploys too, since that record is what the claim
+    // link's no-rebuild re-push runs from (see record-deployment.js).
+    const deploymentId = await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'in_progress',
+      agentName: agentName || undefined,
+    });
     setDeployState(appName, {
       status: 'in_progress',
       appVersion,
@@ -1086,6 +1080,12 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       claimed: !claim.isOrphan,
       claimedNow: !!claim.claimedNow,
       expiresAt: claim.orphanExpiresAt,
+      // Only on the deploy that created a temporary app — see
+      // claim-project.js. This reply is the one place the link appears.
+      claimUrl: claim.claimUrl,
+      // hostnsoft-api's id for this attempt (null if recording failed),
+      // for support and the dashboard's history; not needed to proceed.
+      deploymentId,
       convertingFromService,
     };
 
@@ -1165,16 +1165,14 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     await fs.remove(buildDir).catch(() => { });
     await discardUpload();
 
-    if (isIdentified(credential)) {
-      await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'failed',
-        errorDetail: error.message,
-        agentName: agentName || undefined,
-      });
-    }
+    await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'failed',
+      errorDetail: error.message,
+      agentName: agentName || undefined,
+    });
 
     res.status(500).json(errorBody({
       host, appName, appExists: true,

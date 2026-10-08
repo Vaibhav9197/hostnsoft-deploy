@@ -62,6 +62,21 @@ it's claimed or expires.
 > were removed. See `hostnsoft-deploy/deploy-response.js`. The rest of this
 > doc (TTL, banner, cleanup, claiming by redeploy) still holds.
 
+> **Claim link added 2026-10-08.** The deploy that creates an orphan now
+> also answers with `links.claim`: a link to the dashboard's `/claim` page
+> carrying the app name and a one-time code (32 random bytes, stored only
+> as a SHA-256 hash in `Project.claimCodeHash`). The user opens it, signs
+> in or signs up, picks a workspace, and
+> `POST /companies/:companyId/orphans/claim {appName, code}` moves the
+> project into that company and re-pushes the running image without the
+> banner (`applyCurrentConfig`, no rebuild). Redeploying the same name with
+> a token still claims too, as the fallback. To make the no-rebuild push
+> possible, anonymous deploys are now recorded in deployment history
+> (`triggeredBy: "anonymous"`), which supersedes the first bullet under
+> "out of scope" below. The code is returned once, on the creating deploy
+> only — an anonymous redeploy of an orphan gets no new one, so knowing an
+> app's name is never enough to claim it.
+
 ### 4. Deploy response for an anonymous deploy
 
 The success response gets one additional field, `orphan`, alongside the
@@ -182,11 +197,13 @@ projects created after the change, not ones already given an expiry.
 
 ## Explicitly out of scope for this change
 
-- No deployment-history recording (`/internal/deployments/record`) for
-  anonymous deploys — there's no company to attribute the history to
-  until/unless the project is claimed. Once claimed, history starts
-  accumulating normally from that point forward; nothing is
-  retroactively backfilled for the anonymous period.
+- ~~No deployment-history recording (`/internal/deployments/record`) for
+  anonymous deploys.~~ **Changed 2026-10-08:** anonymous deploys are
+  recorded against the orphan project (`triggeredBy: "anonymous"`,
+  `source: "agent"`), because the claim link's no-rebuild re-push needs
+  the running image's tag. The rows are deleted with the project if it
+  expires (the existing cascade), so an unclaimed orphan leaves nothing
+  behind.
 - No rate limiting on anonymous deploys — a known gap, not solved here,
   consistent with other unrated internal endpoints already flagged
   elsewhere in this codebase.
