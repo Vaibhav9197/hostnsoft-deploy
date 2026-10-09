@@ -242,10 +242,19 @@ async function regenerateRouters() {
     }
   }
 
-  // No routers at all still writes a valid document: an empty `routers:`
-  // key would be invalid YAML for Traefik to parse, and leaving a stale
-  // file behind would keep routing removed apps at the activator.
-  if (count === 0) lines.push('    {}');
+  // No routers at all still writes a file, so a stale one never lingers
+  // and keeps routing removed apps at the activator — but it must NOT
+  // contain an `http:` block. Traefik rejects `routers: {}` ("routers
+  // cannot be a standalone element"), and one bad file in the dynamic
+  // directory drops EVERY file in it, platform.yml included: shipyard and
+  // api-service become 404 until the file is fixed. Seen 2026-09-30 on
+  // the local VM. A comment-only file parses cleanly.
+  if (count === 0) {
+    lines.splice(-2, 2,
+      '# No app is opted into scale-to-zero right now, so there is nothing',
+      '# to route. Deliberately no `http:` block: Traefik rejects an empty',
+      '# routers map and takes every other file in this directory with it.');
+  }
 
   await fs.ensureDir(TRAEFIK_DYNAMIC_DIR);
   const tmp = `${ROUTER_FILE}.tmp`;
