@@ -90,7 +90,7 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
 
   let next = kind === 'static'
     ? `Static site, no build needed: check links.status in ${poll} seconds.`
-    : `Building: poll links.status every ${poll} seconds until it says "live" or "failed".`;
+    : `Building: poll links.status every ${poll} seconds until it says "live", "failed" or "crashed".`;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
   if (convertingFromService) {
     next = `This replaces the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
