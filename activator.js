@@ -24,6 +24,7 @@ const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-s
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { allApps, hostnamesFor } = require('./scale-to-zero-registry');
 const { isBotRequest } = require('./analytics/bot-filter');
+const { isSqliteFile, manifestEntryProblem } = require('./sqlite-data-check');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
@@ -122,7 +123,8 @@ async function jobIsRunning(appName) {
  * BEFORE the start: an app that wakes to a missing database does not
  * crash, it creates a fresh one and reports itself healthy, and by then it
  * is writing over the evidence. Sizes, not checksums — the files are
- * quiescent between stop and wake.
+ * quiescent between stop and wake, except for the one writer that is
+ * allowed to touch them: see manifestEntryProblem in sqlite-data-check.js.
  */
 async function verifyDataAgainstManifest(appName) {
   const manifestPath = `${appDataPathFor('.snapshots')}/${appName}/latest-manifest.json`;
@@ -160,18 +162,36 @@ async function verifyDataAgainstManifest(appName) {
     actual.set(full.slice(dataDir.length + 1), stat.size);
   }
 
-  const problems = [];
+  // Which manifest entries are SQLite databases, judged by the file on
+  // disk now (the manifest records only sizes, and older manifests have
+  // nothing else to go on). Litestream's own `.<db>-litestream/` state
+  // directories are dot-dirs it creates next to the database; they are
+  // never in a manifest and only show up as "extra" below.
+  const sqliteMains = new Set();
   for (const f of manifest.files) {
-    if (!actual.has(f.path)) {
-      problems.push(`missing: ${f.path} (was ${f.bytes} bytes)`);
+    if (actual.has(f.path) && (await isSqliteFile(`${dataDir}/${f.path}`))) sqliteMains.add(f.path);
+  }
+
+  const problems = [];
+  const checkpointed = [];
+  for (const f of manifest.files) {
+    const problem = manifestEntryProblem(f, actual, sqliteMains);
+    if (problem) {
+      problems.push(problem);
     } else if (actual.get(f.path) !== f.bytes) {
-      problems.push(`size changed: ${f.path} ${f.bytes} -> ${actual.get(f.path)}`);
+      checkpointed.push(`${f.path} ${f.bytes} -> ${actual.has(f.path) ? actual.get(f.path) : 'gone'}`);
     }
+  }
+  if (checkpointed.length > 0) {
+    log(`${appName}: sqlite checkpoint since stop, allowed: ${checkpointed.join('; ')}`);
   }
   // Extra files are reported but are NOT a failure on their own: nothing
   // here deletes, and a stray file cannot destroy data the way a missing
   // or truncated one can.
   for (const p of actual.keys()) {
+    // Litestream keeps its own state in `.<db>-litestream/` next to each
+    // database. Expected, and not worth a line per wake.
+    if (/(^|\/)\.[^/]*-litestream\//.test(p)) continue;
     if (!manifest.files.some((f) => f.path === p)) log(`${appName}: note — extra file not in manifest: ${p}`);
   }
 
