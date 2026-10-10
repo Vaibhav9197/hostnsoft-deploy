@@ -428,6 +428,7 @@ async function renameApp(oldName, newName, config = {}) {
       schedulingFloorMb: config.schedulingFloorMb,
       customDomains: config.customDomains || [],
       envVars: config.envVars || [],
+      isFreePlan: !!config.isFreePlan,
     });
     const nomadFilePath = `/tmp/platform-builds/${newName}-rename-${Date.now()}.nomad`;
     await fs.ensureDir(path.dirname(nomadFilePath));
@@ -558,6 +559,7 @@ async function renameStaticApp(oldName, newName, config = {}) {
       domain,
       customDomains: config.customDomains || [],
       isOrphan: false,
+      isFreePlan: !!config.isFreePlan,
       spa: !!manifest.spa,
     });
     steps.newRouter = true;
