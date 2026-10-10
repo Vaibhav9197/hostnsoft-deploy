@@ -1,0 +1,22 @@
+name: Deploy prod
+
+on:
+  push:
+    branches:
+      - prod
+  workflow_dispatch:
+
+# One deploy at a time across both repos. A second push waits
+# for the running deploy to finish instead of overlapping it.
+concurrency:
+  group: hostnsoft-prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Redeploy deploy-service
+    runs-on: [self-hosted, prod-deploy]
+    timeout-minutes: 20
+    steps:
+      - name: Redeploy deploy-service
+        run: bash /home/ubuntu/Server-setup/redeploy.sh prod deploy-service
