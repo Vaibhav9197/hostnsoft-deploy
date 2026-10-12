@@ -25,7 +25,7 @@ const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
-const { allApps } = require('./scale-to-zero-registry');
+const { allApps, hostnamesFor, regenerateRouters, ROUTER_FILE } = require('./scale-to-zero-registry');
 
 // `node idle-report.js | head -3` closes stdout mid-write; without this
 // Node throws an unhandled EPIPE and the run looks like a crash.
@@ -350,6 +350,19 @@ async function pruneSnapshots(snapshotRoot) {
   }
 }
 
+// The hostnames of this app that scale-to-zero.yml has no wake router for,
+// after rewriting it. Empty means every hostname is covered.
+async function hostsWithoutWakeRouter(appName) {
+  await regenerateRouters();
+  const routers = await fsp.readFile(ROUTER_FILE, 'utf8');
+  const hosts = await hostnamesFor(appName);
+  if (hosts.length === 0) return [`${appName} (no hostnames known)`];
+  // Traefik's Host() takes backticks; a constant rather than an escape
+  // inside a template literal (see BT in scale-to-zero-registry.js).
+  const BT = String.fromCharCode(96);
+  return hosts.filter((h) => !routers.includes(`Host(${BT}${h}${BT})`));
+}
+
 async function stopApp(appName) {
   // Belt and braces on top of the caller's own check: this function is
   // the one that shells out, so it re-asserts the rail itself rather
@@ -502,6 +515,18 @@ async function main() {
       console.log(`  job spec saved -> ${specPath}`);
     } catch (e) {
       console.log(`  ABORT — ${e.message}; refusing to stop an app we may not be able to restart`);
+      continue;
+    }
+
+    // Also fatal to the stop: once stopped, the app's own router is gone
+    // and only a wake router reaches it. Without one every request 404s
+    // (daily-mandala, 2026-10-11). Rewritten here from the spec just saved,
+    // then checked rather than trusted.
+    try {
+      const missing = await hostsWithoutWakeRouter(row.appName);
+      if (missing.length > 0) throw new Error(`no wake router for ${missing.join(', ')}`);
+    } catch (e) {
+      console.log(`  ABORT — ${e.message}; refusing to stop an app nothing would wake`);
       continue;
     }
 

@@ -275,6 +275,13 @@ const upload = multer({ dest: '/tmp/platform-uploads/' });
  * failure here costs the ability to scale that app to zero, which is an
  * opt-in feature. Failing the deploy over it would trade a working
  * deployment for a missing optional file.
+ *
+ * The wake routers are rewritten here too, from the spec just saved. In
+ * universal mode every running app is eligible to be stopped, but the
+ * router file was only rewritten on opt-in/out, rename, delete and a
+ * platform redeploy — so an app first deployed after the last redeploy
+ * was stopped with no wake router and 404'd until the next one
+ * (daily-mandala, 2026-10-11). Same for a custom domain added here.
  */
 async function saveJobSpec(appName) {
   try {
@@ -289,6 +296,9 @@ async function saveJobSpec(appName) {
   } catch (e) {
     logger.warn(`[${appName}] Could not save Nomad job spec (scale-to-zero wake would fail): ${e.message}`);
   }
+  await scaleToZero.regenerateRouters().catch((e) => {
+    logger.warn(`[${appName}] Could not rewrite scale-to-zero wake routers (continuing): ${e.message}`);
+  });
 }
 
 /**
