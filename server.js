@@ -347,6 +347,33 @@ async function purgeIfNotRunning(appName) {
 }
 
 
+// `railpack build` can exit 0 without leaving a tagged image behind — a
+// production incident did exactly that (docs/CLAUDE.md, "The still-open
+// production mystery"), and trusting the exit code alone let the deploy
+// carry on to `nomad job run`, where the allocation died pulling an
+// image that was never there. That failure surfaced far from the build
+// log that could have explained it. So the image is asked for directly,
+// here, and a miss is a build failure like any other: the thrown error
+// lands in finishDeployFailure, and the railpack output captured just
+// before this runs stays retrievable via GET /apps/:appName/logs (a
+// plain Error carries no stdout/stderr, so setBuildLog there is a no-op
+// and does not overwrite it).
+async function assertImageExists(appName, imageName) {
+  try {
+    // --format keeps the output to the image ID; the default is the full
+    // inspect JSON, which is large and not needed here.
+    await execPromise(`docker image inspect --format '{{.Id}}' ${imageName}`);
+  } catch (e) {
+    const detail = (e.stderr || e.message || '').trim();
+    throw new Error(
+      `Railpack reported success but no Docker image named "${imageName}" exists, so there is nothing to deploy. ` +
+      `The build did not produce an image; check the build log (GET /apps/${appName}/logs) for what railpack actually did.` +
+      (detail ? `\n\ndocker image inspect: ${detail}` : '')
+    );
+  }
+  logger.info(`[${appName}] Verified image ${imageName} exists.`);
+}
+
 // Creates this app's host data directory before Nomad is asked to bind
 // mount it. Docker would otherwise create a missing bind-mount source
 // itself, but as root and mode 0755 — and Railpack images do not
@@ -473,6 +500,12 @@ async function performBuildAndDeploy({
       { maxBuffer: BUILD_OUTPUT_MAX_BUFFER },
     );
     setBuildLog(appName, buildResult);
+
+    // Exit code 0 above is not proof an image exists — see
+    // assertImageExists. Checked BEFORE anything downstream is touched
+    // (data dir, purgeIfNotRunning, Nomad), so a build that produced
+    // nothing leaves the currently running version of the app alone.
+    await assertImageExists(appName, imageName);
 
     // Before the job spec is applied, not after — Nomad's bind mount
     // needs this to exist and be writable at container start.

@@ -157,11 +157,14 @@ separate future task — this is the right place to fix them.
 
 A prior incident (`railpack build` exiting successfully but producing no
 Docker image) was investigated but never fully root-caused — a retry
-happened to succeed before deeper diagnosis. **Still recommended and not
-yet implemented**: after the Railpack build step, explicitly verify the
-image exists (`docker image inspect <imageName>`) and throw a real error
-if it doesn't, rather than trusting the build command's exit code alone.
-See the session log for the full investigation trail.
+happened to succeed before deeper diagnosis. The deploy service no longer
+trusts the build's exit code alone: `assertImageExists` in `server.js`
+runs `docker image inspect <imageName>` right after the Railpack step and
+fails the deploy with a stated cause if the image is missing, before the
+data directory, `purgeIfNotRunning` or Nomad are touched. The root cause
+of railpack exiting 0 without an image is still unknown; if it recurs, the
+failed deployment's `errorDetail` plus `GET /apps/:appName/logs` (the
+captured railpack output) are now the place to start.
 
 ## Also part of this repo (if applicable — confirm)
 
