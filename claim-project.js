@@ -116,6 +116,13 @@ async function claimProject(credential, slug, appType) {
     orphanExpiresAt: body.orphanExpiresAt || null,
     orphanMessage: body.orphanMessage || null,
     orphanLoginUrl: body.orphanLoginUrl || null,
+    // The keep-this-app link, present only on the deploy that CREATED an
+    // orphan: it carries a one-time code hostnsoft-api minted with the
+    // project (its lib/orphanClaim.ts), so an anonymous redeploy of the
+    // same name gets none. server.js relays it as links.claim in the
+    // deploy reply, and nowhere else — status and logs need no
+    // credential, so a link there would hand the app to anyone.
+    claimUrl: body.claimUrl || null,
     isFreePlan: !!body.isFreePlan,
   };
 }

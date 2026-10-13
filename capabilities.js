@@ -170,7 +170,10 @@ const CAPABILITIES = {
     supported: true,
     expires_after_hours: 24,
     on_expiry: 'deleted',
-    claims_by: 'redeploy_with_credential',
+    // claim_link: the deploy reply's links.claim — the user opens it and
+    // signs in, nothing is redeployed. redeploy_with_credential: the
+    // fallback when that link is gone. See the "claim" topic.
+    claims_by: ['claim_link', 'redeploy_with_credential'],
   },
 
   // What survives what. `survives_node_loss: false` is the single most
@@ -445,25 +448,28 @@ const TOPICS = [
   },
   {
     topic: 'claim',
-    covers: 'Temporary apps, the 24-hour deletion, and getting a deploy token to keep them',
+    covers: 'Temporary apps, the 24-hour deletion, and the claim link (or a deploy token) that keeps them',
     available: true,
     who: ['agent', 'dashboard'],
-    needsHuman: 'The user reads the token from their email and pastes it back.',
-    summary: `An app deployed without a token is live but temporary: it is deleted ${CAPABILITIES.anonymous_deploy.expires_after_hours} hours after it was first deployed unless claimed. The exact time is app.expiresAt in the status reply. Claiming makes it permanent at the same URL.`,
+    needsHuman: 'The user opens the claim link and signs in. Fallback: they read a token from their email and paste it back.',
+    summary: `An app deployed without a token is live but temporary: it is deleted ${CAPABILITIES.anonymous_deploy.expires_after_hours} hours after it was first deployed unless claimed. The exact time is app.expiresAt. Claiming makes it permanent at the same URL. The deploy that created the app answered with links.claim: a link only its deployer has, which keeps the app once they open it and sign in. No redeploy, no source code.`,
     how: [
-      `Check for a token first: the ${CAPABILITIES.credentials.env_var} environment variable, then ${CAPABILITIES.credentials.file}. If one exists, just redeploy the same app name with it.`,
+      'Give the user links.claim from the deploy reply and ask them to open it and sign in (an account is created if they have none). Once they confirm, the app is permanent: nothing more to do, and no token needed for that.',
+      'The link is in the deploy reply only, never in a status reply. If you no longer have it, claim by redeploying instead, below.',
+      `Fallback, redeploy with a token. Check for one first: the ${CAPABILITIES.credentials.env_var} environment variable, then ${CAPABILITIES.credentials.file}. If one exists, redeploy the same app name with it.`,
       'Otherwise ask the user for their email and POST {"email": "<their email>"} to links.requestToken. It always answers 202; the token is emailed, never returned. An account is created if they don\'t have one.',
       `Ask the user to paste the token back. Save it to ${CAPABILITIES.credentials.file} so you never ask again.`,
       'Redeploy with the same X-App-Name and the header Authorization: Bearer <token>. The reply says the app is now permanent.',
-      'From then on send the same Authorization header on links.status and links.logs too: once claimed, the app is only visible to its owner, and a bare request gets a 404.',
+      'Once claimed either way, later deploys of that name need the owner\'s token: an anonymous redeploy of a claimed name is a 409. Send the same Authorization header on links.status and links.logs too; a bare request gets a 404.',
     ],
     limits: [
       'There is no reminder email: tell the user the deletion time yourself.',
+      'The claim link works once, only until the deadline, and is shown only in the deploy reply that created the app.',
       'Token requests are rate limited: 5 per email per hour.',
       `Tokens don't expire and are scoped to one ${CAPABILITIES.credentials.scoped_to}.`,
       'Never send an empty or made-up token: that is a 401, not a temporary deploy.',
     ],
-    next: 'If the app is temporary, tell the user when it will be deleted, then ask for their email to claim it.',
+    next: 'If the app is temporary, tell the user when it will be deleted and give them links.claim to open and sign in. Ask for their email only if that link is gone.',
     links: { requestToken: `${SHIP}/api/public/deploy-tokens/request`, dashboard: 'https://embarko.ai/app/tokens', docs: `${DOCS}/capabilities#anonymous` },
   },
   {

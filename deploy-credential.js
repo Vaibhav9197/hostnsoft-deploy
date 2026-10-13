@@ -89,11 +89,4 @@ function credentialHeaders(credential) {
     : {};
 }
 
-// True for anything that identifies a company — i.e. everything except
-// anonymous. Gates deployment-history recording, which has no company to
-// attribute an anonymous deploy to (docs/Anonymous-deploy-req.md).
-function isIdentified(credential) {
-  return credential !== null;
-}
-
-module.exports = { readDeployCredential, credentialBody, credentialHeaders, isIdentified };
+module.exports = { readDeployCredential, credentialBody, credentialHeaders };
