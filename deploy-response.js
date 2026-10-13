@@ -25,6 +25,14 @@
  * The flow this steers an agent through: deploy -> confirm it is live ->
  * claim it (an anonymous deploy, the usual first-time case, is deleted
  * after 24h) -> offer the showcase. Feedback is always one link away.
+ *
+ * Claiming: the deploy that creates a temporary app answers with
+ * links.claim, a link to the dashboard carrying a one-time code. The
+ * user opens it and signs in; nothing is redeployed. It appears in that
+ * reply only — status replies need no credential, so one there would
+ * hand the app to whoever asked — which is why the status reply's `next`
+ * points back at the deploy reply, and at links.help (the claim topic,
+ * which also covers the redeploy-with-a-token fallback) when it's gone.
  */
 
 const DOCS_URL = 'https://embarko.ai/docs';
@@ -35,8 +43,9 @@ const SHOWCASE_URL = 'https://embarko.ai/showcase';
 const POLL_SECONDS = { static: 2, service: 10 };
 
 // Every URL a reply can carry lives here, and only here: `app` and the
-// rest of the body never repeat one.
-function linksFor(host, appName, appUrl) {
+// rest of the body never repeat one. `claimUrl` is the keep-this-app link
+// for a fresh temporary app (see the file comment); absent otherwise.
+function linksFor(host, appName, appUrl, claimUrl) {
   const base = `https://${host}`;
   return {
     // The app's own public address — what the user is given once it's live.
@@ -46,7 +55,8 @@ function linksFor(host, appName, appUrl) {
     // App-scoped feedback: needs no credential while the app is unclaimed,
     // the app's own token once it is.
     feedback: `${base}/apps/${appName}/customer-query`,
-    claim: `${base}/api/public/deploy-tokens/request`,
+    // For the user, not the agent: they open it and sign in to keep the app.
+    ...(claimUrl ? { claim: claimUrl } : {}),
     showcase: SHOWCASE_URL,
     docs: DOCS_URL,
   };
@@ -73,25 +83,36 @@ function pick(all, ...names) {
   return out;
 }
 
-function appFacts({ appName, kind, claimed, expiresAt }) {
+function appFacts({ appName, kind, claimed, expiresAt, deploymentId }) {
   const app = { name: appName, kind, claimed };
   if (!claimed && expiresAt) app.expiresAt = expiresAt;
+  // The platform's id for this deploy attempt, for support and the
+  // dashboard's history. Only the deploy reply has one.
+  if (deploymentId) app.deploymentId = deploymentId;
   return app;
+}
+
+// The one sentence about keeping a fresh temporary app, for the deploy
+// reply that carries its link.
+function keepSentence(expiresAt) {
+  return `Temporary app: once it is live, give the user links.claim to open and sign in, which keeps it with no redeploy; otherwise it is deleted at ${expiresAt}.`;
 }
 
 /**
  * POST /apps 202. `claimedNow` — this deploy just adopted a previously
  * anonymous app. `convertingFromService` — a server app is being replaced
- * by a static site.
+ * by a static site. `claimUrl` — the keep link, for a just-created
+ * temporary app. `deploymentId` — hostnsoft-api's id for this attempt.
  */
-function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt, convertingFromService }) {
-  const all = linksFor(host, appName, url);
+function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService }) {
+  const all = linksFor(host, appName, url, claimUrl);
   const poll = POLL_SECONDS[kind];
 
   let next = kind === 'static'
     ? `Static site, no build needed: check links.status in ${poll} seconds.`
     : `Building: poll links.status every ${poll} seconds until it says "live", "failed" or "crashed".`;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
+  if (!claimed && claimUrl) next = `${next} ${keepSentence(expiresAt)}`;
   if (convertingFromService) {
     next = `This replaces the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
@@ -99,9 +120,9 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
   return {
     success: true,
     status: kind === 'static' ? 'publishing' : 'building',
-    app: appFacts({ appName, kind, claimed, expiresAt }),
+    app: appFacts({ appName, kind, claimed, expiresAt, deploymentId }),
     next,
-    links: pick(all, 'status'),
+    links: pick(all, 'status', 'claim'),
   };
 }
 
@@ -112,9 +133,9 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
  * Same body the status reply would give, minus its deprecated `deploy`
  * field, with the claim/convert notes the 202 would have carried.
  */
-function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, convertingFromService, deployState, live }) {
+function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, deployState, live }) {
   const { deploy, ...body } = statusBody({
-    host, appName, kind: 'static', url, claimed, expiresAt, deployState, staticLive: live,
+    host, appName, kind: 'static', url, claimed, expiresAt, claimUrl, deploymentId, deployState, staticLive: live,
   });
   let next = body.next;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
@@ -131,26 +152,37 @@ function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, con
  * the last attempt (deploy-status.js), null after a restart. `health` is
  * Nomad's view (app-health.js) — meaningless for a static site, which has
  * no job; `staticLive` says whether its files are being served instead.
+ * `claimUrl`/`deploymentId` are set only when this backs a deploy reply
+ * (publishedBody): a status poll never carries the claim link.
  */
-function statusBody({ host, appName, kind, url, claimed, expiresAt, deployState, health, staticLive }) {
-  const all = linksFor(host, appName, url);
-  const app = appFacts({ appName, kind, claimed, expiresAt });
+function statusBody({ host, appName, kind, url, claimed, expiresAt, claimUrl, deploymentId, deployState, health, staticLive }) {
+  const all = linksFor(host, appName, url, claimUrl);
+  const app = appFacts({ appName, kind, claimed, expiresAt, deploymentId });
   const attempt = deployState ? deployState.status : null;
   const poll = POLL_SECONDS[kind];
 
   // Live: give the user the URL, then the one next step for this app —
   // claim it while it's temporary, offer the showcase once it's kept.
-  const live = claimed
-    ? {
-        status: 'live',
-        next: 'Live: give the user links.app. If they want it listed publicly, follow links.help.',
-        links: { ...pick(all, 'app'), help: helpUrl(host, 'showcase') },
-      }
-    : {
-        status: 'live',
-        next: `Live: give the user links.app and tell them it will be deleted at ${expiresAt} unless claimed. To claim it, follow links.help.`,
-        links: { ...pick(all, 'app'), help: helpUrl(host, 'claim') },
-      };
+  let live;
+  if (claimed) {
+    live = {
+      status: 'live',
+      next: 'Live: give the user links.app. If they want it listed publicly, follow links.help.',
+      links: { ...pick(all, 'app'), help: helpUrl(host, 'showcase') },
+    };
+  } else if (claimUrl) {
+    live = {
+      status: 'live',
+      next: `Live: give the user links.app, and links.claim to open and sign in, which keeps the app with no redeploy; otherwise it is deleted at ${expiresAt}. Details in links.help.`,
+      links: { ...pick(all, 'app', 'claim'), help: helpUrl(host, 'claim') },
+    };
+  } else {
+    live = {
+      status: 'live',
+      next: `Live: give the user links.app and tell them it will be deleted at ${expiresAt} unless claimed. To keep it they open the claim link from the deploy reply (its links.claim) and sign in; if that link is gone, follow links.help.`,
+      links: { ...pick(all, 'app'), help: helpUrl(host, 'claim') },
+    };
+  }
   const feedbackHelp = helpUrl(host, 'feedback');
 
   let body;
@@ -262,7 +294,7 @@ const NEXT_FOR_CODE = {
   invalid_static_root: 'Point the Staticfile\'s root at a folder inside the upload, like "root: dist".',
   app_kind_changed: 'A static site can\'t become a server app: deploy this version under a new name (see links.help).',
   deploy_failed: 'Couldn\'t read the upload: check it\'s a valid tar.gz and redeploy, then report it to links.feedback if it keeps failing.',
-  not_found: 'No app you can see has this name: check the name, and send the owning company\'s token if it\'s claimed.',
+  not_found: 'No app you can see has this name: check the name, and send the owning workspace\'s token if it\'s claimed.',
   lookup_failed: 'Temporary problem on our side: retry in a few seconds, and report it to links.feedback if it keeps happening.',
 };
 

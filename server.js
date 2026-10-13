@@ -62,7 +62,7 @@ const { claimProject } = require('./claim-project');
 // deploy as the logged-in person instead of making them mint a
 // company-wide deploy token first. One module reads whichever credential
 // came in and packages it for the hostnsoft-api calls below.
-const { readDeployCredential, isIdentified } = require('./deploy-credential');
+const { readDeployCredential } = require('./deploy-credential');
 
 // NEW: shared Nomad job spec builder — see docs/Customdomain-req.md. Used
 // here after a fresh build, and by the /internal/apps/:appName/config
@@ -73,6 +73,7 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
+const { getNomadJob, stopNomadJob } = require('./nomad-job');
 const { renameApp, renameStaticApp } = require('./rename-app');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
@@ -274,6 +275,13 @@ const upload = multer({ dest: '/tmp/platform-uploads/' });
  * failure here costs the ability to scale that app to zero, which is an
  * opt-in feature. Failing the deploy over it would trade a working
  * deployment for a missing optional file.
+ *
+ * The wake routers are rewritten here too, from the spec just saved. In
+ * universal mode every running app is eligible to be stopped, but the
+ * router file was only rewritten on opt-in/out, rename, delete and a
+ * platform redeploy — so an app first deployed after the last redeploy
+ * was stopped with no wake router and 404'd until the next one
+ * (daily-mandala, 2026-10-11). Same for a custom domain added here.
  */
 async function saveJobSpec(appName) {
   try {
@@ -288,6 +296,9 @@ async function saveJobSpec(appName) {
   } catch (e) {
     logger.warn(`[${appName}] Could not save Nomad job spec (scale-to-zero wake would fail): ${e.message}`);
   }
+  await scaleToZero.regenerateRouters().catch((e) => {
+    logger.warn(`[${appName}] Could not rewrite scale-to-zero wake routers (continuing): ${e.message}`);
+  });
 }
 
 /**
@@ -314,17 +325,20 @@ async function saveJobSpec(appName) {
  * deploy should plainly bring the app back rather than silently no-op.
  */
 async function purgeIfNotRunning(appName) {
+  // Exact lookup: `nomad job inspect` would return a DIFFERENT dead job
+  // whose name merely starts with this one, and the purge below would
+  // then target it (see nomad-job.js).
   let status;
   try {
-    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
-    status = JSON.parse(stdout).Job;
-  } catch {
-    return; // not registered at all — nothing to purge, the run registers it
+    status = await getNomadJob(appName);
+  } catch (e) {
+    logger.warn(`[${appName}] Could not look up existing job (continuing): ${e.message}`);
+    return;
   }
   if (!status || (status.Status === 'running' && status.Stop !== true)) return;
 
   logger.info(`[${appName}] Existing job is ${status.Stop ? 'stopped' : status.Status} — purging before deploy`);
-  await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+  await stopNomadJob(appName, { purge: true }).catch((e) => {
     // Not fatal: the run below may still succeed (it will, whenever the
     // new spec actually differs). Failing the deploy here would turn a
     // recoverable case into an outage.
@@ -332,6 +346,33 @@ async function purgeIfNotRunning(appName) {
   });
 }
 
+
+// `railpack build` can exit 0 without leaving a tagged image behind — a
+// production incident did exactly that (docs/CLAUDE.md, "The still-open
+// production mystery"), and trusting the exit code alone let the deploy
+// carry on to `nomad job run`, where the allocation died pulling an
+// image that was never there. That failure surfaced far from the build
+// log that could have explained it. So the image is asked for directly,
+// here, and a miss is a build failure like any other: the thrown error
+// lands in finishDeployFailure, and the railpack output captured just
+// before this runs stays retrievable via GET /apps/:appName/logs (a
+// plain Error carries no stdout/stderr, so setBuildLog there is a no-op
+// and does not overwrite it).
+async function assertImageExists(appName, imageName) {
+  try {
+    // --format keeps the output to the image ID; the default is the full
+    // inspect JSON, which is large and not needed here.
+    await execPromise(`docker image inspect --format '{{.Id}}' ${imageName}`);
+  } catch (e) {
+    const detail = (e.stderr || e.message || '').trim();
+    throw new Error(
+      `Railpack reported success but no Docker image named "${imageName}" exists, so there is nothing to deploy. ` +
+      `The build did not produce an image; check the build log (GET /apps/${appName}/logs) for what railpack actually did.` +
+      (detail ? `\n\ndocker image inspect: ${detail}` : '')
+    );
+  }
+  logger.info(`[${appName}] Verified image ${imageName} exists.`);
+}
 
 // Creates this app's host data directory before Nomad is asked to bind
 // mount it. Docker would otherwise create a missing bind-mount source
@@ -358,28 +399,26 @@ async function ensureAppDataDir(appName) {
 // Shared tail of every background deploy, container or static: reports
 // the outcome to hostnsoft-api so its dashboard deployment history is
 // actually populated, and to this process's own deploy-status.js.
-// Skipped for anonymous deploys — see docs/Anonymous-deploy-req.md's
-// "out of scope": there's no company to attribute history to
-// until/unless the project is claimed. deploymentId (from the
-// in_progress call in the request handler) updates that same row in
-// place rather than creating a second one for this attempt. `kind`
+// Anonymous deploys are reported too (since 2026-10-08): the recorded
+// image tag is what lets the claim link keep the app without a rebuild
+// — see record-deployment.js. deploymentId (from the in_progress call
+// in the request handler) updates that same row in place rather than
+// creating a second one for this attempt. `kind`
 // ("static" | "service") is what hostnsoft-api persists as
 // Project.kind — reported only here, on success, because that is
 // the first moment the app's kind on this host is actually settled
 // (a failed static publish is undone, see performStaticDeploy).
 async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind }) {
-  if (isIdentified(credential)) {
-    await recordDeployment({
-      credential,
-      projectSlug: appName,
-      appVersion,
-      status: 'success',
-      imageTag: imageName,
-      memoryMb: taskMemory,
-      deploymentId,
-      kind,
-    });
-  }
+  await recordDeployment({
+    credential,
+    projectSlug: appName,
+    appVersion,
+    status: 'success',
+    imageTag: imageName,
+    memoryMb: taskMemory,
+    deploymentId,
+    kind,
+  });
   setDeployState(appName, {
     status: 'success',
     finishedAt: new Date().toISOString(),
@@ -413,16 +452,14 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
   await fs.remove(buildDir).catch(() => { });
   await fs.remove(filePath).catch(() => { });
 
-  if (isIdentified(credential)) {
-    await recordDeployment({
-      credential,
-      projectSlug: appName,
-      appVersion,
-      status: 'failed',
-      errorDetail,
-      deploymentId,
-    });
-  }
+  await recordDeployment({
+    credential,
+    projectSlug: appName,
+    appVersion,
+    status: 'failed',
+    errorDetail,
+    deploymentId,
+  });
   setDeployState(appName, {
     status: 'failed',
     finishedAt: new Date().toISOString(),
@@ -459,6 +496,12 @@ async function performBuildAndDeploy({
       { maxBuffer: BUILD_OUTPUT_MAX_BUFFER },
     );
     setBuildLog(appName, buildResult);
+
+    // Exit code 0 above is not proof an image exists — see
+    // assertImageExists. Checked BEFORE anything downstream is touched
+    // (data dir, purgeIfNotRunning, Nomad), so a build that produced
+    // nothing leaves the currently running version of the app alone.
+    await assertImageExists(appName, imageName);
 
     // Before the job spec is applied, not after — Nomad's bind mount
     // needs this to exist and be writable at container start.
@@ -630,7 +673,7 @@ async function performStaticDeploy({
     // container on its next deploy.
     if (convertingFromService) {
       logger.info(`[${appName}] Retiring the server job now that the files are served directly.`);
-      await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+      await stopNomadJob(appName, { purge: true }).catch((e) => {
         logger.warn(`[${appName}] Could not purge the old Nomad job (continuing): ${e.message}`);
       });
       await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
@@ -1054,18 +1097,16 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     // the upload was accepted, not wait out the whole build inline.
     // Progress is tracked via deploy-status.js (see GET
     // /apps/:appName/status, whose URL is included in the response
-    // below) and, for token-authenticated deploys, mirrored into
-    // hostnsoft-api's own deployment history too.
-    let deploymentId = null;
-    if (isIdentified(credential)) {
-      deploymentId = await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'in_progress',
-        agentName: agentName || undefined,
-      });
-    }
+    // below) and mirrored into hostnsoft-api's own deployment history —
+    // for anonymous deploys too, since that record is what the claim
+    // link's no-rebuild re-push runs from (see record-deployment.js).
+    const deploymentId = await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'in_progress',
+      agentName: agentName || undefined,
+    });
     setDeployState(appName, {
       status: 'in_progress',
       appVersion,
@@ -1082,6 +1123,12 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       claimed: !claim.isOrphan,
       claimedNow: !!claim.claimedNow,
       expiresAt: claim.orphanExpiresAt,
+      // Only on the deploy that created a temporary app — see
+      // claim-project.js. This reply is the one place the link appears.
+      claimUrl: claim.claimUrl,
+      // hostnsoft-api's id for this attempt (null if recording failed),
+      // for support and the dashboard's history; not needed to proceed.
+      deploymentId,
       convertingFromService,
     };
 
@@ -1161,16 +1208,14 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     await fs.remove(buildDir).catch(() => { });
     await discardUpload();
 
-    if (isIdentified(credential)) {
-      await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'failed',
-        errorDetail: error.message,
-        agentName: agentName || undefined,
-      });
-    }
+    await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'failed',
+      errorDetail: error.message,
+      agentName: agentName || undefined,
+    });
 
     res.status(500).json(errorBody({
       host, appName, appExists: true,
@@ -1423,7 +1468,7 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
 // actually changed.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { imageTag, memoryMb, customDomains, envVars, deploymentId } = req.body || {};
+  const { imageTag, memoryMb, customDomains, envVars, deploymentId, isFreePlan = false } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -1482,7 +1527,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
       // rebuilt by this same endpoint without isOrphan.
       const manifest = await updateManifest(appName, { customDomains, isOrphan: false });
       await writeStaticRouterFile({
-        appName, domain, customDomains, isOrphan: false, spa: !!(manifest && manifest.spa),
+        appName, domain, customDomains, isOrphan: false, isFreePlan: !!isFreePlan, spa: !!(manifest && manifest.spa),
       });
     };
 
@@ -1545,6 +1590,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     schedulingFloorMb,
     customDomains,
     envVars: envVars || [],
+    isFreePlan: !!isFreePlan,
   });
 
   const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
@@ -1623,7 +1669,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
  */
 app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { newName, imageTag, memoryMb, customDomains, envVars } = req.body || {};
+  const { newName, imageTag, memoryMb, customDomains, envVars, isFreePlan = false } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name", code: 'invalid_app_name' });
@@ -1645,7 +1691,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
     // data dir to move (see renameStaticApp). imageTag/memory/envVars are
     // container concerns and are ignored on that path.
     const result = (await isStaticApp(appName))
-      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [] })
+      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [], isFreePlan: !!isFreePlan })
       : await renameApp(appName, newName, {
         imageTag,
         taskMemory,
@@ -1654,6 +1700,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
         schedulingFloorMb: SCHEDULING_FLOOR_MB,
         customDomains: customDomains || [],
         envVars: envVars || [],
+        isFreePlan: !!isFreePlan,
       });
 
     // The in-memory deploy state is keyed by app name, so carry it over
@@ -1698,21 +1745,13 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
   }
 
   try {
-    await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
-      // A job that was never successfully deployed (e.g. an orphan whose
-      // build/deploy failed) has no Nomad job at all — treat "not found"
-      // as already-torn-down rather than an error. Nomad's actual message
-      // here is "No job(s) with prefix or id \"x\" found" (confirmed via
-      // Nomad's own CLI source/issue tracker) — it does NOT contain the
-      // substring "not found", so the previous check here never matched
-      // and this path silently fell through to `throw e` instead (caught
-      // by this function's own outer try/catch, surfaced as a 500 to
-      // hostnsoft-api rather than the "already torn down" success this
-      // comment always described). Found while adding the same
-      // not-found detection to app-health.js's GET .../status endpoint.
-      const output = `${e.stdout || ''}${e.stderr || ''}`;
-      if (!/no job\(s\) with prefix or id/i.test(output)) throw e;
-    });
+    // A job that was never successfully deployed (e.g. an orphan whose
+    // build/deploy failed) has no Nomad job at all, and a static app never
+    // has one — stopNomadJob treats that as already torn down. It looks
+    // the job up by exact ID first: a bare `nomad job stop -purge demo`
+    // with no job "demo" resolves by prefix to someone else's job (see
+    // nomad-job.js).
+    await stopNomadJob(appName, { purge: true });
 
     // A static app (static-site.js) has no job to purge; it has a Traefik
     // router file and a directory of files instead. Router first, so

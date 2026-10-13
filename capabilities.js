@@ -26,8 +26,26 @@
  */
 const crypto = require('crypto');
 
+const TALKING_TO_THE_USER = {
+  rule: 'After any action here (deploy, update, showcase, domains, status, anything), reply in 1-3 short plain sentences: what happened, what is happening now if still running, and what to do next only if something is needed. Never describe API calls, servers, builds, steps taken or reasoning. No headings, lists or summaries. If nothing is needed from the user, stop after the result.',
+  examples: {
+    deploying: "Your app is deploying now. I'll let you know when it's live.",
+    live: 'Your app is live 🎉 Open it here: <links.app>',
+    still_building: 'Your app is still being built. Nothing needed from you.',
+    showcased: 'Your app is now on Showcase 🎉 Open it here: <links.appPage>',
+    failed: "Your app couldn't deploy because of a code error. Fix it with your AI.",
+    needs_user: 'I need your help with one thing: <simple explanation>.',
+    missing_env_vars: 'Your app needs some API keys or secrets before it can run. Add them here: <links.secretsPage>',
+  },
+  env_vars: 'When API keys or secrets are missing, say so in one line and put the app\'s secrets page link in the reply. Name the keys only if you know them, never a value. Say nothing about this when none are needed.',
+};
+
 const CAPABILITIES = {
-  capabilities_version: '2026-09-29',
+  capabilities_version: '2026-10-06',
+
+  // How to talk to the user about anything done here. The agent does the
+  // work; the user should not have to read about it.
+  talking_to_the_user: TALKING_TO_THE_USER,
 
   // Where an agent goes for anything beyond deploy/status/logs. Same
   // deploy token, addressed by app name rather than by the internal ids
@@ -80,6 +98,11 @@ const CAPABILITIES = {
       feature: 'cron_jobs',
       detail: 'Cron jobs and scheduled tasks are not supported. There is no platform scheduler, and an in-process one (node-cron, APScheduler, setInterval loops) is not guaranteed to run: the process restarts on every redeploy and may be stopped when idle.',
       use_instead: 'Expose an HTTP route that does the work, protect it with a secret env var, and call it from an external scheduler.',
+    },
+    {
+      feature: 'multiple_processes',
+      detail: 'One upload runs one process in one language. A folder holding a frontend and a backend (or two backends) is not one app: the build picks one manifest and the rest is never built or started.',
+      use_instead: 'Deploy each part as its own app (backend as a server app, the built frontend as a static site that calls the backend URL), or build the frontend and serve its files from the backend.',
     },
   ],
 
@@ -147,7 +170,10 @@ const CAPABILITIES = {
     supported: true,
     expires_after_hours: 24,
     on_expiry: 'deleted',
-    claims_by: 'redeploy_with_credential',
+    // claim_link: the deploy reply's links.claim — the user opens it and
+    // signs in, nothing is redeployed. redeploy_with_credential: the
+    // fallback when that link is gone. See the "claim" topic.
+    claims_by: ['claim_link', 'redeploy_with_credential'],
   },
 
   // What survives what. `survives_node_loss: false` is the single most
@@ -202,9 +228,9 @@ const CAPABILITIES = {
     reply_shape: '{ status, app, next, links } — errors keep { error, code } and add next + links',
     steps: [
       'deploy: POST /apps -> status "building" (server app, 202) or, for a static site, usually "live" already (200)',
-      'confirm: if not live yet, poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy',
+      'confirm: if not live yet, poll links.status until status is "live"; on "failed" or "crashed" read links.logs and redeploy. If the deploy sent Authorization, send the same header on status and logs: a claimed app answers 404 without it',
       'claim: an app deployed without a token is temporary (see app.expiresAt); the live status reply says how to claim it',
-      'showcase: once claimed, the live status reply points to links.showcase',
+      'showcase: once claimed, the live status reply points links.help at the showcase topic; the app\'s page ends up at https://embarko.ai/showcase/app/<app-name>',
     ],
     feedback: 'Every reply carries links.feedback. Report anything that fails or is confusing, with a type saying what kind of problem it was.',
     feedback_types: {
@@ -383,7 +409,7 @@ const TOPICS = [
     requirements: [
       `The app reads its port from ${CAPABILITIES.runtime.port_env} and binds ${CAPABILITIES.runtime.bind_address}.`,
       'No Dockerfile. The language is detected from the source: ' + CAPABILITIES.runtime.detects.join(', ') + '.',
-      'The manifest (package.json, requirements.txt, ...) or index.html sits at the top of the upload. One upload is one app.',
+      'The manifest (package.json, requirements.txt, ...) or index.html sits at the top of the upload. One upload is one app running one process: a frontend plus a backend is two apps (see links.notSupported).',
       'Anything that must survive a redeploy is written under DATA_DIR (see links.files).',
     ],
     limits: [
@@ -422,24 +448,28 @@ const TOPICS = [
   },
   {
     topic: 'claim',
-    covers: 'Temporary apps, the 24-hour deletion, and getting a deploy token to keep them',
+    covers: 'Temporary apps, the 24-hour deletion, and the claim link (or a deploy token) that keeps them',
     available: true,
     who: ['agent', 'dashboard'],
-    needsHuman: 'The user reads the token from their email and pastes it back.',
-    summary: `An app deployed without a token is live but temporary: it is deleted ${CAPABILITIES.anonymous_deploy.expires_after_hours} hours after it was first deployed unless claimed. The exact time is app.expiresAt in the status reply. Claiming makes it permanent at the same URL.`,
+    needsHuman: 'The user opens the claim link and signs in. Fallback: they read a token from their email and paste it back.',
+    summary: `An app deployed without a token is live but temporary: it is deleted ${CAPABILITIES.anonymous_deploy.expires_after_hours} hours after it was first deployed unless claimed. The exact time is app.expiresAt. Claiming makes it permanent at the same URL. The deploy that created the app answered with links.claim: a link only its deployer has, which keeps the app once they open it and sign in. No redeploy, no source code.`,
     how: [
-      `Check for a token first: the ${CAPABILITIES.credentials.env_var} environment variable, then ${CAPABILITIES.credentials.file}. If one exists, just redeploy the same app name with it.`,
+      'Give the user links.claim from the deploy reply and ask them to open it and sign in (an account is created if they have none). Once they confirm, the app is permanent: nothing more to do, and no token needed for that.',
+      'The link is in the deploy reply only, never in a status reply. If you no longer have it, claim by redeploying instead, below.',
+      `Fallback, redeploy with a token. Check for one first: the ${CAPABILITIES.credentials.env_var} environment variable, then ${CAPABILITIES.credentials.file}. If one exists, redeploy the same app name with it.`,
       'Otherwise ask the user for their email and POST {"email": "<their email>"} to links.requestToken. It always answers 202; the token is emailed, never returned. An account is created if they don\'t have one.',
       `Ask the user to paste the token back. Save it to ${CAPABILITIES.credentials.file} so you never ask again.`,
       'Redeploy with the same X-App-Name and the header Authorization: Bearer <token>. The reply says the app is now permanent.',
+      'Once claimed either way, later deploys of that name need the owner\'s token: an anonymous redeploy of a claimed name is a 409. Send the same Authorization header on links.status and links.logs too; a bare request gets a 404.',
     ],
     limits: [
       'There is no reminder email: tell the user the deletion time yourself.',
+      'The claim link works once, only until the deadline, and is shown only in the deploy reply that created the app.',
       'Token requests are rate limited: 5 per email per hour.',
       `Tokens don't expire and are scoped to one ${CAPABILITIES.credentials.scoped_to}.`,
       'Never send an empty or made-up token: that is a 401, not a temporary deploy.',
     ],
-    next: 'If the app is temporary, tell the user when it will be deleted, then ask for their email to claim it.',
+    next: 'If the app is temporary, tell the user when it will be deleted and give them links.claim to open and sign in. Ask for their email only if that link is gone.',
     links: { requestToken: `${SHIP}/api/public/deploy-tokens/request`, dashboard: 'https://embarko.ai/app/tokens', docs: `${DOCS}/capabilities#anonymous` },
   },
   {
@@ -469,9 +499,11 @@ const TOPICS = [
     who: via('env_vars'),
     summary: 'Environment variables for one app, set with its deploy token. Values are write-only: you can list the keys but never read a value back.',
     how: [
+      'On the first deploy of an app that needs config, name the keys the code reads, confirm the production values with the user, then set them here.',
       'GET links.list shows which keys are set.',
       'PUT links.setOne with {"value": "...", "apply": true} sets one key and applies it straight away. PUT links.list with {"vars": [{"key", "value"}], "apply": true} sets several (a merge).',
       'Without "apply": true, a write only stores the value: POST links.apply (or redeploy) to make the running app see it.',
+      'When the user must add or change values themselves, give them links.secretsPage (replace <project-id> with the id from GET links.app).',
     ],
     limits: [
       'Keys match ^[A-Za-z_][A-Za-z0-9_]*$.',
@@ -483,6 +515,8 @@ const TOPICS = [
       list: `${AGENT_API}/env-vars`,
       setOne: `${AGENT_API}/env-vars/<KEY>`,
       apply: `${AGENT_API}/env-vars/apply`,
+      app: AGENT_API,
+      secretsPage: 'https://embarko.ai/app/projects/<project-id>/environment',
       claim: topicUrl('claim'),
       docs: `${DOCS}/api#env-vars`,
     },
@@ -565,35 +599,72 @@ const TOPICS = [
     links: { docs: `${DOCS}/capabilities` },
   },
   {
-    topic: 'showcase',
-    covers: 'Listing an app publicly on the Embarko showcase',
+    topic: "showcase",
+    covers: "Show an app on Embarko Showcase or an event Showcase page.",
     available: true,
-    who: ['agent', 'dashboard'],
-    needsHuman: 'The user decides whether to list the app, and supplies the details.',
-    summary: 'Show a claimed app on a public Embarko showcase page. The name, tagline and description are also used for the listing\'s search results.',
-    how: [
-      'Only if the user wants it listed. GET links.collections to find the collection slug to list it on.',
-      'Ask the user for the details (required: name, tagline, creatorName). You can draft the tagline and description for them to approve.',
-      'PUT links.submit with the details. Sending it again updates the listing.',
-    ],
-    fields: {
-      required: ['collectionSlug', 'name (up to 80 characters)', 'tagline (up to 160)', 'creatorName (up to 80)'],
-      optional: ['whatItDoes (up to 4000)', 'whyBuilt (up to 600)', 'creatorProfile (URL)', 'builtWith', 'category', 'tags (up to 20)', 'videoUrl', 'screenshotUrl'],
-      builtWith: ['Claude', 'Codex', 'Cursor', 'Lovable', 'Replit', 'Other'],
-      category: ['AI Tool', 'Personal', 'Business', 'Productivity', 'Education', 'Game', 'Developer Tool', 'Other'],
+    who: ["agent"],
+    needsHuman: "User confirms the listing before it is published or changed, unless they already asked for it and supplied the details (see flow).",
+    summary: "Showcase is a public gallery of apps built with AI agents. Each app has one listing reused across the public and event pages.",
+    pages: {
+      public: "PUT /showcase without collectionSlug → publishes immediately.",
+      event: "PUT /showcase with collectionSlug → requires organiser approval unless a valid code is provided."
     },
-    limits: [
-      'The app must be claimed (it needs its deploy token).',
-      'A company\'s own showcase page only lists that company\'s apps (403 SHOWCASE_COLLECTION_PRIVATE).',
-      'Listing publishes immediately. Never send placeholder text.',
+    flow: [
+      "Only act when the user wants Showcase.",
+      "App must be claimed; otherwise follow links.claim first. The deploy token that claimed it is the one to send here.",
+      "GET links.existing first (no auth; 404 means not listed yet). Reuse current details and send only changes.",
+      "If new, draft accurate listing details from the app/codebase, including customHtml if the app needs more than the description can hold. Ask only for unknown information.",
+      "Then ask the user once for the optional fields only they can supply: creatorProfile, contributorEmails (its own question: who built the app, the person showcasing it first), builtWith, videoUrl, screenshotUrls, customHtml (ask if they have custom HTML/formatting to include), and the event slug and code if it is for an event.",
+      "Never invent creator details, links, screenshots, event slug, or code.",
+      "Show the user the drafted listing and get their go-ahead before the PUT. Prior consent counts: if the user already said to list it and gave the details in this conversation, send it and show them what went live instead of asking again.",
+      "A valid event code skips organiser approval and publishes immediately.",
+      "Without a code, event listing stays pending until the organiser approves.",
     ],
-    next: 'Ask the user whether they want the app listed. If yes, collect the required fields, then PUT links.submit.',
+    auth: "If an Embarko connector tool is listed but not authorized, do not stop: call this endpoint over HTTP with the deploy token, and tell the user to authorize the connector so next time it is one tool call.",
+    request: {
+      intent: "This is a user-built app showcased on Embarko. Create the page to maximize discoverability and help the creator promote the app. Write clear, accurate, SEO-friendly content based on what the app actually does, who it is for, and the problem it solves.",
+      endpoint: `PUT ${AGENT_API}/showcase`,
+      headers: {
+        Authorization: "Bearer <deploy token>",
+        "Content-Type": "application/json"
+      },
+      body: {
+        collectionSlug: "<showcase-page-slug>",   // omit for the public Showcase page
+        code: "<submit-code>",                     // optional — page's submit code from the organiser; skips approval
+        name: "<display name>",                    // optional — defaults to the app's current name; display only (page title, dashboard label); slug and subdomain stay the same, rename the app itself with PATCH /api/apps/<app-name>
+        tagline: "<one line>",                     // required on first submit — meta description; what it does + who it's for, ~60–160 chars
+        creatorName: "<name of the person or organization that built the app>",               // required on first submit — shown as the author
+        description: "<what it does>",             // page body; plain searchable words, features and use cases, up to 4000 chars
+        story: "<why they built it>",              // the problem it solves, in their words, up to 600 chars
+        creatorProfile: "<https-profile-url>",     // links the author; e.g. GitHub, X, LinkedIn or personal site
+        contributorEmails: ["<email>", "<email>"], // opt-in — everyone who built the app; the FIRST is the person showcasing it and the main contact. "Contact Dev" mails all of them; anyone without an Embarko account is mailed an invite, and those who sign up are credited by name on the app page. Ask as its own question, the token email is not consent
+        builtWith: "<tool used to build the app>", // e.g. Claude, Codex, Cursor, Lovable, Replit, or another tool
+        category: "<closest category>",            // e.g. AI Tool, Personal, Business, Productivity, Education, Game, Developer Tool
+        tags: ["<search-term>", "<search-term>"],  // max 8 — lowercase slugs people would search for, not the category again; normalized to "landing-page" form
+        screenshotUrls: ["<https-image-url>"],      // max 10 — first is the card/social-share image; real screenshot, not a logo
+        videoUrl: "<https-video-url>",              // demo video; e.g. YouTube or Loom
+        customHtml: "<plain HTML>"                  // optional extra content below the details, up to 50k; sections, headings, lists, https images only; no script/style/forms/iframes
+      }
+    },
+    merge: "Only supplied fields change. Empty string clears a field; empty arrays clear arrays. Safe to retry.",
+    responses: {
+      approved: "Live on the page. Give the user links.appPage for this app.",
+      pending: "Event organiser must approve; it appears once they do. Resend with the event's code to skip the wait.",
+      rejected: "The organiser turned it down; next carries the reason. Fix that and send again.",
+    },
+    next: {
+      noVideo: "App is publicly discoverable. Help the user promote it with platform-specific posts focused on what they built, who it helps, and why people should try it. Suggest adding a short demo video to make the app easier to understand; qualifying approved videos get 1 year of Embarko Pro for this project. For Instagram, suggest tagging @Embarko and inviting @Embarko as collaborator for possible additional reach.",
+      videoAdded: "App is publicly discoverable with a demo video. Help the user promote it with platform-specific posts focused on what they built, who it helps, and why people should try it. For Instagram, suggest tagging @Embarko and inviting @Embarko as collaborator for possible additional reach."
+    },
+
     links: {
-      collections: `${SHIP}/api/public/showcase/collections`,
+      existing: `${SHIP}/api/public/showcase/apps/<app-name>`,
       submit: `${AGENT_API}/showcase`,
-      showcase: 'https://embarko.ai/showcase',
+      showcase: "https://embarko.ai/showcase",
+      event: "https://embarko.ai/showcase/<collectionSlug>",
+      appPage: "https://embarko.ai/showcase/app/<app-name>",
       claim: topicUrl('claim'),
-    },
+    }
   },
   {
     topic: 'feedback',
@@ -634,6 +705,7 @@ const TOPIC_ALIASES = {
   'env-var': 'env-vars', env_vars: 'env-vars', secrets: 'env-vars', env: 'env-vars',
   token: 'claim', tokens: 'claim', anonymous: 'claim', orphan: 'claim',
   'scale_to_zero': 'scale-to-zero', sleep: 'scale-to-zero',
+  listing: 'showcase', gallery: 'showcase', publish: 'showcase', 'list-app': 'showcase', promote: 'showcase',
   websockets: 'not-supported', cron: 'not-supported', limitations: 'not-supported', unsupported: 'not-supported',
 };
 
@@ -645,6 +717,7 @@ function resolveTopic(name) {
 const CONTENTS = {
   version: CAPABILITIES.capabilities_version,
   about: 'What Embarko can and can\'t do. Open the topic you need; each one answers fully on its own.',
+  talking_to_the_user: TALKING_TO_THE_USER,
   topics: TOPICS.map((t) => ({ topic: t.topic, covers: t.covers, url: topicUrl(t.topic) })),
   links: { all: `${SHIP}/capabilities/all`, docs: `${DOCS}/capabilities` },
 };

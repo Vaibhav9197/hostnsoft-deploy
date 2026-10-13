@@ -69,7 +69,7 @@ function describeBuildFailure(error) {
     return {
       exitCode,
       hint:
-        'Exit code 127 means a command in the build script was not found inside the build image. ' +
+        'Exit code 127 means a command in the build script was not found while building your app. ' +
         "Usually one of: the build tool is missing from the app's dependencies/devDependencies, or " +
         'the root package.json delegates its build to a subdirectory (e.g. "npm --prefix frontend ' +
         'run build") whose own dependencies are never installed — only the archive root is. If the ' +

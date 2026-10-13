@@ -60,7 +60,7 @@ async function readDeployCredential(req) {
         ok: false,
         status: 400,
         code: 'company_id_required',
-        error: "Missing X-Company-Id header. A proxy_auth_token isn't scoped to one company, so the deploy has to say which company this app belongs to.",
+        error: "Missing X-Company-Id header. A proxy_auth_token isn't scoped to one workspace, so the deploy has to say which workspace this app belongs to.",
       };
     }
     return { ok: true, credential: { proxyAuthToken, companyId } };
@@ -89,11 +89,4 @@ function credentialHeaders(credential) {
     : {};
 }
 
-// True for anything that identifies a company — i.e. everything except
-// anonymous. Gates deployment-history recording, which has no company to
-// attribute an anonymous deploy to (docs/Anonymous-deploy-req.md).
-function isIdentified(credential) {
-  return credential !== null;
-}
-
-module.exports = { readDeployCredential, credentialBody, credentialHeaders, isIdentified };
+module.exports = { readDeployCredential, credentialBody, credentialHeaders };
