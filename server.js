@@ -199,6 +199,13 @@ const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || 'http://localhost:3000'
 
 const app = express();
 
+// Traefik sits in front on the same box and forwards the real client
+// address in X-Forwarded-For. Without this, req.ip is always 127.0.0.1
+// and every anonymous deploy would share ONE rate-limit counter (see
+// rate-limit.js). Exactly one hop is trusted: a client cannot
+// forge its address by sending its own X-Forwarded-For.
+app.set('trust proxy', 1);
+
 // First, ahead of every route — assigns a unique id to each request so
 // every log line made while handling it (anywhere, including inside
 // claim-project.js/record-deployment.js) can be correlated back to this
@@ -252,8 +259,24 @@ app.use(
   })
 );
 
-// Configure Multer to save uploaded files to a temporary folder
-const upload = multer({ dest: '/tmp/platform-uploads/' });
+// Configure Multer to save uploaded files to a temporary folder.
+// fileSize caps one tarball so a single upload cannot fill the disk;
+// multer stops writing at the cap and the handler below answers 413.
+// Optional, defaults to 500 MB.
+const UPLOAD_MAX_BYTES = parseInt(process.env.UPLOAD_MAX_BYTES, 10) || 500 * 1024 * 1024;
+const upload = multer({ dest: '/tmp/platform-uploads/', limits: { fileSize: UPLOAD_MAX_BYTES } });
+
+// Caps how often one caller may upload (see rate-limit.js). Runs BEFORE
+// multer so a rejected request never touches the disk. One budget for
+// everyone, counted per deploy token, per company for dashboard uploads,
+// or per client IP for anonymous deploys.
+const { createLimiter, intEnv } = require('./rate-limit');
+const uploadRateLimit = createLimiter({
+  prefix: 'upload',
+  limit: intEnv('UPLOAD_LIMIT', 10),
+  windowMs: intEnv('UPLOAD_LIMIT_WINDOW_MIN', 1) * 60_000,
+  label: 'uploads',
+});
 /**
  * Save the app's Nomad job spec so it can be woken after a stop.
  *
@@ -710,7 +733,23 @@ app.get('/capabilities/all', (req, res) => sendCapabilities(req, res, CAPABILITI
 
 app.get('/capabilities/:topic', (req, res) => sendTopic(req, res, req.params.topic));
 
-app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
+// multer stops at UPLOAD_MAX_BYTES and throws LIMIT_FILE_SIZE; this turns
+// that into a 413 with the usual error body (the partial file is already
+// discarded by multer itself). Any other multer error falls through.
+function uploadSizeError(err, req, res, next) {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json(errorBody({
+      host: req.get('host'),
+      appName: req.headers['x-app-name'],
+      code: 'upload_too_large',
+      error: `The upload is larger than the ${Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))} MB limit.`,
+      extra: { maxBytes: UPLOAD_MAX_BYTES },
+    }));
+  }
+  return next(err);
+}
+
+app.post('/apps', uploadRateLimit, upload.single('source'), uploadSizeError, jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
 
   // Multer has already written the upload to disk by the time this runs,

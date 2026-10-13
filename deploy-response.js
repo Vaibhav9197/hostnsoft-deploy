@@ -249,6 +249,8 @@ const NEXT_FOR_CODE = {
   invalid_app_version: 'Use only letters, numbers, dots, dashes and underscores in X-App-Version.',
   invalid_app_type: 'Shorten X-App-Type to a plain label like "portfolio", or leave it out.',
   invalid_agent_name: 'Use a short plain name in X-Agent-Name like "claude-code", or leave it out.',
+  rate_limited: 'Wait the number of seconds in retryAfterSeconds (also the Retry-After header), then deploy again.',
+  upload_too_large: 'Shrink the upload: exclude node_modules, build output and other generated files from the tarball.',
   missing_source_file: 'Attach the code: a tar.gz as the "source" field, or JSON with a non-empty "files" array.',
   invalid_json: 'Send valid JSON, or upload a tar.gz as the "source" field instead.',
   invalid_file_path: 'Use relative paths inside the app for every files[].path (no leading "/" or "..").',
