@@ -294,7 +294,7 @@ const NEXT_FOR_CODE = {
   invalid_static_root: 'Point the Staticfile\'s root at a folder inside the upload, like "root: dist".',
   app_kind_changed: 'A static site can\'t become a server app: deploy this version under a new name (see links.help).',
   deploy_failed: 'Couldn\'t read the upload: check it\'s a valid tar.gz and redeploy, then report it to links.feedback if it keeps failing.',
-  not_found: 'No app you can see has this name: check the name, and send the owning company\'s token if it\'s claimed.',
+  not_found: 'No app you can see has this name: check the name, and send the owning workspace\'s token if it\'s claimed.',
   lookup_failed: 'Temporary problem on our side: retry in a few seconds, and report it to links.feedback if it keeps happening.',
 };
 
