@@ -15,8 +15,8 @@
  *
  * `next` stays short on purpose. When a step needs more than a sentence —
  * how to claim, what the showcase needs, the runtime rules behind a crash,
- * how to send feedback — the detail lives in a capabilities topic
- * (capabilities.js) and the reply links it as links.help. The agent reads
+ * how to send feedback — the detail lives in a topic of the agent guide
+ * (embarko.ai/docs) and the reply links it as links.help. The agent reads
  * it only if it needs to.
  *
  * Errors keep their existing `error` and `code` (callers branch on code)
@@ -69,10 +69,13 @@ function publicFeedbackUrl(host) {
   return `https://${host}/api/public/customer-query`;
 }
 
-// links.help: the capabilities topic that explains this reply's next step
-// in full. One per reply at most, and only where a sentence isn't enough.
-function helpUrl(host, topic) {
-  return `https://${host}/capabilities/${topic}`;
+// links.help: the guide topic that explains this reply's next step in
+// full. One per reply at most, and only where a sentence isn't enough. The
+// guide answers an agent in Markdown and a browser in HTML at the same URL.
+// `host` is unused since the guide moved off this host; kept so callers
+// don't change.
+function helpUrl(_host, topic) {
+  return `${DOCS_URL}/${topic}`;
 }
 
 // `links` with only the named entries, and feedback always.
@@ -298,12 +301,12 @@ const NEXT_FOR_CODE = {
   lookup_failed: 'Temporary problem on our side: retry in a few seconds, and report it to links.feedback if it keeps happening.',
 };
 
-// The capabilities topic that explains the error in full, for the few codes
+// The guide topic that explains the error in full, for the few codes
 // where a sentence can't: how to get a token, where data lives, and what a
 // static site can't do.
 const HELP_FOR_CODE = {
   unauthorized: 'claim',
-  unsupported_storage_pattern: 'files',
+  unsupported_storage_pattern: 'data',
   invalid_static_root: 'static-sites',
   app_kind_changed: 'static-sites',
 };
@@ -319,7 +322,7 @@ const GENERIC_NEXT = 'Fix the request as the error says and retry, or report it 
 function errorBody({ host, appName, error, code, extra = {}, appExists = false, next }) {
   const links = {};
   const docsAnchored = ['no_manifest_at_root', 'app_nested_in_subdirectory', 'invalid_static_root'];
-  if (docsAnchored.includes(code)) links.docs = DOCS_URL;
+  if (docsAnchored.includes(code)) links.docs = `${DOCS_URL}/errors`;
   const text = next || NEXT_FOR_CODE[code] || GENERIC_NEXT;
   // An error with no topic of its own that asks for a report points at the
   // feedback topic, which says what to send.

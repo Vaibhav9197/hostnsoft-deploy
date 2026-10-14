@@ -168,10 +168,14 @@ captured railpack output) are now the place to start.
 
 ## Also part of this repo (if applicable — confirm)
 
-If the client-facing `hostnsoft-deploy` skill package (the `SKILL.md` +
-`scripts/deploy.sh` + `scripts/troubleshoot.md` + `scripts/check-app-db.sh`
-bundle that clients/agents use to package and call this API) also lives
-in this repo, keep it in sync with `server.js`'s actual behavior — e.g.
+The agent-facing docs are the guide on the website (embarko.ai/docs,
+built from `app/lib/guide/content.js` in the site repo); this service no
+longer serves its own copy, and `/capabilities*` only redirects there.
+When behavior an agent relies on changes here, update that guide.
+
+If the client-facing skill package (`SKILL.md` + `scripts/deploy.sh`,
+github.com/embarko-ai/skill, which agents use to package and call this API)
+also lives in this repo, keep it in sync with `server.js`'s actual behavior — e.g.
 the client-side pre-flight `window.storage` check in `deploy.sh` should
 stay consistent with `detect-storage-usage.js`'s server-side logic. If
 that skill package lives somewhere else instead, note the actual location

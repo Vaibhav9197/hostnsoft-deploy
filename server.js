@@ -97,7 +97,7 @@ const { resolveAppKind } = require('./app-kind');
 // low `memory` the scheduler packs against, and the `memory_max` ceiling
 // it may actually burst up to. The CEILING values below are exactly the
 // numbers that used to be the single flat reservation (and are still what
-// capabilities.js publishes and what hostnsoft-api persists as
+// the docs publish and what hostnsoft-api persists as
 // Project.memoryMb) — no app's real limit changed. Only the number Nomad
 // bin-packs against got lower.
 //
@@ -162,9 +162,6 @@ const { pushToRegistry } = require('./image-registry');
 // POST /internal/apps/:appName/config deploymentId branch below) back to
 // hostnsoft-api once it's known.
 const { reportConfigPushResult } = require('./report-config-push');
-const {
-  CAPABILITIES_BODY, CAPABILITIES_ETAG, CONTENTS_SERVED, TOPICS_SERVED, TOPICS, resolveTopic,
-} = require('./capabilities');
 // JSON { files: [...] } source for POST /apps — what an MCP tool call can
 // carry, since it can't attach a file. See json-source.js.
 const { jsonSource } = require('./json-source');
@@ -710,48 +707,32 @@ async function performStaticDeploy({
   }
 }
 
-// The contract an agent reads before designing or deploying an app —
-// runtime requirements, how to get a credential, what persists, and which
-// features it can actually invoke itself. Unauthenticated on purpose: an
-// agent needs this BEFORE it has a token, and it's the same answer for
-// everyone. See capabilities.js for what may and may not go in it.
+// The agent guide lives on the website, one topic per page, and is the only
+// copy: https://embarko.ai/docs (Markdown for agents, HTML for people, .json
+// on request). /capabilities used to be a second copy served from here, and
+// two copies drift. Its URLs are in older replies, skills and prompts, so
+// they redirect to the matching guide topic. The Accept header carries over,
+// so an agent that asked for JSON still gets JSON there.
 //
-// Served like a book: GET /capabilities is the contents page, one line per
-// topic; GET /capabilities/<topic> answers one question in full; and
-// GET /capabilities/all is the whole contract at once. ?feature=<topic> on
-// the contents URL is an alias for the topic path.
-function sendCapabilities(req, res, body, etag) {
-  res.setHeader('ETag', etag);
+// Express puts the address in the body too, so a client that doesn't follow
+// redirects (curl without -L) still learns where to go.
+const GUIDE = 'https://embarko.ai/docs';
+// Topics that were renamed in the guide. Anything else keeps its name; the
+// guide resolves aliases itself and answers an unknown name with its contents.
+const GUIDE_TOPIC = { files: 'data', 'not-supported': 'prerequisites', 'scale-to-zero': 'status', all: '' };
+
+function toGuide(res, topic, ext = '') {
+  const name = topic == null ? '' : (Object.hasOwn(GUIDE_TOPIC, topic) ? GUIDE_TOPIC[topic] : topic);
+  const url = name ? `${GUIDE}/${encodeURIComponent(name)}${ext}` : (ext ? `${GUIDE}/index${ext}` : GUIDE);
   res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  // A revalidating client costs us nothing and costs the agent no tokens.
-  if (req.headers['if-none-match'] === etag) return res.status(304).end();
-  res.status(200).send(body);
+  res.redirect(301, url);
 }
 
-function sendTopic(req, res, name) {
-  const topic = resolveTopic(name);
-  if (!topic) {
-    return res.status(404).json({
-      error: `No capabilities topic called "${name}".`,
-      code: 'unknown_topic',
-      topics: TOPICS.map((t) => t.topic),
-      next: 'Pick one of topics, or read links.contents for what each one covers.',
-      links: { contents: `https://${req.get('host')}/capabilities` },
-    });
-  }
-  const served = TOPICS_SERVED[topic.topic];
-  return sendCapabilities(req, res, served.body, served.etag);
-}
-
-app.get('/capabilities', (req, res) => {
-  if (req.query.feature) return sendTopic(req, res, req.query.feature);
-  return sendCapabilities(req, res, CONTENTS_SERVED.body, CONTENTS_SERVED.etag);
+app.get('/capabilities', (req, res) => toGuide(res, req.query.feature ? String(req.query.feature).toLowerCase() : null));
+app.get('/capabilities/:topic', (req, res) => {
+  const [, topic, ext = ''] = /^(.*?)(\.md|\.json)?$/i.exec(req.params.topic.toLowerCase());
+  toGuide(res, topic, ext);
 });
-
-app.get('/capabilities/all', (req, res) => sendCapabilities(req, res, CAPABILITIES_BODY, CAPABILITIES_ETAG));
-
-app.get('/capabilities/:topic', (req, res) => sendTopic(req, res, req.params.topic));
 
 app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
@@ -1659,7 +1640,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
  * endpoint above does — hostnsoft-api owns all four, and the job spec
  * has to be rebuilt from scratch under the new name anyway.
  *
- * NOT RATE LIMITED HERE. capabilities.js advertises one change per week
+ * NOT RATE LIMITED HERE. The docs advertise one change per week
  * per app; that quota lives in hostnsoft-api, which owns the project
  * record the count hangs off and is the only caller of this route. This
  * side would have nowhere durable to keep it — see deploy-status.js on why
