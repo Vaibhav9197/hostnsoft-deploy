@@ -204,6 +204,11 @@ const app = express();
 // and every anonymous deploy would share ONE rate-limit counter (see
 // rate-limit.js). Exactly one hop is trusted: a client cannot
 // forge its address by sending its own X-Forwarded-For.
+//
+// When Cloudflare proxies the host, the rate limiter reads the client
+// address from CF-Connecting-IP instead (rate-limit.js clientIp()), so
+// a load balancer between Cloudflare and Traefik does not collapse
+// every client into one address.
 app.set('trust proxy', 1);
 
 // First, ahead of every route — assigns a unique id to each request so
@@ -267,10 +272,26 @@ const UPLOAD_MAX_BYTES = parseInt(process.env.UPLOAD_MAX_BYTES, 10) || 100 * 102
 const upload = multer({ dest: '/tmp/platform-uploads/', limits: { fileSize: UPLOAD_MAX_BYTES } });
 
 // Caps how often one caller may upload (see rate-limit.js). Runs BEFORE
-// multer so a rejected request never touches the disk. One budget for
-// everyone, counted per deploy token, per company for dashboard uploads,
-// or per client IP for anonymous deploys.
-const { createLimiter, intEnv } = require('./rate-limit');
+// multer so a rejected request never touches the disk. Two counters,
+// checked in this order:
+//
+//   1. uploadIpRateLimit — per client IP, for EVERY request, token or
+//      not. identifyCaller() does not validate the token, so without
+//      this one machine could mint a fresh budget per made-up token.
+//      Looser than the per-caller limit because an office NAT or a CI
+//      runner pool puts many honest callers behind one address.
+//   2. uploadRateLimit — per deploy token, per company for dashboard
+//      uploads, or per client IP for anonymous deploys.
+//
+// IP first, so a flood from one address is refused before it touches
+// the per-token counter of a token that is also in honest use elsewhere.
+const { createLimiter, ipLimiter, intEnv } = require('./rate-limit');
+const uploadIpRateLimit = ipLimiter({
+  prefix: 'upload-ip',
+  limit: intEnv('UPLOAD_IP_LIMIT', 30),
+  windowMs: intEnv('UPLOAD_IP_LIMIT_WINDOW_MIN', 1) * 60_000,
+  label: 'uploads',
+});
 const uploadRateLimit = createLimiter({
   prefix: 'upload',
   limit: intEnv('UPLOAD_LIMIT', 10),
@@ -749,7 +770,7 @@ function uploadSizeError(err, req, res, next) {
   return next(err);
 }
 
-app.post('/apps', uploadRateLimit, upload.single('source'), uploadSizeError, jsonSource, async (req, res) => {
+app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), uploadSizeError, jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
 
   // Multer has already written the upload to disk by the time this runs,
