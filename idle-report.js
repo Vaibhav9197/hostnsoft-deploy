@@ -23,6 +23,7 @@ const execFileAsync = promisify(execFile);
 const { getDb, isAnalyticsEnabled } = require('./analytics/db');
 const { appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const { isBotRequest } = require('./analytics/bot-filter');
+const { isLitestreamPath } = require('./sqlite-data-check');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
 const { allApps, hostnamesFor, regenerateRouters, ROUTER_FILE } = require('./scale-to-zero-registry');
@@ -183,8 +184,12 @@ async function snapshotAppData(appName) {
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const full = `${entry.parentPath || entry.path}/${entry.name}`;
+    const rel = full.slice(dataDir.length + 1);
+    // Still copied by cp -a below; just not something the wake check can
+    // hold Litestream to (see isLitestreamPath).
+    if (isLitestreamPath(rel)) continue;
     const stat = await fsp.stat(full);
-    files.push({ path: full.slice(dataDir.length + 1), bytes: stat.size });
+    files.push({ path: rel, bytes: stat.size });
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
 

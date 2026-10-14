@@ -65,4 +65,17 @@ function manifestEntryProblem(f, actual, sqliteMains) {
   return null;
 }
 
-module.exports = { isSqliteFile, manifestEntryProblem, SQLITE_HEADER };
+/**
+ * Litestream's own state: the `.<db>-litestream/` directory it keeps next
+ * to each database (shadow WAL, generations). Not app data, and NOT
+ * quiescent while the app is stopped — Litestream keeps running and
+ * rotates and deletes its segments on its own schedule. Kept out of the
+ * stop-time manifest and skipped by the wake-time check; before both,
+ * a manifest listing a segment Litestream later deleted kept the app
+ * from ever waking (walkover-directory, 2026-10-14).
+ */
+function isLitestreamPath(p) {
+  return /(^|\/)\.[^/]*-litestream\//.test(p);
+}
+
+module.exports = { isSqliteFile, manifestEntryProblem, isLitestreamPath, SQLITE_HEADER };
