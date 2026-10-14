@@ -262,8 +262,8 @@ app.use(
 // Configure Multer to save uploaded files to a temporary folder.
 // fileSize caps one tarball so a single upload cannot fill the disk;
 // multer stops writing at the cap and the handler below answers 413.
-// Optional, defaults to 500 MB.
-const UPLOAD_MAX_BYTES = parseInt(process.env.UPLOAD_MAX_BYTES, 10) || 500 * 1024 * 1024;
+// Optional, defaults to 100 MB.
+const UPLOAD_MAX_BYTES = parseInt(process.env.UPLOAD_MAX_BYTES, 10) || 100 * 1024 * 1024;
 const upload = multer({ dest: '/tmp/platform-uploads/', limits: { fileSize: UPLOAD_MAX_BYTES } });
 
 // Caps how often one caller may upload (see rate-limit.js). Runs BEFORE
