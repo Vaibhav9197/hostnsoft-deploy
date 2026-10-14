@@ -45,7 +45,7 @@ function startRetentionLoop() {
     } catch (e) {
       logger.error(`[analytics-retention] initial prune failed: ${e.message}`);
     }
-  }, 60 * 1000);
+  }, 60 * 1000).unref(); // .unref(): don't keep the process alive on shutdown
 
   setInterval(() => {
     try {
@@ -53,7 +53,7 @@ function startRetentionLoop() {
     } catch (e) {
       logger.error(`[analytics-retention] prune failed: ${e.message}`);
     }
-  }, RUN_INTERVAL_MS);
+  }, RUN_INTERVAL_MS).unref(); // .unref(): don't keep the process alive on shutdown
 }
 
 module.exports = { startRetentionLoop };

@@ -217,7 +217,7 @@ function startResourcePoller() {
   tick().catch((e) => logger.error(`[resource-poller] initial tick failed: ${e.message}`));
   setInterval(() => {
     tick().catch((e) => logger.error(`[resource-poller] tick failed: ${e.message}`));
-  }, POLL_INTERVAL_MS);
+  }, POLL_INTERVAL_MS).unref(); // .unref(): don't keep the process alive on shutdown
 }
 
 module.exports = { startResourcePoller };

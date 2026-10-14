@@ -1847,9 +1847,33 @@ app.get('/internal/apps/:appName/analytics', requireInternalSecret, async (req, 
 // (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
 // without colliding; defaults to 4000 to match prior fixed behavior.
 const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
+  // Tell pm2 we can serve (wait_ready). No-op outside pm2.
+  if (process.send) process.send('ready');
 });
+
+// Graceful shutdown, same shape as api-service. pm2 sends SIGINT on
+// reload/stop (SIGTERM from docker/systemd); without a handler Node would
+// exit at once, cutting in-flight requests and background builds. Close
+// the server, give in-flight requests and background builds the grace
+// period, then exit. pm2 kill_timeout must be longer than this.
+// server-setup.md#zero-downtime
+const SHUTDOWN_GRACE_MS = 120000;
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`[server] ${signal} received: closing HTTP server, finishing in-flight work`);
+  server.close(() => logger.info('[server] HTTP server closed'));
+  setTimeout(() => {
+    logger.info(`[server] grace period of ${SHUTDOWN_GRACE_MS / 1000}s over, exiting`);
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // Started after listen() so a broken analytics subsystem can never
 // prevent the actual deploy pipeline from coming up — each function
