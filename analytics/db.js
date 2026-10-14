@@ -55,6 +55,10 @@ function getDb() {
   // WAL so the tailer/poller (writers) and an incoming analytics request
   // (reader) never block each other.
   db.exec('PRAGMA journal_mode = WAL');
+  // Other processes (idle-report.js, Litestream) also write to this file.
+  // Without a busy_timeout SQLite fails instantly on overlap instead of
+  // waiting the few milliseconds the other writer needs.
+  db.exec('PRAGMA busy_timeout = 5000');
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS request_log (
