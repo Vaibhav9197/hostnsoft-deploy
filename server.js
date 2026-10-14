@@ -125,6 +125,7 @@ const SCHEDULING_FLOOR_MB = 32;
 // backing hostnsoft-api's project-health field (previously hardcoded to
 // "unknown"). See app-health.js.
 const { getAppHealth } = require('./app-health');
+const { getPlatformHealth } = require('./platform-health');
 
 // NEW: GET /internal/apps/:appName/analytics — per-app traffic (from
 // Traefik's access log) and CPU/memory (from Nomad's stats API) history,
@@ -199,6 +200,15 @@ const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || 'http://localhost:3000'
   .filter(Boolean);
 
 const app = express();
+
+// Ahead of the request-id middleware below, so it is never logged: an
+// uptime monitor polls this every minute, which would add ~2900 lines a
+// day. platform-health.js logs the failures itself. No auth, no CORS —
+// the monitor is not a browser and the body carries only ok/down.
+app.get('/health', async (req, res) => {
+  const { ok, body } = await getPlatformHealth();
+  res.status(ok ? 200 : 503).json(body);
+});
 
 // First, ahead of every route — assigns a unique id to each request so
 // every log line made while handling it (anywhere, including inside
