@@ -12,9 +12,12 @@ const cors = require('cors');
 const multer = require('multer');
 const tar = require('tar');
 const fs = require('fs-extra');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+// Argument-array runner: no shell, so a value passed as an arg can never be
+// parsed as a command. Use for any command built from caller-supplied data.
+const execFilePromise = util.promisify(execFile);
 const { randomUUID } = require('crypto');
 const logger = require('./logger');
 const { runWithRequestId } = require('./request-context');
@@ -1677,8 +1680,14 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
   }
-  if (typeof imageTag !== 'string' || !imageTag.includes(':')) {
-    return res.status(400).json({ error: 'imageTag is required and must be a full "name:version" image reference' });
+  // imageTag is interpolated into `docker image inspect` and into the Nomad
+  // job's `image = "..."` field, so it must be exactly this app's own image
+  // reference and nothing else. appName is already /^[a-z0-9-]+$/ (checked
+  // above), so it is safe to anchor the pattern on it. This rejects a tag
+  // for another app's image and any shell/template metacharacters.
+  const imageTagPattern = new RegExp('^' + appName + ':[A-Za-z0-9._-]+$');
+  if (typeof imageTag !== 'string' || !imageTagPattern.test(imageTag)) {
+    return res.status(400).json({ error: 'imageTag must be "<appName>:<version>" using letters, digits, dot, dash, underscore in the version.' });
   }
   if (!Array.isArray(customDomains) || !customDomains.every((d) => typeof d === 'string')) {
     return res.status(400).json({ error: "customDomains must be an array of strings" });
@@ -1769,7 +1778,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   // fail deep in its own retry/placement logic with a confusing
   // "pull access denied" error unrelated to the actual cause.
   try {
-    await execPromise(`docker image inspect ${imageTag}`);
+    await execFilePromise('docker', ['image', 'inspect', imageTag]);
   } catch (e) {
     logger.warn(`[${appName}] Requested image "${imageTag}" not found locally, refusing config update`);
     // code + retainCount let the caller (hostnsoft-api's rollback route)
