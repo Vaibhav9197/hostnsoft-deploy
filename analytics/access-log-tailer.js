@@ -130,7 +130,7 @@ function tick(logPath) {
     if (rotated) {
       db.prepare(
         'INSERT INTO tail_state (log_path, inode, byte_offset) VALUES (?, ?, ?) ' +
-          'ON CONFLICT(log_path) DO UPDATE SET inode = excluded.inode, byte_offset = excluded.byte_offset'
+        'ON CONFLICT(log_path) DO UPDATE SET inode = excluded.inode, byte_offset = excluded.byte_offset'
       ).run(logPath, stat.ino, newOffset);
     }
     return;
@@ -149,7 +149,7 @@ function tick(logPath) {
     }
     db.prepare(
       'INSERT INTO tail_state (log_path, inode, byte_offset) VALUES (?, ?, ?) ' +
-        'ON CONFLICT(log_path) DO UPDATE SET inode = excluded.inode, byte_offset = excluded.byte_offset'
+      'ON CONFLICT(log_path) DO UPDATE SET inode = excluded.inode, byte_offset = excluded.byte_offset'
     ).run(logPath, stat.ino, fromOffset + consumedBytes);
     db.exec('COMMIT');
   } catch (e) {
@@ -175,7 +175,7 @@ function startAccessLogTailer() {
     } catch (e) {
       logger.error(`[access-log-tailer] tick failed: ${e.message}`);
     }
-  }, POLL_INTERVAL_MS);
+  }, POLL_INTERVAL_MS).unref(); // .unref(): don't keep the process alive on shutdown
 }
 
 module.exports = { startAccessLogTailer, appNameFromRouterName };
