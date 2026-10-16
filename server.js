@@ -142,6 +142,7 @@ const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/
 // in-process (see GET /apps/:appName/status) and app-logs.js/
 // project-lookup.js back that endpoint and GET /apps/:appName/logs.
 const { setDeployState, getDeployState, clearDeployState } = require('./deploy-status');
+const { beginDeploy, isDeployInFlight } = require('./deploy-in-flight');
 const { lookupProject } = require('./project-lookup');
 const { verifyProxyAuthCompanyAccess } = require('./verify-proxy-auth');
 const { getAppLogs } = require('./app-logs');
@@ -839,6 +840,15 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     return reject(claim.status, claim.code, claim.error);
   }
 
+  // In flight from the claim on, for orphan cleanup's teardown (see
+  // deploy-in-flight.js). This registration covers the request itself and
+  // ends with its response, whichever way that goes; a build that carries
+  // on in the background takes its own registration below, before the
+  // response goes out, so there's no gap between the two.
+  const endRequestInFlight = beginDeploy(appName);
+  res.once('finish', endRequestInFlight);
+  res.once('close', endRequestInFlight);
+
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
     return reject(400, 'invalid_app_version', "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", {}, true);
   }
@@ -1122,6 +1132,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       backgroundOwnsFiles = true;
       let settle;
       const outcome = new Promise((resolve) => { settle = resolve; });
+      const endStaticInFlight = beginDeploy(appName);
       performStaticDeploy({
         appName, appVersion, imageName, domain,
         buildDir, filePath: req.file.path,
@@ -1130,7 +1141,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       }).catch((err) => {
         logger.error(`[${appName}] unexpected error in static deploy: ${err.message}`);
         settle('failed');
-      });
+      }).finally(endStaticInFlight);
 
       let timer;
       const result = await Promise.race([
@@ -1149,6 +1160,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     }
 
     backgroundOwnsFiles = true;
+    const endBuildInFlight = beginDeploy(appName);
     // A server app's build takes minutes: answer at once and let the agent
     // poll. The claim and showcase steps come later, in the status reply,
     // once the app is actually live — see deploy-response.js.
@@ -1164,7 +1176,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       scaleToZeroOptIn, scaleToZeroOptOut,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
-    });
+    }).finally(endBuildInFlight);
 
   } catch (error) {
     // Only the SYNCHRONOUS section above (extraction, package.json read,
@@ -1723,6 +1735,16 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
   const { appName } = req.params;
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
+  }
+
+  // ?ifIdle=1 (orphan cleanup only): leave an app with a deploy in flight
+  // alone and say so, rather than tearing it down under a build that would
+  // bring it back up afterwards — see deploy-in-flight.js. hostnsoft-api
+  // retries on its next cleanup run. Without the flag a deploy in flight
+  // doesn't stop a teardown, as before.
+  if (req.query.ifIdle === '1' && isDeployInFlight(appName)) {
+    logger.info(`[${appName}] Teardown skipped: a deploy is in progress`);
+    return res.status(409).json({ error: "A deploy of this app is in progress", code: "deploy_in_progress" });
   }
 
   try {
