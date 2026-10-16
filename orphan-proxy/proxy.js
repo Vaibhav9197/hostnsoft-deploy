@@ -294,6 +294,19 @@ const BACKEND_WAIT_MS = Number(process.env.BACKEND_WAIT_MS) || 60000;
 const BACKEND_RETRY_DELAY_MS = 300;
 const RETRYABLE = new Set(['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'EPIPE']);
 
+// Injecting the banner means buffering the whole HTML body (raw chunks,
+// joined buffer, rewritten string — roughly 3x the page size). Bound
+// that: an HTML response bigger than this is streamed through with no
+// banner rather than held in memory. Real pages are well under 100KB.
+const BANNER_MAX_HTML_BYTES = Number(process.env.BANNER_MAX_HTML_BYTES) || 3 * 1024 * 1024;
+// Caps on how many in-flight requests can hold buffers at once and for
+// how long, so slow or stuck clients cannot pile memory up until the
+// container is OOM killed.
+const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS) || 1000;
+const HEADERS_TIMEOUT_MS = Number(process.env.HEADERS_TIMEOUT_MS) || 30000;
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 300000;
+const KEEPALIVE_TIMEOUT_MS = Number(process.env.KEEPALIVE_TIMEOUT_MS) || 5000;
+
 const server = http.createServer((clientReq, clientRes) => {
   const banner = bannerConfigFor(clientReq);
   const headers = { ...clientReq.headers };
@@ -314,15 +327,36 @@ const server = http.createServer((clientReq, clientRes) => {
       { host: TARGET_HOST, port: TARGET_PORT, method: clientReq.method, path: clientReq.url, headers },
       (proxyRes) => {
         const contentType = proxyRes.headers['content-type'] || '';
-        if (!banner || !contentType.startsWith('text/html')) {
+        const declaredLength = Number(proxyRes.headers['content-length']);
+        const tooBig = Number.isFinite(declaredLength) && declaredLength > BANNER_MAX_HTML_BYTES;
+        if (!banner || !contentType.startsWith('text/html') || tooBig) {
           clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
           proxyRes.pipe(clientRes);
           return;
         }
 
+        // Buffer the body; if it turns out bigger than the cap (no or
+        // wrong content-length), stop buffering and flush what we have
+        // plus the rest, untouched.
         const chunks = [];
-        proxyRes.on('data', (chunk) => chunks.push(chunk));
+        let received = 0;
+        let bailed = false;
+        proxyRes.on('data', (chunk) => {
+          if (bailed) return;
+          received += chunk.length;
+          chunks.push(chunk);
+          if (received > BANNER_MAX_HTML_BYTES) {
+            bailed = true;
+            const outHeaders = { ...proxyRes.headers };
+            delete outHeaders['content-length'];
+            clientRes.writeHead(proxyRes.statusCode, outHeaders);
+            for (const c of chunks) clientRes.write(c);
+            chunks.length = 0;
+            proxyRes.pipe(clientRes);
+          }
+        });
         proxyRes.on('end', () => {
+          if (bailed) return;
           const injected = injectBanner(Buffer.concat(chunks).toString('utf8'), banner);
           const outHeaders = { ...proxyRes.headers };
           delete outHeaders['content-encoding'];
@@ -398,6 +432,11 @@ server.on('upgrade', (req, clientSocket, head) => {
   };
   connect();
 });
+
+server.maxConnections = MAX_CONNECTIONS;
+server.headersTimeout = HEADERS_TIMEOUT_MS;
+server.requestTimeout = REQUEST_TIMEOUT_MS;
+server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
 
 server.listen(Number(LISTEN_PORT), LISTEN_HOST, () => {
   const mode = FOOTER_ALWAYS
