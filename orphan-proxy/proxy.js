@@ -6,9 +6,10 @@
  * ../docs/Anonymous-deploy-req.md #5) — or, as ONE shared instance run
  * by the static-server Nomad job, in front of the static server for
  * every orphan STATIC app (../docs/Static-apps-req.md) — and rewrites any text/html
- * response to add a small expiry banner (top of the page) and a "hosted on
- * Embarko" footer (end of the page), both in normal flow, via a script
- * tag injected just before `</body>` (or appended, if none is found).
+ * response to add a small expiry banner (top of the page, normal flow) and
+ * a "hosted on Embarko" badge (a fixed pill, bottom-left of the viewport,
+ * always visible like a chat-widget launcher), via a script tag injected
+ * just before `</body>` (or appended, if none is found).
  * Every other response — JSON, assets,
  * streaming, WebSocket upgrades — passes through completely untouched.
  *
@@ -147,102 +148,193 @@ function buildBannerTag(expiresAt, loginUrl) {
 })();</script>`;
 }
 
+const BADGE_LOGO =
+  '<svg class="mk" viewBox="0 0 245 245" aria-hidden="true"><path d="M160.814 10.2161C170.654 9.8409 181.953 10.0699 191.858 10.0622C206.239 10.0092 220.619 10.0453 235 10.1702C233.881 12.4335 232.574 16.1623 231.5 18.6242C228.397 25.7222 225.516 31.6883 221.392 38.222C207.797 59.7602 188.871 73.0528 163.847 77.542C158.232 78.5493 152.569 79.1037 146.887 79.9221C140.545 80.8948 134.242 82.1144 127.993 83.5781C110.442 87.7762 96.8738 94.0396 81.2197 102.542C67.9784 110.667 55.8537 119.543 45.2649 131.08C43.3882 133.125 41.9269 135.482 40.2539 137.689C43.9665 125.108 47.6806 111.899 51.1877 99.2142C57.498 76.3896 62.3088 54.4298 79.2498 36.5815C102.089 12.5188 129.884 10.7803 160.814 10.2161Z"/><path d="M20.274 204.37C23.1248 192.924 27.7038 181.585 30.6594 170.158C32.9809 161.181 37.3719 155.745 42.7256 148.471C63.2563 120.579 95.4262 104.485 129.698 103.155C136.709 102.885 143.892 102.983 150.98 102.987C161.986 102.944 172.99 102.96 183.995 103.036C190.715 103.077 198.693 103.32 205.293 103.075C202.997 108.772 200.074 116.52 197.032 121.819C188.598 136.504 175.911 150.486 160.304 157.316C144.726 164.134 132.967 163.455 116.764 163.35C88.869 163.169 62.2926 171.497 40.144 188.701C33.4593 193.893 28.0684 199.519 22.0943 205.478C21.186 206.771 19.6305 208.519 18.5747 209.771C18.9406 208.227 19.7599 205.937 20.274 204.37Z"/><path d="M92.2857 184.037C103.114 183.192 117.676 184.546 128.782 184.705C144.418 184.929 159.94 184.922 175.577 184.932L189.842 184.908C192.668 184.897 196.095 184.979 198.868 184.647C194.889 190.952 191.513 196.544 186.634 202.328C175.038 216.079 158.911 225.853 141.725 230.669C133.536 232.964 125.313 233.938 116.913 234.654C101.028 234.96 85.1385 235.062 69.2503 234.964L10 234.929C11.8399 231.777 16.9894 224.685 19.325 221.969C39.6946 198.277 61.3318 186.485 92.2857 184.037Z"/></svg>';
+
 const FOOTER_CSS = [
-  ':host{all:initial;display:block;width:100%}',
   '*{box-sizing:border-box;margin:0}',
-  '.embarko-colophon{--bg:#faf9f6;--ink:#20201f;--muted:#6a6863;--line:#dcd9d2;width:100%;padding:0 36px;background:var(--bg);color:var(--ink);border-top:1px solid var(--line);font:400 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;text-align:center;-webkit-font-smoothing:antialiased}',
-  '.em-dark{--bg:#171817;--ink:#f0efeb;--muted:#b2b1ab;--line:#363735;color-scheme:dark}',
-  '.em-inner{max-width:1160px;min-height:150px;margin:0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
-  '.em-line{font:italic 24px/1.3 Georgia,"Times New Roman",serif;color:var(--ink)}',
-  '.em-bottom{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap}',
-  '.em-credit{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:15px}',
-  '.em-brand{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;color:var(--ink);text-decoration:none}',
-  '.em-mark{display:block;width:18px;height:18px;flex:none;fill:currentColor;transition:transform .3s ease}',
-  '.em-word{font-weight:550;font-size:16px;letter-spacing:-.25px}',
-  '.em-dot{width:3px;height:3px;border-radius:50%;background:var(--muted)}',
-  '.em-cta{display:inline-flex;align-items:center;gap:8px;min-height:32px;color:var(--ink);text-decoration:none;font:400 15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;white-space:nowrap;cursor:pointer}',
-  '.em-arrow{width:16px;height:16px;flex:none;transition:transform .22s ease}',
-  '.em-cta:hover .em-label{text-decoration:underline;text-underline-offset:4px}',
-  '.em-cta:hover .em-arrow,.em-cta:focus-visible .em-arrow{transform:translate(2px,-2px)}',
-  '.em-inner:has(.em-cta:hover) .em-mark{transform:translateX(3px)}',
-  'a:focus-visible{outline:2px solid var(--ink);outline-offset:5px;border-radius:4px}',
-  '@media (max-width:600px){.embarko-colophon{padding:0 22px}.em-inner{min-height:136px}.em-line{font-size:20px}.em-bottom{gap:9px}}',
-  '@media (prefers-reduced-motion:reduce){.em-mark,.em-arrow{transition:none}}',
+  // Surface tokens: light by default, dark via data-tone, more opaque via data-busy
+  '.w{--s:rgba(255,255,255,.62);--ink:#111214;--mut:rgba(17,18,20,.6);--edge:rgba(0,0,0,.09);--hi:rgba(255,255,255,.6);',
+  '--sh:0 1px 2px rgba(0,0,0,.05),0 6px 20px rgba(0,0,0,.07);--cta:#111214;--cta-ink:#fff;--cta-h:#2b2c2f;',
+  '--pw:116px;--ph:32px;--cw:248px;--ch:150px;position:relative;display:inline-block}',
+  '.b{position:relative;width:var(--pw);height:var(--ph);border-radius:16px;overflow:hidden;color:var(--ink);',
+  'background:var(--s);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);',
+  'border:1px solid var(--edge);box-shadow:inset 0 1px 0 var(--hi),var(--sh);',
+  'font:400 13px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;letter-spacing:-.005em;-webkit-font-smoothing:antialiased;',
+  'transition:width .3s cubic-bezier(.2,.8,.2,1),height .3s cubic-bezier(.2,.8,.2,1),border-radius .3s cubic-bezier(.2,.8,.2,1),background-color .3s ease,border-color .3s ease,color .3s ease}',
+  '.w[data-busy]{--s:rgba(255,255,255,.86)}',
+  '.w[data-tone=dark]{--s:rgba(30,30,32,.56);--ink:#f5f5f7;--mut:rgba(245,245,247,.62);--edge:rgba(255,255,255,.13);--hi:rgba(255,255,255,.07);',
+  '--sh:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35);--cta:#f5f5f7;--cta-ink:#111214;--cta-h:#fff}',
+  '.w[data-tone=dark][data-busy]{--s:rgba(30,30,32,.84)}',
+  '.b.open{width:var(--cw);height:var(--ch);border-radius:14px}',
+  '.mk{display:block;width:14px;height:14px;flex:none;fill:currentColor}',
+  'button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}',
+  // Dismiss (hover-revealed, top-right corner of the capsule)
+  '.dis{position:absolute;top:-7px;right:-7px;z-index:1;width:18px;height:18px;border-radius:50%;background:var(--s);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);border:1px solid var(--edge);box-shadow:inset 0 1px 0 var(--hi),var(--sh);color:var(--ink);display:grid;place-items:center;opacity:0;transform:scale(.8);transition:opacity .15s ease,transform .15s ease,background-color .2s ease}',
+  '.dis svg{width:8px;height:8px}',
+  '.dis:hover{background:var(--edge)}',
+  '.w:hover .dis,.w:focus-within .dis{opacity:1;transform:none}',
+  '.w.open .dis{display:none}',
+  '@media (hover:none){.dis{opacity:1;transform:none}}',
+  // Pill
+  '.pill{position:absolute;left:0;bottom:0;height:calc(var(--ph) - 2px);display:inline-flex;align-items:center;gap:6px;padding:0 13px 0 11px;font-weight:500;white-space:nowrap;transition:opacity .15s ease .12s}',
+  '.open .pill{opacity:0;pointer-events:none;transition-delay:0s}',
+  // Card
+  '.card{position:absolute;left:0;bottom:0;width:calc(var(--cw) - 2px);padding:12px 12px 12px 14px;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .15s ease,transform .2s ease,visibility 0s linear .2s}',
+  '.open .card{opacity:1;visibility:visible;transform:none;transition:opacity .2s ease .1s,transform .25s ease .08s,visibility 0s}',
+  '.hd{display:flex;align-items:center;gap:6px;font-weight:600}',
+  '.x{margin-left:auto;width:24px;height:24px;display:grid;place-items:center;border-radius:7px;color:var(--mut)}',
+  '.x:hover{background:var(--edge);color:var(--ink)}',
+  '.x svg{width:12px;height:12px}',
+  '.t{margin-top:8px;font-size:15px;font-weight:600;line-height:1.3;letter-spacing:-.01em;padding-right:2px}',
+  '.d{margin-top:2px;color:var(--mut)}',
+  '.cta{margin-top:12px;display:flex;align-items:center;justify-content:center;gap:6px;height:34px;border-radius:9px;background:var(--cta);color:var(--cta-ink);text-decoration:none;font-weight:600;transition:background .2s ease}',
+  '.cta:hover{background:var(--cta-h)}',
+  '.cta svg{width:13px;height:13px;transition:transform .2s ease}',
+  '.cta:hover svg,.cta:focus-visible svg{transform:translate(2px,-2px)}',
+  '.pill:focus-visible,.x:focus-visible,.dis:focus-visible,.cta:focus-visible{outline:2px solid var(--ink);outline-offset:2px;border-radius:10px}',
+  '@media (max-width:420px){.b{--cw:min(240px,calc(100vw - 24px))}}',
+  '@media (prefers-reduced-motion:reduce){*{transition-duration:0s!important;transition-delay:0s!important}}',
 ].join('');
 
 const FOOTER_HTML =
-  '<footer class="embarko-colophon em-dark" aria-label="Hosting credit: Embarko">' +
-  '<div class="em-inner">' +
-  '<p class="em-line">A little place on the internet.</p>' +
-  '<div class="em-bottom">' +
-  '<span class="em-credit">Hosted on <a class="em-brand" data-em-link>' +
-  '<svg class="em-mark" viewBox="0 0 245 245" aria-hidden="true"><path d="M160.814 10.2161C170.654 9.8409 181.953 10.0699 191.858 10.0622C206.239 10.0092 220.619 10.0453 235 10.1702C233.881 12.4335 232.574 16.1623 231.5 18.6242C228.397 25.7222 225.516 31.6883 221.392 38.222C207.797 59.7602 188.871 73.0528 163.847 77.542C158.232 78.5493 152.569 79.1037 146.887 79.9221C140.545 80.8948 134.242 82.1144 127.993 83.5781C110.442 87.7762 96.8738 94.0396 81.2197 102.542C67.9784 110.667 55.8537 119.543 45.2649 131.08C43.3882 133.125 41.9269 135.482 40.2539 137.689C43.9665 125.108 47.6806 111.899 51.1877 99.2142C57.498 76.3896 62.3088 54.4298 79.2498 36.5815C102.089 12.5188 129.884 10.7803 160.814 10.2161Z"/><path d="M20.274 204.37C23.1248 192.924 27.7038 181.585 30.6594 170.158C32.9809 161.181 37.3719 155.745 42.7256 148.471C63.2563 120.579 95.4262 104.485 129.698 103.155C136.709 102.885 143.892 102.983 150.98 102.987C161.986 102.944 172.99 102.96 183.995 103.036C190.715 103.077 198.693 103.32 205.293 103.075C202.997 108.772 200.074 116.52 197.032 121.819C188.598 136.504 175.911 150.486 160.304 157.316C144.726 164.134 132.967 163.455 116.764 163.35C88.869 163.169 62.2926 171.497 40.144 188.701C33.4593 193.893 28.0684 199.519 22.0943 205.478C21.186 206.771 19.6305 208.519 18.5747 209.771C18.9406 208.227 19.7599 205.937 20.274 204.37Z"/><path d="M92.2857 184.037C103.114 183.192 117.676 184.546 128.782 184.705C144.418 184.929 159.94 184.922 175.577 184.932L189.842 184.908C192.668 184.897 196.095 184.979 198.868 184.647C194.889 190.952 191.513 196.544 186.634 202.328C175.038 216.079 158.911 225.853 141.725 230.669C133.536 232.964 125.313 233.938 116.913 234.654C101.028 234.96 85.1385 235.062 69.2503 234.964L10 234.929C11.8399 231.777 16.9894 224.685 19.325 221.969C39.6946 198.277 61.3318 186.485 92.2857 184.037Z"/></svg>' +
-  '<span class="em-word">Embarko</span></a></span>' +
-  '<span class="em-dot" aria-hidden="true"></span>' +
-  '<a class="em-cta" data-em-link aria-label="Host your own app on Embarko (opens in a new tab)"><span class="em-label">Host yours</span>' +
-  '<svg class="em-arrow" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 12.5 12 4M4 4h8v8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>' +
+  '<div class="w">' +
+  '<button class="dis" type="button" aria-label="Hide Embarko badge"><svg viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>' +
+  '<div class="b" role="complementary" aria-label="Hosted on Embarko">' +
+  '<button class="pill" type="button" aria-expanded="false" aria-controls="c">' + BADGE_LOGO + '<span>Embarko</span></button>' +
+  '<div class="card" id="c">' +
+  '<div class="hd">' + BADGE_LOGO + '<span>Embarko</span>' +
+  '<button class="x" type="button" aria-label="Collapse"><svg viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5 6 7.5l3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>' +
+  '<p class="t">Hosting made ridiculously easy.</p>' +
+  '<p class="d">From simple websites and internal tools to full agentic applications.</p>' +
+  '<a class="cta" data-em-link target="_blank" rel="noopener noreferrer">Make yours live<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 12 12 4M5 4h7v7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>' +
   '</div>' +
   '</div>' +
-  '</footer>';
+  '</div>';
 
-// "Hosted on Embarko" colophon, appended as the last element of <body>
-// so it sits at the end of the page in normal flow. Same Shadow DOM
-// isolation as the banner, for the same reasons; unlike the banner there
-// is no unisolated fallback — on a browser without attachShadow the
-// footer is simply skipped. The ref is the page's own subdomain, so the
-// tag is identical for every app and every request — built once.
 const FOOTER_TAG = `<script>(function () {
   if (!document.documentElement.attachShadow) return;
+  if (window.__embarkoBadge) return; window.__embarkoBadge = true;
   var ref = location.hostname.split('.')[0];
 
-  var host = document.createElement('div');
+  // Shadow DOM keeps the badge's look safe from the host site's CSS
+  var host = document.createElement('embarko-badge');
   host.id = '__embarko_orphan_footer';
-  // Normal flow, last child of <body>. High z-index so a page's fixed
-  // sidebar/nav cannot sit over it.
-  host.style.cssText = 'all:initial;display:block;width:100%;position:relative;z-index:2147483647;';
-  var root = host.attachShadow({ mode: 'open' });
+  var root = host.attachShadow({ mode: 'closed' });
   root.innerHTML = '<style>' + ${JSON.stringify(FOOTER_CSS)} + '</style>' + ${JSON.stringify(FOOTER_HTML)};
+
+  var wrap = root.querySelector('.w'), box = root.querySelector('.b'), pill = root.querySelector('.pill'), card = root.querySelector('.card'), x = root.querySelector('.x'), dis = root.querySelector('.dis');
+  // Dismissed for this page view only — nothing is stored, so a reload shows it again.
+  var dismissed = false, observer = null, timer = null;
 
   root.querySelectorAll('[data-em-link]').forEach(function (a) {
     var u = new URL('https://embarko.ai/');
     if (ref) u.searchParams.set('ref', ref);
-    u.searchParams.set('utm_source', 'free_footer_colophon');
-    a.href = u.toString(); a.target = '_blank'; a.rel = 'noopener noreferrer';
+    u.searchParams.set('utm_source', 'free_badge');
+    a.href = u.toString();
   });
 
-  // Apps that render inside their own fixed full-viewport scroll box
-  // (Streamlit, some dashboards) leave <body> with no flow height, so a
-  // body-level footer lands at the TOP of the viewport. When that
-  // happens, append it at the end of that scroll box instead.
-  // ponytail: picks the first big overflow:auto element; good enough
-  // for Streamlit/Gradio, revisit if a nested-scroller app misplaces it.
-  function scrollBox() {
-    var els = document.body.getElementsByTagName('*');
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i], cs = getComputedStyle(el);
-      if (el === host) continue;
-      if (/auto|scroll/.test(cs.overflowY) && el.clientHeight >= innerHeight * .5 && el.clientWidth >= innerWidth * .5) return el;
-    }
-    return null;
-  }
-  var container = document.body, pending = false;
-  function place() {
-    pending = false;
-    if (!container.isConnected || (container === document.body && document.body.scrollHeight <= innerHeight && host.getBoundingClientRect().top < innerHeight * .5)) {
-      container = scrollBox() || document.body;
-    }
-    // SPAs (Next/React hydration) append their root AFTER this script
-    // ran, which pushed the footer above the app. Keep it last.
-    if (container.lastElementChild !== host) container.appendChild(host);
+  // ---- Mandatory: keep the badge attached, visible and at the bottom-left ----
+  var HOST_STYLE = ['all:initial', 'position:fixed', 'left:max(min(16px,3.2vw),env(safe-area-inset-left))', 'bottom:max(min(16px,3.2vw),env(safe-area-inset-bottom))',
+    'right:auto', 'top:auto', 'z-index:2147483646', 'display:block', 'visibility:visible', 'opacity:1', 'transform:none', 'filter:none', 'clip-path:none',
+    'pointer-events:auto', 'width:auto', 'height:auto', 'margin:0', 'padding:0'].map(function (d) { return d + ' !important'; }).join(';');
+  function enforce() {
+    if (dismissed) return;
+    if (!host.isConnected) (document.body || document.documentElement).appendChild(host);
+    if (host.getAttribute('style') !== HOST_STYLE) host.setAttribute('style', HOST_STYLE);
+    ['hidden', 'inert', 'aria-hidden', 'class'].forEach(function (a) { if (host.hasAttribute(a)) host.removeAttribute(a); });
   }
   function mount() {
-    place();
-    new MutationObserver(function () {
-      if (!pending) { pending = true; requestAnimationFrame(place); }
-    }).observe(document.body, { childList: true, subtree: true });
+    enforce(); measure(); tone();
+    var queued = false;
+    observer = new MutationObserver(function (recs) {
+      // Ignore pure attribute changes on the badge itself (our own writes)
+      if (recs.every(function (r) { return r.type === 'attributes' && r.target === host; })) { enforce(); return; }
+      if (queued) return; queued = true; setTimeout(function () { queued = false; enforce(); tone(); }, 200);
+    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
+    timer = setInterval(enforce, 2000);
   }
-  if (document.body) mount();
-  else document.addEventListener('DOMContentLoaded', mount);
+
+  // ---- Size the box to fit the pill and card exactly ----
+  function measure() {
+    box.style.setProperty('--pw', (pill.offsetWidth + 2) + 'px');
+    box.style.setProperty('--ch', (card.offsetHeight + 2) + 'px');
+  }
+
+  // ---- Adaptive contrast: read what sits behind the badge ----
+  var cv = document.createElement('canvas').getContext('2d');
+  function rgba(str) {
+    if (!str || str === 'transparent') return null;
+    cv.fillStyle = '#000'; cv.fillStyle = str; var v = cv.fillStyle, m;
+    if (v[0] === '#') return { r: parseInt(v.substr(1, 2), 16), g: parseInt(v.substr(3, 2), 16), b: parseInt(v.substr(5, 2), 16), a: 1 };
+    if ((m = v.match(/rgba?\\(([^)]+)\\)/))) { var p = m[1].split(/[\\s,\\/]+/).map(parseFloat); return { r: p[0], g: p[1], b: p[2], a: p[3] == null ? 1 : p[3] }; }
+    return null;
+  }
+  function lum(c) { function f(v) { v /= 255; return v <= .03928 ? v / 12.92 : Math.pow((v + .055) / 1.055, 2.4); } return .2126 * f(c.r) + .7152 * f(c.g) + .0722 * f(c.b); }
+  var MEDIA = { IMG: 1, VIDEO: 1, CANVAS: 1, IFRAME: 1, PICTURE: 1, svg: 1, EMBED: 1, OBJECT: 1 };
+  // Composite the stack of elements under one point, top to bottom
+  function sample(px, py) {
+    var els = document.elementsFromPoint(px, py), acc = { r: 0, g: 0, b: 0, a: 0 }, busy = false, unknown = false, top = null;
+    for (var i = 0; i < els.length && acc.a < .99; i++) {
+      var el = els[i]; if (el === host) continue; if (!top) top = el;
+      if (MEDIA[el.tagName]) { busy = unknown = true; break; }
+      var cs = getComputedStyle(el), c = rgba(cs.backgroundColor);
+      if (cs.backgroundImage && cs.backgroundImage !== 'none') {
+        busy = true;
+        // Gradients: average their colour stops. url() images can't be read
+        var stops = cs.backgroundImage.match(/rgba?\\([^)]+\\)|#[0-9a-f]{3,8}\\b/gi);
+        if (/url\\(/.test(cs.backgroundImage) || !stops) { unknown = true; break; }
+        var s = { r: 0, g: 0, b: 0 }; stops.forEach(function (t) { var k = rgba(t) || { r: 0, g: 0, b: 0 }; s.r += k.r; s.g += k.g; s.b += k.b; });
+        var n = stops.length; c = { r: s.r / n, g: s.g / n, b: s.b / n, a: 1 };
+      }
+      if (c && c.a > 0) { var w = (1 - acc.a) * c.a; acc.r += c.r * w; acc.g += c.g * w; acc.b += c.b * w; acc.a += w; }
+    }
+    // Fill what's left: white page canvas, or, behind images/video, a guess from the site's
+    // own text colour there (light text means the site made that area dark)
+    var fill = 255;
+    if (unknown && top) { var tc = rgba(getComputedStyle(top).color); if (tc && lum(tc) > .4) fill = 0; }
+    if (acc.a < .99) { var w2 = 1 - acc.a; acc.r += fill * w2; acc.g += fill * w2; acc.b += fill * w2; }
+    return { l: lum(acc), busy: busy };
+  }
+  var lastTone = '';
+  function tone() {
+    if (dismissed || !host.isConnected) return;
+    var r = host.getBoundingClientRect(), open = box.classList.contains('open');
+    var w = open ? card.offsetWidth : r.width, h = open ? card.offsetHeight : r.height;
+    var L = r.left, B = r.bottom, ls = [], busy = false;
+    for (var i = 0; i < 3; i++) for (var j = 0; j < 2; j++) {
+      var s = sample(L + 4 + (w - 8) * i / 2, B - 4 - (h - 8) * j); ls.push(s.l); busy = busy || s.busy;
+    }
+    var avg = ls.reduce(function (a, b) { return a + b; }, 0) / ls.length;
+    var spread = Math.max.apply(0, ls) - Math.min.apply(0, ls);
+    if (spread > .3) busy = true; // mixed light and dark behind it
+    // Small dead zone so it doesn't flicker between tones
+    var t = avg < .16 ? 'dark' : avg > .24 ? 'light' : (lastTone || 'light');
+    lastTone = t; wrap.setAttribute('data-tone', t);
+    if (busy) wrap.setAttribute('data-busy', ''); else wrap.removeAttribute('data-busy');
+  }
+  var raf = 0; function soon() { if (!raf) raf = requestAnimationFrame(function () { raf = 0; tone(); }); }
+  window.addEventListener('scroll', soon, { passive: true });
+  window.addEventListener('resize', function () { measure(); soon(); });
+
+  // ---- Open / close ----
+  function setOpen(o, focusPill) {
+    box.classList.toggle('open', o); wrap.classList.toggle('open', o); pill.setAttribute('aria-expanded', o); tone();
+    if (o) setTimeout(function () { root.querySelector('.cta').focus({ preventScroll: true }); }, 60);
+    else if (focusPill) pill.focus({ preventScroll: true });
+  }
+  pill.addEventListener('click', function () { setOpen(true); });
+  dis.addEventListener('click', function (e) {
+    e.stopPropagation(); dismissed = true;
+    if (observer) observer.disconnect();
+    if (timer) clearInterval(timer);
+    if (host.parentNode) host.parentNode.removeChild(host);
+  });
+  x.addEventListener('click', function () { setOpen(false, true); });
+  document.addEventListener('pointerdown', function (e) { if (box.classList.contains('open') && e.composedPath().indexOf(host) < 0) setOpen(false); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && box.classList.contains('open')) setOpen(false, true); });
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
 })();</script>`;
 
 // One tag per distinct (expiry, login URL) pair — for the sidecar that
