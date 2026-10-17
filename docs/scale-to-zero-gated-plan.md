@@ -1047,6 +1047,43 @@ above is down to two: the registry and the generated routers.
 
 ---
 
+## Post-stop window closed per stop, 2026-10-12 (EAI-61)
+
+With every router at `priority: 1`, the post-stop 502 window was back for
+every app on every stop. Closed by raising an app's wake router only
+around its own sleep, rather than permanently:
+
+1. **Before the stop**, idle-report writes `.scale-to-zero/sleep/<app>.json`
+   (`stopping`), regenerates the routers so that app's are at
+   `priority: 500`, reads the file back to confirm every hostname, and
+   waits `WAKE_ROUTER_SETTLE_MS` (3s) for Traefik to apply it. Only then
+   `nomad job stop`. The activator proxies to the still-running app until
+   the stop, so Traefik never holds a router pointing at a dead allocation.
+2. **During the stop**, the activator holds any request that needs a wake
+   until the record leaves `stopping`, which happens after the snapshot.
+   Waking earlier would check the data against the previous manifest.
+3. **After the snapshot**, the record becomes `asleep`. The router stays
+   at 500.
+4. **On wake**, the activator removes the record and regenerates, so the
+   router drops back to 1 and traffic goes direct. Safe whenever Traefik
+   gets to it: until it sees the app's own router, requests fall through
+   to the activator, which proxies to the running app.
+
+Failure directions are chosen so the error is a hop, never a 502: an
+unreadable record reads as `asleep`; a `stopping` record older than
+`STOPPING_STALE_MS` (10 min) reads as `asleep`; regenerate keeps every
+record when Nomad cannot be asked, and only clears an `asleep` record for
+a job that is running again. A failed stop keeps the hold unless Nomad
+confirms the job is still running.
+
+Records are one file per app because three processes write them
+(idle-report, the activator, deploy-service). For the same reason the
+router file's tmp name is now unique per write: a shared one could rename
+a half-written file into place, and Traefik drops every file in the
+directory when one is invalid.
+
+---
+
 ## Explicitly out of scope for this plan
 
 - **Making scale-to-zero the default** for new deploys — a separate,
