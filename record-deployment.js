@@ -60,6 +60,7 @@ async function recordDeployment({
   deploymentId,
   kind,
   agentName,
+  schedules,
 }) {
   try {
     const response = await fetch(`${HOSTNSOFT_API_URL}/internal/deployments/record`, {
@@ -76,6 +77,7 @@ async function recordDeployment({
         deploymentId,
         kind,
         agentName,
+        ...(schedules !== undefined ? { schedules } : {}),
       }),
     });
 
