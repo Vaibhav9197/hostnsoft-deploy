@@ -27,6 +27,7 @@ const { runWithRequestId } = require('./request-context');
 const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
 const { detectTimers } = require('./detect-timers');
 const { readEmbarkoConfig } = require('./embarko-config');
+const { BUILD_INFO } = require('./build-info');
 
 // NEW: confirms the extracted upload actually has a manifest (or
 // index.html) at buildDir's own root — Railpack only looks there. Catches
@@ -731,6 +732,13 @@ function toGuide(res, topic, ext = '') {
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.redirect(301, url);
 }
+
+// Which code is serving and since when — see build-info.js. The deploy
+// workflow polls this after a redeploy and fails unless `commit` is the
+// one it just pushed.
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', commit: BUILD_INFO.commit, startedAt: BUILD_INFO.startedAt });
+});
 
 app.get('/capabilities', (req, res) => toGuide(res, req.query.feature ? String(req.query.feature).toLowerCase() : null));
 app.get('/capabilities/:topic', (req, res) => {
