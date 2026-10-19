@@ -175,7 +175,9 @@ const FOOTER_CSS = [
   '.dis:hover{background:var(--edge)}',
   '.w:hover .dis,.w:focus-within .dis{opacity:1;transform:none}',
   '.w.open .dis{display:none}',
-  '@media (hover:none){.dis{opacity:1;transform:none}}',
+  // Touch: no hover to reveal the corner cross, so the card's header button hides the badge instead
+  '.x .xc{display:none}',
+  '@media (hover:none){.dis{display:none}.x .xv{display:none}.x .xc{display:block}}',
   // Pill
   '.pill{position:absolute;left:0;bottom:0;height:calc(var(--ph) - 2px);display:inline-flex;align-items:center;gap:6px;padding:0 13px 0 11px;font-weight:500;white-space:nowrap;transition:opacity .15s ease .12s}',
   '.open .pill{opacity:0;pointer-events:none;transition-delay:0s}',
@@ -204,7 +206,7 @@ const FOOTER_HTML =
   '<button class="pill" type="button" aria-expanded="false" aria-controls="c">' + BADGE_LOGO + '<span>Embarko</span></button>' +
   '<div class="card" id="c">' +
   '<div class="hd">' + BADGE_LOGO + '<span>Embarko</span>' +
-  '<button class="x" type="button" aria-label="Collapse"><svg viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5 6 7.5l3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>' +
+  '<button class="x" type="button" aria-label="Collapse"><svg class="xv" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 4.5 6 7.5l3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="xc" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div>' +
   '<p class="t">Hosting made ridiculously easy.</p>' +
   '<p class="d">From simple websites and internal tools to full agentic applications.</p>' +
   '<a class="cta" data-em-link target="_blank" rel="noopener noreferrer">Make yours live<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 12 12 4M5 4h7v7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>' +
@@ -322,15 +324,21 @@ const FOOTER_TAG = `<script>(function () {
     box.classList.toggle('open', o); wrap.classList.toggle('open', o); pill.setAttribute('aria-expanded', o); tone();
     if (o) setTimeout(function () { root.querySelector('.cta').focus({ preventScroll: true }); }, 60);
     else if (focusPill) pill.focus({ preventScroll: true });
+    // Outside click: the card's link still holds focus for a tick, which would flash the corner cross via :focus-within
+    else if (root.activeElement) root.activeElement.blur();
   }
   pill.addEventListener('click', function () { setOpen(true); });
-  dis.addEventListener('click', function (e) {
+  function dismiss(e) {
     e.stopPropagation(); dismissed = true;
     if (observer) observer.disconnect();
     if (timer) clearInterval(timer);
     if (host.parentNode) host.parentNode.removeChild(host);
-  });
-  x.addEventListener('click', function () { setOpen(false, true); });
+  }
+  dis.addEventListener('click', dismiss);
+  // Touch devices: the card's header button closes the badge (no hover to reveal the corner cross)
+  var touch = matchMedia('(hover:none)').matches;
+  if (touch) x.setAttribute('aria-label', 'Hide Embarko badge');
+  x.addEventListener('click', function (e) { if (touch) dismiss(e); else setOpen(false, true); });
   document.addEventListener('pointerdown', function (e) { if (box.classList.contains('open') && e.composedPath().indexOf(host) < 0) setOpen(false); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && box.classList.contains('open')) setOpen(false, true); });
 
