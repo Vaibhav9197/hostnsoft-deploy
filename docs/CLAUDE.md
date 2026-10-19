@@ -122,6 +122,13 @@ history first).
   before the build; `record-deployment.js` sends them again on success, when
   they are applied. Spec and the reason for each rule: `docs/embarko-json.md`.
   (An `X-Schedules` header was built first and dropped before release.)
+- **`build-info.js`** and **`GET /health`** (added 2026-10-19) — the git
+  commit this process started with, read once at startup, plus
+  `startedAt`. Public at `ship.embarko.ai/health` (hostnsoft-api has the
+  same at `/api/health`). `.github/workflows/deploy-prod.yml` polls
+  `127.0.0.1:4000/health` after `redeploy.sh` and fails the run unless
+  `commit` is the pushed SHA, so a reload that left the old process serving
+  can't pass silently.
 - **`detect-timers.js`** (added 2026-10-17) — warns, never refuses, when a
   server app with no `schedules` in embarko.json lists an in-process timer library
   (node-cron, APScheduler, rufus-scheduler, robfig/cron…): those timers stop

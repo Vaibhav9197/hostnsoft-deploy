@@ -128,7 +128,7 @@ function timersWarning(timers) {
     libraries: timers.libraries,
     expressions: timers.expressions,
     detail:
-      `This app uses ${libs} to run jobs on a timer inside the app. Those timers stop when the app is put to sleep after a quiet spell, with no error.` +
+      `This app uses ${libs} to run jobs on a timer inside the app. Those timers are not guaranteed to run on Embarko and can stop with no error.` +
       found +
       ' Move each job into a GET route that checks Authorization: Bearer $CRON_SECRET, remove the timer, and deploy again with the jobs listed under "schedules" in embarko.json (see links.help).',
   };
@@ -275,11 +275,10 @@ function statusBody({ host, appName, kind, url, claimed, expiresAt, claimUrl, de
     body = staticLive
       ? live
       : { status: 'not_deployed', next: 'Nothing is published under this name: deploy it with POST /apps.', links: pick(all) };
-  } else if (health === 'running') {
+  } else if (health === 'running' || health === 'stopped') {
+    // 'stopped' = parked by scale-to-zero, woken by the first request. That
+    // is internal, so it reads as plain live to agents.
     body = live;
-  } else if (health === 'stopped') {
-    // Parked by scale-to-zero: reachable, woken by the first request.
-    body = { ...live, next: `${live.next} It's asleep now and wakes on the first request.` };
   } else if (health === 'starting') {
     body = {
       status: 'starting',
