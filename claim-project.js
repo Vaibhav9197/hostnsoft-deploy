@@ -41,13 +41,18 @@ const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/val
 // (fail closed), same as before.
 const RELAYED_STATUSES = new Set([400, 401, 403, 409]);
 
-async function claimProject(credential, slug, appType) {
+async function claimProject(credential, slug, appType, schedules) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/projects/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...credentialHeaders(credential) },
-      body: JSON.stringify({ ...credentialBody(credential), slug, ...(appType ? { appType } : {}) }),
+      body: JSON.stringify({
+        ...credentialBody(credential),
+        slug,
+        ...(appType ? { appType } : {}),
+        ...(schedules !== undefined ? { schedules } : {}),
+      }),
     });
   } catch (e) {
     logger.error(`[claim-project] could not reach hostnsoft-api to claim "${slug}": ${e.message}`);
@@ -124,6 +129,12 @@ async function claimProject(credential, slug, appType) {
     // credential, so a link there would hand the app to anyone.
     claimUrl: body.claimUrl || null,
     isFreePlan: !!body.isFreePlan,
+    // {declared, accepted, reason?} when embarko.json listed schedules —
+    // hostnsoft-api's docs/schedules.md. Relayed in the deploy reply.
+    schedules: body.schedules || null,
+    // How many schedules the app has right now, so a deploy without them
+    // can say they were kept (server.js deployWarnings).
+    scheduleCount: typeof body.scheduleCount === 'number' ? body.scheduleCount : 0,
   };
 }
 

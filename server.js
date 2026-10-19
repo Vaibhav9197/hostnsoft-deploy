@@ -25,6 +25,8 @@ const { runWithRequestId } = require('./request-context');
 // building/shipping an app that will break at runtime. Skipped entirely
 // for apps that already declare a real database dependency.
 const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
+const { detectTimers } = require('./detect-timers');
+const { readEmbarkoConfig } = require('./embarko-config');
 
 // NEW: confirms the extracted upload actually has a manifest (or
 // index.html) at buildDir's own root — Railpack only looks there. Catches
@@ -142,6 +144,7 @@ const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/
 // in-process (see GET /apps/:appName/status) and app-logs.js/
 // project-lookup.js back that endpoint and GET /apps/:appName/logs.
 const { setDeployState, getDeployState, clearDeployState } = require('./deploy-status');
+const { beginDeploy, isDeployInFlight } = require('./deploy-in-flight');
 const { lookupProject } = require('./project-lookup');
 const { verifyProxyAuthCompanyAccess } = require('./verify-proxy-auth');
 const { getAppLogs } = require('./app-logs');
@@ -167,7 +170,7 @@ const { reportConfigPushResult } = require('./report-config-push');
 const { jsonSource } = require('./json-source');
 // The { status, app, next, links } shape every agent-facing reply uses.
 // The docs URL lives there too, so every reply links the same one.
-const { acceptedBody, publishedBody, statusBody, staticLogsBody, errorBody, linksFor } = require('./deploy-response');
+const { acceptedBody, publishedBody, statusBody, staticLogsBody, errorBody, linksFor, timersWarning } = require('./deploy-response');
 
 // How long POST /apps waits for a static site to publish before answering
 // "check back" instead. Almost every static site is done in about a second,
@@ -405,8 +408,9 @@ async function ensureAppDataDir(appName) {
 // Project.kind — reported only here, on success, because that is
 // the first moment the app's kind on this host is actually settled
 // (a failed static publish is undone, see performStaticDeploy).
-async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind }) {
+async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind, schedules }) {
   await recordDeployment({
+    schedules,
     credential,
     projectSlug: appName,
     appVersion,
@@ -475,7 +479,7 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
   claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-  scaleToZeroOptIn, scaleToZeroOptOut,
+  scaleToZeroOptIn, scaleToZeroOptOut, schedules,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -571,7 +575,7 @@ async function performBuildAndDeploy({
     await fs.remove(buildDir);
     await fs.remove(filePath);
 
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind: 'service' });
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind: 'service', schedules });
   } catch (error) {
     await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
   }
@@ -592,7 +596,7 @@ async function performBuildAndDeploy({
 // can't change the outcome, which is why it happens outside the try below.
 async function performStaticDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, credential, deploymentId, plan, existingKind, onOutcome = () => { },
+  claim, credential, deploymentId, plan, existingKind, onOutcome = () => { }, schedules,
 }) {
   const convertingFromService = existingKind === 'service';
   try {
@@ -646,7 +650,7 @@ async function performStaticDeploy({
     // deployment history say "live" as soon as it's true.
     // No memoryMb: a static app runs no process, so there is nothing
     // hostnsoft-api's Project.memoryMb could describe for it.
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static' });
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static', schedules });
     onOutcome('live');
   } catch (error) {
     await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
@@ -733,6 +737,30 @@ app.get('/capabilities/:topic', (req, res) => {
   const [, topic, ext = ''] = /^(.*?)(\.md|\.json)?$/i.exec(req.params.topic.toLowerCase());
   toGuide(res, topic, ext);
 });
+
+// The deploy reply's warnings — see the call site in POST /apps.
+function deployWarnings({ config, timers, claim, isStaticDeploy, schedules }) {
+  const out = [...config.warnings];
+  const timer = timersWarning(timers);
+  if (timer) out.push(timer);
+  // No embarko.json schedules this time, but the app has some: say they
+  // were kept, so a deleted file isn't mistaken for "removed".
+  if (schedules === undefined && claim.scheduleCount > 0 && !isStaticDeploy) {
+    out.push({
+      code: 'schedules_unchanged',
+      detail:
+        `This app has ${claim.scheduleCount} schedule(s), and this upload has no "schedules" in embarko.json, so they were kept as they are. ` +
+        'To remove them, deploy with {"schedules": []} in embarko.json.',
+    });
+  }
+  if (isStaticDeploy && Array.isArray(schedules) && schedules.length > 0) {
+    out.push({
+      code: 'schedules_on_static_site',
+      detail: 'This is a static site, so nothing runs on a server and its schedules were not applied. Deploy the app as a server app to use schedules.',
+    });
+  }
+  return out;
+}
 
 app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
@@ -834,10 +862,32 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     return reject(400, 'invalid_agent_name', "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".");
   }
 
-  const claim = await orDiscard(claimProject(credential, appName, appType || undefined));
+  // The app's optional embarko.json, read from the archive before the
+  // claim so a file that can't be trusted refuses the deploy before any
+  // work, and the claim can check its schedules and create CRON_SECRET in
+  // the same call. See embarko-config.js and docs/embarko-json.md.
+  // `schedules` undefined = no file or no key = leave schedules as they are.
+  const config = req.file
+    ? await orDiscard(readEmbarkoConfig(req.file.path))
+    : { ok: true, present: false, schedules: undefined, warnings: [] };
+  if (!config.ok) {
+    return reject(400, config.code, config.error, { file: 'embarko.json', help: 'https://embarko.ai/docs/embarko-json' });
+  }
+  const schedules = config.schedules;
+
+  const claim = await orDiscard(claimProject(credential, appName, appType || undefined, schedules));
   if (!claim.ok) {
     return reject(claim.status, claim.code, claim.error);
   }
+
+  // In flight from the claim on, for orphan cleanup's teardown (see
+  // deploy-in-flight.js). This registration covers the request itself and
+  // ends with its response, whichever way that goes; a build that carries
+  // on in the background takes its own registration below, before the
+  // response goes out, so there's no gap between the two.
+  const endRequestInFlight = beginDeploy(appName);
+  res.once('finish', endRequestInFlight);
+  res.once('close', endRequestInFlight);
 
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
     return reject(400, 'invalid_app_version', "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", {}, true);
@@ -1022,6 +1072,13 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     // Refusing here instead used to send a static app's owner off to a
     // second app name over a transient railpack failure.
     const isStaticDeploy = plan.ok ? plan.isPlainStatic : existingKind === 'static';
+
+    // In-process timers (node-cron, APScheduler...) stop when an idle app is
+    // put to sleep. Warn, never refuse: the reply tells the agent to move the
+    // jobs to schedules — see detect-timers.js. Skipped when embarko.json
+    // already declares schedules, and for a static site, which runs no code.
+    const timers = !isStaticDeploy && schedules === undefined ? await detectTimers(buildDir, deps) : null;
+    if (timers) logger.info(`[${appName}] In-process timer library detected: ${timers.libraries.join(', ')}`);
     if (plan.ok && !isStaticDeploy && existingKind === 'static') {
       const now = `a server app (railpack detected: ${plan.providers || 'unknown'})`;
       logger.info(`[${appName}] Rejected: app is a static site, this upload is ${now}`);
@@ -1111,6 +1168,12 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       // for support and the dashboard's history; not needed to proceed.
       deploymentId,
       convertingFromService,
+      // What hostnsoft-api said about embarko.json's schedules, if any.
+      schedules: claim.schedules,
+      // Everything worth fixing that didn't stop the deploy, as
+      // {code, detail}: embarko.json problems, in-process timers, schedules
+      // left as they were, schedules on a static site. deploy-response.js.
+      warnings: deployWarnings({ config, timers, claim, isStaticDeploy, schedules }),
     };
 
     // A static site publishes in about a second, so wait for it (up to
@@ -1122,15 +1185,16 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       backgroundOwnsFiles = true;
       let settle;
       const outcome = new Promise((resolve) => { settle = resolve; });
+      const endStaticInFlight = beginDeploy(appName);
       performStaticDeploy({
         appName, appVersion, imageName, domain,
         buildDir, filePath: req.file.path,
         claim, credential, deploymentId, plan, existingKind,
-        onOutcome: settle,
+        onOutcome: settle, schedules,
       }).catch((err) => {
         logger.error(`[${appName}] unexpected error in static deploy: ${err.message}`);
         settle('failed');
-      });
+      }).finally(endStaticInFlight);
 
       let timer;
       const result = await Promise.race([
@@ -1149,6 +1213,7 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     }
 
     backgroundOwnsFiles = true;
+    const endBuildInFlight = beginDeploy(appName);
     // A server app's build takes minutes: answer at once and let the agent
     // poll. The claim and showcase steps come later, in the status reply,
     // once the app is actually live — see deploy-response.js.
@@ -1161,10 +1226,10 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
       appName, appVersion, imageName, domain,
       buildDir, filePath: req.file.path,
       claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-      scaleToZeroOptIn, scaleToZeroOptOut,
+      scaleToZeroOptIn, scaleToZeroOptOut, schedules,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
-    });
+    }).finally(endBuildInFlight);
 
   } catch (error) {
     // Only the SYNCHRONOUS section above (extraction, package.json read,
@@ -1725,6 +1790,16 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     return res.status(400).json({ error: "Invalid app name" });
   }
 
+  // ?ifIdle=1 (orphan cleanup only): leave an app with a deploy in flight
+  // alone and say so, rather than tearing it down under a build that would
+  // bring it back up afterwards — see deploy-in-flight.js. hostnsoft-api
+  // retries on its next cleanup run. Without the flag a deploy in flight
+  // doesn't stop a teardown, as before.
+  if (req.query.ifIdle === '1' && isDeployInFlight(appName)) {
+    logger.info(`[${appName}] Teardown skipped: a deploy is in progress`);
+    return res.status(409).json({ error: "A deploy of this app is in progress", code: "deploy_in_progress" });
+  }
+
   try {
     // A job that was never successfully deployed (e.g. an orphan whose
     // build/deploy failed) has no Nomad job at all, and a static app never
@@ -1847,9 +1922,33 @@ app.get('/internal/apps/:appName/analytics', requireInternalSecret, async (req, 
 // (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
 // without colliding; defaults to 4000 to match prior fixed behavior.
 const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
+  // Tell pm2 we can serve (wait_ready). No-op outside pm2.
+  if (process.send) process.send('ready');
 });
+
+// Graceful shutdown, same shape as api-service. pm2 sends SIGINT on
+// reload/stop (SIGTERM from docker/systemd); without a handler Node would
+// exit at once, cutting in-flight requests and background builds. Close
+// the server, give in-flight requests and background builds the grace
+// period, then exit. pm2 kill_timeout must be longer than this.
+// server-setup.md#zero-downtime
+const SHUTDOWN_GRACE_MS = 120000;
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`[server] ${signal} received: closing HTTP server, finishing in-flight work`);
+  server.close(() => logger.info('[server] HTTP server closed'));
+  setTimeout(() => {
+    logger.info(`[server] grace period of ${SHUTDOWN_GRACE_MS / 1000}s over, exiting`);
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // Started after listen() so a broken analytics subsystem can never
 // prevent the actual deploy pipeline from coming up — each function

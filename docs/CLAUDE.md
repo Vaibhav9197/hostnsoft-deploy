@@ -114,6 +114,21 @@ history first).
   server app may be redeployed as a static site (its job is retired); a
   static site can NOT become a server app — refused with 422
   `app_kind_changed`. Four new required env vars — see `.env.example`.
+- **`embarko-config.js`** (added 2026-10-17) — reads the app's optional
+  `embarko.json` from the uploaded archive before the claim: today its
+  `schedules`. Refuses bad JSON and anything secret-looking; warns about a
+  nested or misnamed file and unknown keys. `claim-project.js` sends the
+  schedules to hostnsoft-api, which validates them and creates `CRON_SECRET`
+  before the build; `record-deployment.js` sends them again on success, when
+  they are applied. Spec and the reason for each rule: `docs/embarko-json.md`.
+  (An `X-Schedules` header was built first and dropped before release.)
+- **`detect-timers.js`** (added 2026-10-17) — warns, never refuses, when a
+  server app with no `schedules` in embarko.json lists an in-process timer library
+  (node-cron, APScheduler, rufus-scheduler, robfig/cron…): those timers stop
+  when scale-to-zero stops the app. Reads the dependency manifests only, so
+  browser `setInterval` is never flagged; only on a hit does it grep the
+  source for cron expressions to quote. Adds an `in_process_timer` entry to
+  the 202's `warnings[]` (all warnings: `docs/embarko-json.md`). Measured at 0.1–9 ms.
 - **`app-registry.js`** — a **stopgap** flat-JSON-file record of what
   each app last deployed with (`version`, `dbType`, `memory`,
   `deployedAt`). This exists only because this service has no real

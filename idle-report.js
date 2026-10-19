@@ -26,7 +26,7 @@ const { isBotRequest } = require('./analytics/bot-filter');
 const { isLitestreamPath } = require('./sqlite-data-check');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { SCALE_TO_ZERO_MODE } = require('./scale-to-zero-apps');
-const { allApps, hostnamesFor, regenerateRouters, ROUTER_FILE } = require('./scale-to-zero-registry');
+const { allApps, holdForStop, markAsleep, releaseHold } = require('./scale-to-zero-registry');
 
 // `node idle-report.js | head -3` closes stdout mid-write; without this
 // Node throws an unhandled EPIPE and the run looks like a crash.
@@ -355,17 +355,11 @@ async function pruneSnapshots(snapshotRoot) {
   }
 }
 
-// The hostnames of this app that scale-to-zero.yml has no wake router for,
-// after rewriting it. Empty means every hostname is covered.
-async function hostsWithoutWakeRouter(appName) {
-  await regenerateRouters();
-  const routers = await fsp.readFile(ROUTER_FILE, 'utf8');
-  const hosts = await hostnamesFor(appName);
-  if (hosts.length === 0) return [`${appName} (no hostnames known)`];
-  // Traefik's Host() takes backticks; a constant rather than an escape
-  // inside a template literal (see BT in scale-to-zero-registry.js).
-  const BT = String.fromCharCode(96);
-  return hosts.filter((h) => !routers.includes(`Host(${BT}${h}${BT})`));
+// Status alone is not enough: a job whose stop has been accepted still
+// reads "running" until its allocations are gone, with Stop set.
+async function jobStillRunning(appName) {
+  const job = await nomadGet(`/v1/job/${encodeURIComponent(appName)}`);
+  return job.Status === 'running' && job.Stop !== true;
 }
 
 async function stopApp(appName) {
@@ -525,12 +519,16 @@ async function main() {
 
     // Also fatal to the stop: once stopped, the app's own router is gone
     // and only a wake router reaches it. Without one every request 404s
-    // (daily-mandala, 2026-10-11). Rewritten here from the spec just saved,
-    // then checked rather than trusted.
+    // (daily-mandala, 2026-10-11), and one still BELOW the app's own router
+    // when the stop lands is a 502 until Traefik next polls Nomad
+    // (EAI-61). Rewritten here from the spec just saved, then checked
+    // rather than trusted: see holdForStop.
     try {
-      const missing = await hostsWithoutWakeRouter(row.appName);
-      if (missing.length > 0) throw new Error(`no wake router for ${missing.join(', ')}`);
+      const problems = await holdForStop(row.appName);
+      if (problems.length > 0) throw new Error(problems.join(', '));
+      console.log('  wake router raised in front of the app');
     } catch (e) {
+      await releaseHold(row.appName).catch((re) => console.log(`  ! could not release the hold: ${re.message}`));
       console.log(`  ABORT — ${e.message}; refusing to stop an app nothing would wake`);
       continue;
     }
@@ -540,6 +538,15 @@ async function main() {
       console.log('  stopped');
     } catch (e) {
       console.log(`  STOP FAILED — ${e.message}`);
+      // Whether the stop took effect decides the router. Still running:
+      // release, so it is reached directly again. Stopped after all, or
+      // unknown: keep the hold — the activator in front of a running app
+      // costs a hop and lowers itself on the next request, while lowering
+      // it in front of a stopped one reopens the 502 window.
+      const running = await jobStillRunning(row.appName).catch(() => null);
+      await (running ? releaseHold(row.appName) : markAsleep(row.appName)).catch((re) =>
+        console.log(`  ! could not update the sleep state: ${re.message}`)
+      );
       continue;
     }
 
@@ -553,6 +560,17 @@ async function main() {
       }
     } catch (e) {
       console.log(`  WARNING — snapshot failed: ${e.message} (app is stopped; data is untouched)`);
+    }
+
+    // Only now, snapshot or not. Until this the activator holds any
+    // request for the app rather than waking it, so a wake can never check
+    // the data against the manifest this run was about to replace.
+    try {
+      await markAsleep(row.appName);
+    } catch (e) {
+      console.log(
+        `  WARNING — could not mark asleep: ${e.message} (requests are held until the 'stopping' record goes stale)`
+      );
     }
     stopped += 1;
   }

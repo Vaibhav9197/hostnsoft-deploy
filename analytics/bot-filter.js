@@ -24,13 +24,22 @@
  * similar CLI agents. They look automated, but on this platform they are
  * just as likely to be an app's real API client or someone's monitoring
  * script — that IS usage.
+ *
+ * The same goes for generic HTTP client libraries (python-requests,
+ * go-http-client, okhttp, java/), removed from the pattern 2026-10-17.
+ * They are what webhook senders and other services' backends identify
+ * as, and an app driven by webhooks (an agent that wakes on an event) must
+ * be woken by one and kept awake by its traffic. Scanners using these
+ * libraries are still caught by the path patterns below when they probe;
+ * one that only fetches "/" now keeps an app awake longer — the cheap
+ * direction of the bias above.
  */
 
 // Self-identifying automation. Matched case-insensitively against the
 // User-Agent. Search-engine crawlers are included: a crawl is not a user
 // visit, and nothing breaks if an app is asleep when one arrives.
 const BOT_UA_PATTERN =
-  /(bot\b|crawler|spider|scraper|scanner|nuclei|zgrab|masscan|censys|shodan|internet-?measurement|semrush|ahrefs|mj12|dotbot|petalbot|bingpreview|facebookexternalhit|slackbot|whatsapp|telegrambot|headlesschrome|phantomjs|python-requests|go-http-client|libwww-perl|okhttp|java\/|nikto|sqlmap|dirbuster|gobuster|feroxbuster)/i;
+  /(bot\b|crawler|spider|scraper|scanner|nuclei|zgrab|masscan|censys|shodan|internet-?measurement|semrush|ahrefs|mj12|dotbot|petalbot|bingpreview|facebookexternalhit|slackbot|whatsapp|telegrambot|headlesschrome|phantomjs|libwww-perl|nikto|sqlmap|dirbuster|gobuster|feroxbuster)/i;
 
 // Paths that no legitimate visitor asks for. Independent of User-Agent,
 // since a scanner can trivially send a browser UA — and it usually does.

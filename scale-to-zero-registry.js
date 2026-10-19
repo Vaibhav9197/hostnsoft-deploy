@@ -52,6 +52,31 @@ const ACTIVATOR_SERVICE = process.env.ACTIVATOR_SERVICE_NAME || 'scale-to-zero-a
 
 const APPS_DOMAIN_SUFFIX = process.env.APPS_DOMAIN_SUFFIX;
 
+// A wake router's priority. FALLBACK sits below the ~25-44 Traefik derives
+// for the app's own router from its rule length, so a running app is
+// reached directly. HOLD sits above it (and far below the platform's own
+// 10000/10100), so the activator is in front: used from just before a stop
+// until the app is awake again. server-setup.md#s2z-routers
+const FALLBACK_PRIORITY = 1;
+const HOLD_PRIORITY = 500;
+
+// Which apps are stopping or asleep, one file per app rather than a field
+// in apps.json: idle-report, the activator and deploy-service all write it,
+// and a whole-file read-modify-write between three processes loses
+// updates. Writing or removing one file is atomic on its own.
+const SLEEP_STATE_DIR = `${appDataPathFor('.scale-to-zero')}/sleep`;
+
+// A 'stopping' record this old was left by an idle-report run that died
+// mid-stop, and nothing else will ever clear it. Read as 'asleep' from then
+// on. Generous because the snapshot copies the whole data directory.
+const STOPPING_STALE_MS = Number(process.env.STOPPING_STALE_MS) || 10 * 60 * 1000;
+
+// How long Traefik takes to apply a rewrite of the router file. Its file
+// watcher fires at once, but providersThrottleDuration (2s by default)
+// holds each provider's update back. Traefik's API is not enabled on these
+// hosts, so this is a wait rather than a check.
+const WAKE_ROUTER_SETTLE_MS = Number(process.env.WAKE_ROUTER_SETTLE_MS) || 3000;
+
 async function readRegistry() {
   try {
     const raw = await fs.readFile(REGISTRY_PATH, 'utf8');
@@ -151,6 +176,93 @@ function logger(line) {
   console.log(`${new Date().toISOString()} [scale-to-zero] ${line}`);
 }
 
+// A tmp name no other write can share, in this process or another: the
+// pid alone collides between two writes in flight in the same process.
+// Ends in .tmp, so Traefik never loads one as config.
+let tmpSeq = 0;
+function uniqueTmpPath(file) {
+  tmpSeq += 1;
+  return `${file}.${process.pid}-${tmpSeq}.tmp`;
+}
+
+function sleepStatePath(appName) {
+  return `${SLEEP_STATE_DIR}/${appName}.json`;
+}
+
+function normalizeSleepState(record) {
+  if (record.state === 'stopping' && !(Date.now() - Date.parse(record.since) < STOPPING_STALE_MS)) {
+    return { ...record, state: 'asleep', stale: true };
+  }
+  return record;
+}
+
+/**
+ * { state: 'stopping' | 'asleep', since }, or null for an app that is
+ * neither. An unreadable record reads as 'asleep': that keeps the
+ * activator in front, which costs a hop, where dropping it would cost the
+ * 502 this exists to prevent.
+ */
+async function readSleepState(appName) {
+  try {
+    return normalizeSleepState(JSON.parse(await fs.readFile(sleepStatePath(appName), 'utf8')));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    return { state: 'asleep', since: null, unreadable: true };
+  }
+}
+
+async function writeSleepState(appName, state) {
+  await fs.ensureDir(SLEEP_STATE_DIR);
+  const file = sleepStatePath(appName);
+  const tmp = uniqueTmpPath(file);
+  await fs.writeFile(tmp, JSON.stringify({ state, since: new Date().toISOString() }));
+  await fs.rename(tmp, file);
+}
+
+async function clearSleepState(appName) {
+  await fs.remove(sleepStatePath(appName));
+}
+
+async function sleepStates() {
+  let files;
+  try {
+    files = await fs.readdir(SLEEP_STATE_DIR);
+  } catch {
+    return new Map();
+  }
+  const states = new Map();
+  for (const f of files.filter((name) => name.endsWith('.json'))) {
+    const appName = f.slice(0, -5);
+    const record = await readSleepState(appName);
+    if (record) states.set(appName, record);
+  }
+  return states;
+}
+
+// Host -> priority, as scale-to-zero.yml has it NOW. Read back rather than
+// taken from what regenerateRouters wrote: another process may have
+// rewritten the file since.
+async function wakeRouterPriorities() {
+  let text;
+  try {
+    text = await fs.readFile(ROUTER_FILE, 'utf8');
+  } catch {
+    return new Map();
+  }
+  const priorities = new Map();
+  let host = null;
+  for (const line of text.split(/\r?\n/)) {
+    const rule = line.match(/rule: "Host\(`([^`]+)`\)"/);
+    if (rule) host = rule[1];
+    const priority = line.match(/^\s+priority: (\d+)\s*$/);
+    if (priority && host) {
+      priorities.set(host, Number(priority[1]));
+      host = null;
+    }
+  }
+  return priorities;
+}
+
 /**
  * Every hostname an app answers on, from its saved job spec — a custom
  * domain is exactly what a name cannot tell you, and a stopped app with no
@@ -176,7 +288,7 @@ async function hostnamesFor(appName) {
 // template literal and took deploy-service down, and once here.
 const BT = String.fromCharCode(96);
 
-function routerBlock(name, host, service) {
+function routerBlock(name, host, service, priority) {
   // Custom domains are not in this platform's Cloudflare zone, so they can
   // only be issued over HTTP-01 — the same split the app's own router uses.
   const resolver =
@@ -187,10 +299,8 @@ function routerBlock(name, host, service) {
     '      entryPoints:',
     '        - websecure',
     `      service: ${service}`,
-    // 1: below the ~25-44 Traefik derives from rule length, so a running
-    // app is reached directly and the activator only catches it once
-    // stopped. server-setup.md#s2z-routers
-    '      priority: 1',
+    // FALLBACK_PRIORITY or HOLD_PRIORITY — see where they are defined.
+    `      priority: ${priority}`,
     '      tls:',
     `        certResolver: ${resolver}`,
     '',
@@ -204,6 +314,25 @@ function routerBlock(name, host, service) {
  */
 async function regenerateRouters() {
   const apps = await allApps();
+
+  // An 'asleep' record for a job that is running again (redeployed, or
+  // started by hand) would keep it behind the activator for good, and one
+  // for an app no longer listed is litter. Never a 'stopping' one:
+  // idle-report sets it while the job is still running, on purpose. If
+  // Nomad cannot be asked, every record stays — a stale hold costs a hop
+  // through the activator, a missing one costs the 502.
+  const states = await sleepStates();
+  const running = await runningJobNames().catch(() => null);
+  if (running) {
+    for (const [appName, record] of states) {
+      if (record.state === 'stopping') continue;
+      if (running.includes(appName) || !apps.includes(appName)) {
+        await clearSleepState(appName);
+        states.delete(appName);
+      }
+    }
+  }
+
   const lines = [
     '# GENERATED by deploy-service (scale-to-zero-registry.js). Do not edit.',
     '# One router per HOSTNAME for every app opted into scale-to-zero, so a',
@@ -232,11 +361,12 @@ async function regenerateRouters() {
       logger(`skipping ${appName}: served statically, no job to wake`);
       continue;
     }
+    const priority = states.has(appName) ? HOLD_PRIORITY : FALLBACK_PRIORITY;
     for (const host of await hostnamesFor(appName)) {
       // Router names must be unique across the whole file provider, and a
       // hostname can contain dots which read badly in Traefik's dashboard.
       lines.push(
-        routerBlock(`wake-${host.replace(/[^a-z0-9-]/gi, '-')}`, host, ACTIVATOR_SERVICE)
+        routerBlock(`wake-${host.replace(/[^a-z0-9-]/gi, '-')}`, host, ACTIVATOR_SERVICE, priority)
       );
       count += 1;
     }
@@ -257,7 +387,11 @@ async function regenerateRouters() {
   }
 
   await fs.ensureDir(TRAEFIK_DYNAMIC_DIR);
-  const tmp = `${ROUTER_FILE}.tmp`;
+  // idle-report and the activator rewrite this file too now, alongside
+  // deploy-service's concurrent deploys, and two writers sharing one tmp
+  // can rename a half-written file into place — which Traefik rejects,
+  // taking platform.yml with it. See uniqueTmpPath.
+  const tmp = uniqueTmpPath(ROUTER_FILE);
   await fs.writeFile(tmp, `${lines.join('\n')}\n`);
   await fs.rename(tmp, ROUTER_FILE);
   return { apps: apps.length, routers: count };
@@ -328,6 +462,72 @@ async function rekey(oldName, newName) {
   return regenerateRouters();
 }
 
+/**
+ * Put the activator in front of an app that is about to be stopped, and
+ * confirm it. Returns what is wrong; empty means the stop may go ahead.
+ *
+ * Must happen BEFORE the stop. Traefik's Nomad provider only polls, so the
+ * app's own router outlives the job by up to one refresh interval, and
+ * while it does it outranks a priority-1 wake router and points at a dead
+ * allocation: an instant 502 that never reaches the activator (EAI-61).
+ * Raised first, the wake router wins while the app is still up — the
+ * activator proxies to it until the stop, then holds requests until it can
+ * be woken — so there is no moment Traefik routes to a dead allocation.
+ *
+ * The file is read back rather than trusted, and every hostname must be at
+ * HOLD_PRIORITY. That also covers "no wake router at all": stopped, such
+ * an app 404s instead (daily-mandala, 2026-10-11).
+ */
+async function holdForStop(appName) {
+  await writeSleepState(appName, 'stopping');
+  await regenerateRouters();
+  const hosts = await hostnamesFor(appName);
+  if (hosts.length === 0) return [`no hostnames known for ${appName}`];
+
+  const priorities = await wakeRouterPriorities();
+  const problems = [];
+  for (const host of hosts) {
+    if (!priorities.has(host)) problems.push(`no wake router for ${host}`);
+    else if (priorities.get(host) !== HOLD_PRIORITY) {
+      problems.push(`wake router for ${host} is at priority ${priorities.get(host)}, not ${HOLD_PRIORITY}`);
+    }
+  }
+  if (problems.length === 0) await new Promise((r) => setTimeout(r, WAKE_ROUTER_SETTLE_MS));
+  return problems;
+}
+
+/**
+ * The stop is done and the snapshot written. The router stays where
+ * holdForStop put it; what changes is that the activator stops holding
+ * requests and may wake the app.
+ */
+async function markAsleep(appName) {
+  await writeSleepState(appName, 'asleep');
+}
+
+/** The stop did not happen after all: back to reaching the app directly. */
+async function releaseHold(appName) {
+  await clearSleepState(appName);
+  return regenerateRouters();
+}
+
+/**
+ * The app is running again: drop its wake router back below the app's own
+ * router, so its traffic goes direct. Safe however long Traefik takes to
+ * notice either change — until it sees the app's own router, requests fall
+ * through to the activator, which proxies to the running app.
+ *
+ * Only an 'asleep' record. A 'stopping' one belongs to an idle-report run
+ * that is about to stop this app, and needs the hold it set.
+ */
+async function markAwake(appName) {
+  const record = await readSleepState(appName);
+  if (!record || record.state !== 'asleep') return false;
+  await clearSleepState(appName);
+  await regenerateRouters();
+  return true;
+}
+
 // Run directly to rewrite the router file: `node scale-to-zero-registry.js`.
 // Called by both server-setup.sh and redeploy.sh after .env exists, so the
 // routers are regenerated on every deploy rather than only on a
@@ -353,4 +553,9 @@ module.exports = {
   setOptedOut,
   forget,
   rekey,
+  readSleepState,
+  holdForStop,
+  markAsleep,
+  releaseHold,
+  markAwake,
 };

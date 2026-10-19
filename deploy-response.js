@@ -95,6 +95,55 @@ function appFacts({ appName, kind, claimed, expiresAt, deploymentId }) {
   return app;
 }
 
+// What the deploy did with embarko.json's schedules, for the deploy replies. Null
+// when the deploy sent none. `claim` is hostnsoft-api's answer at claim
+// time ({declared, accepted, reason?}); the schedules themselves are
+// applied once the deploy is live — see hostnsoft-api's docs/schedules.md.
+function schedulesFacts(host, appName, claim) {
+  if (!claim) return null;
+  if (!claim.accepted) {
+    return { facts: { declared: claim.declared, applied: false, reason: claim.reason }, sentence: `Schedules not applied: ${claim.reason}`, links: {} };
+  }
+  if (claim.declared === 0) {
+    return { facts: { declared: 0, appliesWhen: 'live' }, sentence: 'Once live, the app has no schedules.', links: {} };
+  }
+  return {
+    facts: { declared: claim.declared, appliesWhen: 'live' },
+    sentence:
+      `Once live, its ${claim.declared === 1 ? 'schedule runs' : `${claim.declared} schedules run`} on time; ` +
+      `POST links.runSchedules (deploy token) to run ${claim.declared === 1 ? 'it' : 'them'} once now, and tell the user it works only when each run's outcome is "ok".`,
+    links: { runSchedules: `https://${host}/api/apps/${appName}/schedules/run` },
+  };
+}
+
+// A warning for in-process timers (detect-timers.js). Null when none.
+function timersWarning(timers) {
+  if (!timers) return null;
+  const libs = timers.libraries.join(', ');
+  const found = timers.expressions.length
+    ? ` Timing found in the code: ${timers.expressions.map((e) => `"${e.cron}" (${e.file})`).join(', ')}.`
+    : '';
+  return {
+    code: 'in_process_timer',
+    libraries: timers.libraries,
+    expressions: timers.expressions,
+    detail:
+      `This app uses ${libs} to run jobs on a timer inside the app. Those timers stop when the app is put to sleep after a quiet spell, with no error.` +
+      found +
+      ' Move each job into a GET route that checks Authorization: Bearer $CRON_SECRET, remove the timer, and deploy again with the jobs listed under "schedules" in embarko.json (see links.help).',
+  };
+}
+
+// One sentence pointing at the warnings, for `next`.
+function warningsSentence(warnings) {
+  return `${warnings.length === 1 ? 'One warning' : `${warnings.length} warnings`} in warnings[]: fix before telling the user it's done.`;
+}
+
+// The guide topic for links.help when a reply has warnings.
+function warningsHelpTopic(warnings) {
+  return warnings.every((w) => w.code.startsWith('embarko_json')) ? 'embarko-json' : 'schedules';
+}
+
 // The one sentence about keeping a fresh temporary app, for the deploy
 // reply that carries its link.
 function keepSentence(expiresAt) {
@@ -107,7 +156,7 @@ function keepSentence(expiresAt) {
  * by a static site. `claimUrl` — the keep link, for a just-created
  * temporary app. `deploymentId` — hostnsoft-api's id for this attempt.
  */
-function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService }) {
+function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, schedules, warnings = [] }) {
   const all = linksFor(host, appName, url, claimUrl);
   const poll = POLL_SECONDS[kind];
 
@@ -120,12 +169,22 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
     next = `This replaces the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
 
+  const sched = schedulesFacts(host, appName, schedules);
+  if (sched) next = `${next} ${sched.sentence}`;
+  if (warnings.length) next = `${next} ${warningsSentence(warnings)}`;
+
   return {
     success: true,
     status: kind === 'static' ? 'publishing' : 'building',
     app: appFacts({ appName, kind, claimed, expiresAt, deploymentId }),
+    ...(sched ? { schedules: sched.facts } : {}),
+    ...(warnings.length ? { warnings } : {}),
     next,
-    links: pick(all, 'status', 'claim'),
+    links: {
+      ...pick(all, 'status', 'claim'),
+      ...(sched ? sched.links : {}),
+      ...(warnings.length ? { help: helpUrl(host, warningsHelpTopic(warnings)) } : {}),
+    },
   };
 }
 
@@ -136,7 +195,7 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
  * Same body the status reply would give, minus its deprecated `deploy`
  * field, with the claim/convert notes the 202 would have carried.
  */
-function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, deployState, live }) {
+function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, deployState, live, warnings = [] }) {
   const { deploy, ...body } = statusBody({
     host, appName, kind: 'static', url, claimed, expiresAt, claimUrl, deploymentId, deployState, staticLive: live,
   });
@@ -145,9 +204,11 @@ function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, cla
   if (convertingFromService) {
     next = `This replaced the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
+  if (warnings.length) next = `${next} ${warningsSentence(warnings)}`;
+  const extra = warnings.length ? { warnings } : {};
   return live
-    ? { success: true, ...body, next }
-    : { success: false, code: 'publish_failed', ...body, next };
+    ? { success: true, ...body, ...extra, next }
+    : { success: false, code: 'publish_failed', ...body, ...extra, next };
 }
 
 /**
@@ -343,6 +404,7 @@ function errorBody({ host, appName, error, code, extra = {}, appExists = false, 
 }
 
 module.exports = {
+  timersWarning,
   DOCS_URL,
   SHOWCASE_URL,
   linksFor,

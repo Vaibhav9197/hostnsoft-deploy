@@ -174,19 +174,17 @@ async function tick() {
   }
 
   const runningJobs = jobs.filter((j) => j.Status === 'running' && j.Type !== 'system');
-  const db = getDb();
-  const insert = db.prepare(
-    'INSERT INTO resource_sample (app_name, ts, cpu_percent, memory_mb) VALUES (?, ?, ?, ?)'
-  );
   const now = Date.now();
 
+  // Sample every app first (slow: Nomad + Docker HTTP calls), then write
+  // all rows in one short transaction. Inserting one row per await used to
+  // hold the write lock in many small bursts across the whole tick.
+  const samples = [];
   for (const job of runningJobs) {
     if (PLATFORM_JOBS.has(job.ID)) continue;
     try {
       const sample = await sampleApp(job.ID);
-      if (sample) {
-        insert.run(job.ID, now, sample.cpuPercent, sample.memoryMb);
-      }
+      if (sample) samples.push({ appName: job.ID, ...sample });
     } catch (e) {
       // A 404 means the container went away between Nomad listing the
       // allocation and Docker being asked about it — ordinary churn
@@ -201,6 +199,22 @@ async function tick() {
         logger.warn(`[resource-poller] could not sample "${job.ID}" this tick: ${e.message}`);
       }
     }
+  }
+  if (samples.length === 0) return;
+
+  const db = getDb();
+  const insert = db.prepare(
+    'INSERT INTO resource_sample (app_name, ts, cpu_percent, memory_mb) VALUES (?, ?, ?, ?)'
+  );
+  db.exec('BEGIN');
+  try {
+    for (const s of samples) {
+      insert.run(s.appName, now, s.cpuPercent, s.memoryMb);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    logger.warn(`[resource-poller] could not store ${samples.length} samples this tick: ${e.message}`);
   }
 }
 
@@ -217,7 +231,7 @@ function startResourcePoller() {
   tick().catch((e) => logger.error(`[resource-poller] initial tick failed: ${e.message}`));
   setInterval(() => {
     tick().catch((e) => logger.error(`[resource-poller] tick failed: ${e.message}`));
-  }, POLL_INTERVAL_MS);
+  }, POLL_INTERVAL_MS).unref(); // .unref(): don't keep the process alive on shutdown
 }
 
 module.exports = { startResourcePoller };
