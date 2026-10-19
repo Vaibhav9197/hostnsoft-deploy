@@ -380,6 +380,15 @@ ${tagLines}
         # bind-mounting on top of Nomad's own allocation directory fights
         # with how Nomad manages it.
         volumes = ["${resolvedAppDataPath}:/data"]
+        # Isolation hardening (security review issue #05). Drop every Linux
+        # capability, forbid gaining new privileges (so setuid binaries
+        # can't escalate), and cap the process count so one app can't
+        # fork-bomb the shared box. Lateral network isolation between apps
+        # (icc=false) and the metadata/private-range egress block live at
+        # the Docker-daemon / DOCKER-USER level in server-setup.sh, not here.
+        cap_drop     = ["ALL"]
+        security_opt = ["no-new-privileges"]
+        pids_limit   = 512
       }
       env {
         PORT        = "\${NOMAD_PORT_${appPortLabel}}"
