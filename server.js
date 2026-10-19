@@ -77,6 +77,7 @@ const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = req
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
 const { getNomadJob, stopNomadJob } = require('./nomad-job');
+const { describeTaskFailure, formatForOwner } = require('./nomad-task-failure');
 const { renameApp, renameStaticApp } = require('./rename-app');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
@@ -347,6 +348,33 @@ async function purgeIfNotRunning(appName) {
   });
 }
 
+/**
+ * Runs `nomad job run` (no -detach, so it returns only once the deployment
+ * succeeds or fails). On failure, replaces the CLI's unhelpful error with
+ * the app's own crash details (exit code, restarts, last log lines) from
+ * nomad-task-failure.js. The thrown error carries no stdout/stderr so
+ * setBuildLog does not overwrite the railpack build log.
+ */
+async function runNomadJob(appName, nomadFilePath) {
+  // Allocations older than this belong to earlier deploys/wakes and must
+  // not be blamed for this one (see pickAllocation in nomad-task-failure).
+  const since = Date.now() - 5000; // clock skew between us and Nomad
+  try {
+    await execPromise(`nomad job run ${nomadFilePath}`);
+  } catch (e) {
+    logger.error(`[${appName}] nomad job run failed: ${(e.stderr || e.stdout || e.message || '').trim().slice(-2000)}`);
+    const diagnosis = await describeTaskFailure(appName, { since }).catch(() => null);
+    const explained = formatForOwner(appName, diagnosis);
+    if (explained) {
+      logger.warn(`[${appName}] Deploy failed at startup: exit code ${diagnosis.exitCode}, ${diagnosis.restarts} restart(s), alloc ${diagnosis.allocId}`);
+      throw new Error(explained);
+    }
+    throw new Error(
+      `Nomad could not bring the app up and the deploy was stopped (${e.message.split('\n')[0]}). ` +
+      `GET /apps/${appName}/logs has the container's output, if any was produced.`
+    );
+  }
+}
 
 // `railpack build` can exit 0 without leaving a tagged image behind — a
 // production incident did exactly that (docs/CLAUDE.md, "The still-open
@@ -532,7 +560,7 @@ async function performBuildAndDeploy({
     // See purgeIfNotRunning: without this, redeploying the same app
     // version over a dead job is a silent no-op reported as a failure.
     await purgeIfNotRunning(appName);
-    await execPromise(`nomad job run ${nomadFilePath}`);
+    await runNomadJob(appName, nomadFilePath);
     await saveJobSpec(appName);
 
     // AFTER saveJobSpec, which is what the router generation reads
@@ -1669,7 +1697,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
         await fs.ensureDir(path.dirname(nomadFilePath));
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
-        await execPromise(`nomad job run ${nomadFilePath}`);
+        await runNomadJob(appName, nomadFilePath);
         await saveJobSpec(appName);
         await fs.remove(nomadFilePath);
         logger.info(`[${appName}] Config update applied.`);
@@ -1687,7 +1715,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
-    await execPromise(`nomad job run ${nomadFilePath}`);
+    await runNomadJob(appName, nomadFilePath);
     await saveJobSpec(appName);
     await fs.remove(nomadFilePath);
     res.json({ success: true });
