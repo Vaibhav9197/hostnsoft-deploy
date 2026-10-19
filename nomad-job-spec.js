@@ -133,6 +133,13 @@ function projectEnvVarLines(envVars) {
 // those scripts pass to `docker build -t`.
 const ORPHAN_PROXY_IMAGE = 'orphan-banner-proxy:local';
 
+// Shared non-root user every app container runs as (security review issue #05).
+// All apps share one unprivileged uid/gid; deploy-service chowns each app's
+// data dir to this so writes still work. One uid (not per-app) is a deliberate
+// choice for now — see the security notes.
+const APP_RUN_UID = 100000;
+const APP_RUN_GID = 100000;
+
 // ONE wildcard certificate for the whole apps zone, instead of one per app.
 //
 // Let's Encrypt allows 50 new certificates per REGISTERED DOMAIN per week.
@@ -367,6 +374,12 @@ ${tagLines}
       ]
     }
     task "server" {
+      # Run every app as one shared non-root user (security review issue #05)
+      # instead of root. The app's own image files stay root-owned and
+      # read-only to it; its writable data dir is chowned to this uid by
+      # deploy-service so /data still works. Capabilities are dropped below,
+      # so this uid has no special powers on the host either.
+      user   = "${APP_RUN_UID}:${APP_RUN_GID}"
       driver = "docker"
       config {
         image      = "${imageName}"

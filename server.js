@@ -466,10 +466,14 @@ async function assertImageExists(appName, imageName) {
 async function ensureAppDataDir(appName) {
   const dir = appDataPathFor(appName);
   await fs.ensureDir(dir);
-  // ensureDir's own mode argument only applies to directories it
-  // actually creates, so chmod separately to also correct a directory
-  // that already exists from an earlier, stricter default.
-  await fs.chmod(dir, 0o777);
+  // Apps run as the shared non-root app user (security review issue #05),
+  // so the data dir must be writable by that group — not world-writable.
+  // The app data root is owned by that group with the setgid bit (see
+  // server-setup.sh), so a dir created here already inherits the group;
+  // 2770 keeps it group-writable (setgid preserved) and drops world access.
+  // chmod separately from ensureDir so it also corrects a directory that
+  // already exists from the earlier, world-writable (0777) default.
+  await fs.chmod(dir, 0o2770);
   return dir;
 }
 
