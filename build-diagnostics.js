@@ -62,8 +62,28 @@ function getBuildLog(appName) {
 // Only codes whose meaning is unambiguous get a hint — a wrong confident
 // explanation is worse than none, since it sends someone fixing the wrong
 // thing. Everything else falls through to the raw error.
-function describeBuildFailure(error) {
+//
+// `timeoutMs` is the build timeout the caller ran exec() with (server.js's
+// BUILD_TIMEOUT_MS); it is only used to word the timed-out hint.
+function describeBuildFailure(error, { timeoutMs } = {}) {
   const exitCode = typeof error?.code === 'number' ? error.code : null;
+
+  // exec()'s own timeout: it kills the child and rejects with killed:true
+  // and the signal, no exit code. Checked first — a killed build has no
+  // exit code of its own, so none of the checks below can match it.
+  if (error?.killed === true && exitCode === null) {
+    const minutes = timeoutMs ? Math.round(timeoutMs / 60000) : null;
+    return {
+      exitCode,
+      timedOut: true,
+      hint:
+        `The build was stopped${minutes ? ` after ${minutes} minute${minutes === 1 ? '' : 's'}` : ''} because it ` +
+        'was still running past the build time limit — the build step itself, not the running app. ' +
+        'Usually an install or build script that hangs (a dependency waiting on a prompt or an ' +
+        'unreachable host) or one that genuinely takes too long. Check the build log for the last ' +
+        'step that printed, make that step finish, and redeploy.',
+    };
+  }
 
   if (exitCode === 127) {
     return {

@@ -349,7 +349,11 @@ const NEXT_FOR_CODE = {
   invalid_file_path: 'Use relative paths inside the app for every files[].path (no leading "/" or "..").',
   invalid_file_content: 'Make every files[].content a string; base64-encode binary files and set "encoding": "base64".',
   invalid_file_encoding: 'Set files[].encoding to "utf8" or "base64", or leave it out.',
-  source_too_large: 'Too big for JSON: upload a tar.gz as the "source" field instead.',
+  // Returned by both source paths: json-source.js's body cap and the
+  // multipart file cap in server.js. limitMb in the reply says which.
+  source_too_large: 'Leave out node_modules, build output, .git and large media; if this was JSON, upload a tar.gz as the "source" field instead.',
+  source_too_large_extracted: 'The archive expands past the limit in limitMb: leave out node_modules, build output, .git and large media, then redeploy.',
+  invalid_upload: 'Send the app as one tar.gz in the multipart "source" field, or as JSON { files: [...] }.',
   too_many_files: 'Leave out node_modules, build output and .git, or upload a tar.gz instead.',
   no_manifest_at_root: 'Repackage so package.json (or index.html) is at the top of the upload; foundNestedAt says where it is.',
   app_nested_in_subdirectory: 'Deploy the folder named in deployThisInstead, not the one above it.',

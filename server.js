@@ -254,8 +254,70 @@ app.use(
   })
 );
 
-// Configure Multer to save uploaded files to a temporary folder
-const upload = multer({ dest: '/tmp/platform-uploads/' });
+// Largest tarball POST /apps accepts, in MB. Until this cap the multipart
+// path had NO limit at all — multer wrote whatever arrived to
+// /tmp/platform-uploads/ before the route's auth or validation ran, so
+// one oversized request could fill the host's disk. The JSON path has
+// had its own 25MB cap (json-source.js) from the start; this is the
+// tarball equivalent. 100MB matches Cloudflare's own request-body limit
+// on the Free/Pro plans, so a higher value only takes effect for clients
+// reaching the origin directly. Tunable per host via .env.
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 100;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+
+// Largest EXTRACTED size an upload may expand to, in MB. The compressed
+// cap above is not enough on its own: a tar.gz of a few MB of zeros
+// expands to tens of GB, so the extraction below stops accepting entries
+// once their declared sizes pass this.
+const MAX_EXTRACTED_MB = Number(process.env.MAX_EXTRACTED_MB) || 1024;
+const MAX_EXTRACTED_BYTES = MAX_EXTRACTED_MB * 1024 * 1024;
+
+// How long `railpack build` may run before it is killed, in ms. The build
+// runs in the background after the 202 (see performBuildAndDeploy), so
+// without this a build stuck on a hung install or a never-ending build
+// script held its railpack process, build directory and in_progress
+// deployment record forever. 15 minutes is well past a cold-cache build
+// on this host and only ever catches a build that is genuinely stuck.
+const BUILD_TIMEOUT_MS = Number(process.env.BUILD_TIMEOUT_MS) || 15 * 60 * 1000;
+
+// Configure Multer to save uploaded files to a temporary folder. `files: 1`
+// because the route only ever reads req.file (upload.single); a second part
+// would otherwise be written to disk and never cleaned up.
+const upload = multer({
+  dest: '/tmp/platform-uploads/',
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+});
+
+// Turns multer's limit errors into the same { error, code, next, links }
+// 413 every other rejection uses. Multer removes its own partial file on
+// these, so there is nothing to clean up here. Anything that is not a
+// multer error is passed on untouched.
+function uploadLimitErrors(err, req, res, next) {
+  if (!(err instanceof multer.MulterError)) return next(err);
+  const host = req.get('host');
+  const appName = req.headers['x-app-name'];
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    logger.info(`[${appName || '-'}] Rejected: upload over ${MAX_UPLOAD_MB}MB`);
+    return res.status(413).json(errorBody({
+      host, appName,
+      error: `The uploaded archive is over ${MAX_UPLOAD_MB}MB`,
+      code: 'source_too_large',
+      extra: { limitMb: MAX_UPLOAD_MB },
+    }));
+  }
+  if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+    return res.status(400).json(errorBody({
+      host, appName,
+      error: 'Send exactly one file, in the "source" field',
+      code: 'missing_source_file',
+    }));
+  }
+  return res.status(400).json(errorBody({
+    host, appName,
+    error: `Upload rejected: ${err.message}`,
+    code: 'invalid_upload',
+  }));
+}
 /**
  * Save the app's Nomad job spec so it can be woken after a stop.
  *
@@ -443,7 +505,7 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
   // A stated cause for the exit codes that have one, appended to the
   // raw error rather than replacing it — nothing that was reported
   // before stops being reported.
-  const failure = describeBuildFailure(error);
+  const failure = describeBuildFailure(error, { timeoutMs: BUILD_TIMEOUT_MS });
   const errorDetail = failure.hint ? `${error.message}\n\n${failure.hint}` : error.message;
 
   // Unlike before this became a background step, cleanup on failure
@@ -493,9 +555,22 @@ async function performBuildAndDeploy({
     // nothing to serve either and the failure was undiagnosable. The
     // raised maxBuffer matters for the same reason (exec's 1MB default
     // truncates a cold-cache build). See build-diagnostics.js.
+    //
+    // `timeout` kills the build after BUILD_TIMEOUT_MS. The rejection it
+    // produces carries `killed: true` plus whatever railpack had printed,
+    // and lands in finishDeployFailure like any other build error, so the
+    // deployment record, deploy state and cleanup all follow the one
+    // path. SIGKILL rather than the default SIGTERM: a stuck `npm install`
+    // inside railpack's BuildKit run does not reliably exit on SIGTERM,
+    // and a build that ignored the kill would be the very hang this exists
+    // to end.
     const buildResult = await execPromise(
-      `cd ${buildDir} && railpack build . --name ${imageName}`,
-      { maxBuffer: BUILD_OUTPUT_MAX_BUFFER },
+      // `exec` so the shell is REPLACED by railpack rather than parenting
+      // it: exec()'s timeout kills the process it spawned, and without
+      // this that is the `sh -c` wrapper, leaving railpack itself running
+      // as an orphan — the hang this timeout exists to end.
+      `cd ${buildDir} && exec railpack build . --name ${imageName}`,
+      { maxBuffer: BUILD_OUTPUT_MAX_BUFFER, timeout: BUILD_TIMEOUT_MS, killSignal: 'SIGKILL' },
     );
     setBuildLog(appName, buildResult);
 
@@ -770,7 +845,7 @@ function deployWarnings({ config, timers, claim, isStaticDeploy, schedules }) {
   return out;
 }
 
-app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
+app.post('/apps', upload.single('source'), uploadLimitErrors, jsonSource, async (req, res) => {
   const appName = req.headers['x-app-name'];
 
   // Multer has already written the upload to disk by the time this runs,
@@ -922,13 +997,39 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   // termination in practice).
 
   try {
-    // 2. Extract the uploaded tar.gz file
+    // 2. Extract the uploaded tar.gz file — bounded by MAX_EXTRACTED_BYTES.
+    // The filter sees every entry's declared size before it is written, so
+    // once the running total passes the cap every further entry is skipped
+    // and the upload is rejected below. Nothing past the cap ever reaches
+    // disk; what was already written goes with buildDir.
     logger.info(`[${appName}] Extracting code...`);
     await fs.ensureDir(buildDir);
+    let extractedBytes = 0;
+    let extractedOverCap = false;
     await tar.x({
       file: req.file.path,
-      cwd: buildDir
+      cwd: buildDir,
+      filter: (_entryPath, entry) => {
+        if (extractedOverCap) return false;
+        extractedBytes += entry.size || 0;
+        if (extractedBytes > MAX_EXTRACTED_BYTES) {
+          extractedOverCap = true;
+          return false;
+        }
+        return true;
+      },
     });
+    if (extractedOverCap) {
+      logger.info(`[${appName}] Rejected: archive expands past ${MAX_EXTRACTED_MB}MB`);
+      await fs.remove(buildDir);
+      await fs.remove(req.file.path);
+      return res.status(413).json(errorBody({
+        host, appName, appExists: true,
+        error: `The uploaded archive expands to more than ${MAX_EXTRACTED_MB}MB`,
+        code: 'source_too_large_extracted',
+        extra: { limitMb: MAX_EXTRACTED_MB },
+      }));
+    }
 
     // NEW 2a-pre. Confirm there's actually something buildable at
     // buildDir's own root before spending any build time — see
