@@ -259,17 +259,21 @@ app.use(
 // /tmp/platform-uploads/ before the route's auth or validation ran, so
 // one oversized request could fill the host's disk. The JSON path has
 // had its own 25MB cap (json-source.js) from the start; this is the
-// tarball equivalent. 100MB matches Cloudflare's own request-body limit
-// on the Free/Pro plans, so a higher value only takes effect for clients
-// reaching the origin directly. Tunable per host via .env.
-const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 100;
+// tarball equivalent. With the skill's excludes (.git, node_modules,
+// build output) a real source tree compresses to single-digit MB, so 50MB
+// is far above normal use. Cloudflare caps proxied request bodies at
+// 100MB on the Free/Pro plans; anything above that only takes effect for
+// clients reaching the origin directly. Tunable per host via .env.
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 50;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
 // Largest EXTRACTED size an upload may expand to, in MB. The compressed
 // cap above is not enough on its own: a tar.gz of a few MB of zeros
 // expands to tens of GB, so the extraction below stops accepting entries
-// once their declared sizes pass this.
-const MAX_EXTRACTED_MB = Number(process.env.MAX_EXTRACTED_MB) || 1024;
+// once their declared sizes pass this. Source text compresses 3-5x, so a
+// tarball near the compressed cap that is mostly code will hit this one
+// first — raise MAX_EXTRACTED_MB rather than MAX_UPLOAD_MB if that bites.
+const MAX_EXTRACTED_MB = Number(process.env.MAX_EXTRACTED_MB) || 100;
 const MAX_EXTRACTED_BYTES = MAX_EXTRACTED_MB * 1024 * 1024;
 
 // How long `railpack build` may run before it is killed, in ms. The build
