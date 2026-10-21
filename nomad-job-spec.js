@@ -336,6 +336,9 @@ job "${appName}" {
     health_check     = "task_states"
     min_healthy_time = "5s"
     healthy_deadline = "3m"
+    # How long Nomad waits for progress before failing the deployment.
+    # Default is 10m; must stay above healthy_deadline.
+    progress_deadline = "4m"
   }
 
   group "web" {

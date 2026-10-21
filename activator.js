@@ -25,6 +25,7 @@ const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
 const { allApps, hostnamesFor, readSleepState, markAwake } = require('./scale-to-zero-registry');
 const { isBotRequest } = require('./analytics/bot-filter');
 const { isSqliteFile, manifestEntryProblem, isLitestreamPath } = require('./sqlite-data-check');
+const { describeTaskFailure, formatForVisitor } = require('./nomad-task-failure');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
@@ -135,7 +136,7 @@ async function jobIsStopped(appName) {
  */
 async function waitWhileStopping(appName, deadline) {
   let waited = false;
-  for (;;) {
+  for (; ;) {
     const record = await readSleepState(appName);
     if (!record || record.state !== 'stopping') {
       if (waited) log(`${appName}: stop finished, continuing`);
@@ -200,7 +201,7 @@ async function verifyDataAgainstManifest(appName) {
   } catch (e) {
     throw new Error(
       `data directory ${dataDir} is unreadable (${e.code}) but the manifest lists ` +
-        `${manifest.fileCount} file(s) — refusing to start an app that would create a fresh, empty one`
+      `${manifest.fileCount} file(s) — refusing to start an app that would create a fresh, empty one`
     );
   }
   for (const entry of entries) {
@@ -275,7 +276,7 @@ async function runSavedSpec(appName) {
   if (missing.length > 0) {
     throw new Error(
       `image(s) missing on this host: ${missing.join(', ')} — these are built locally and pushed to no ` +
-        `registry, so ${appName} cannot be started without redeploying it`
+      `registry, so ${appName} cannot be started without redeploying it`
     );
   }
 
@@ -300,7 +301,7 @@ async function serviceRegistrations(appName) {
  * dead address until the deadline.
  */
 async function waitForAddress(appName, deadline, ignoreAllocs = new Set()) {
-  for (;;) {
+  for (; ;) {
     const reg = (await serviceRegistrations(appName)).find(
       (r) => r.Address && r.Port && !ignoreAllocs.has(r.AllocID)
     );
@@ -342,7 +343,12 @@ async function wake(appName) {
   return rememberAddr(appName, addr);
 }
 
+// When each app's most recent cold start began. explainCrash only blames
+// allocations created after this, never a failure from an earlier wake.
+const wakeStartedAt = new Map();
+
 async function coldStart(appName, deadline) {
+  wakeStartedAt.set(appName, Date.now() - 5000); // clock skew margin
   // Logged phase by phase, not just at the ends. A cold start is the one
   // path here that legitimately takes tens of seconds, so "no output yet"
   // and "wedged" look identical from outside — and that is exactly how
@@ -436,7 +442,7 @@ const RETRYABLE = ['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'EPIPE'];
  * starting is not stopped, and its address keeps being retried.
  */
 async function forwardWhenReady(req, res, appName, addr, body, deadline) {
-  for (;;) {
+  for (; ;) {
     try {
       return await forward(req, res, addr, body);
     } catch (e) {
@@ -449,6 +455,24 @@ async function forwardWhenReady(req, res, appName, addr, body, deadline) {
       }
     }
   }
+}
+
+// Visitor-facing crash explanation, or null when the task is still
+// coming up / Nomad cannot say. Best-effort and bounded (see
+// nomad-task-failure.js): it must never turn a 503 into a hang.
+async function explainCrash(appName) {
+  const since = wakeStartedAt.get(appName);
+  if (!since) return null; // nothing was cold-started by this process: not a startup crash
+  const d = await describeTaskFailure(appName, { tailBytes: 1500, since }).catch(() => null);
+  const text = formatForVisitor(d);
+  if (!text) return null;
+  const tail = (d.stderr || d.stdout || '').split('\n').slice(-5).join(' | ');
+  log(
+    `${appName}: crashed on startup — exit code ${d.exitCode}, ${d.restarts} restart(s), alloc ${d.allocId}` +
+    (d.lastEvent ? `; nomad: ${d.lastEvent}` : '') +
+    (tail ? `; last output: ${tail}` : '')
+  );
+  return text;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -551,6 +575,20 @@ const server = http.createServer(async (req, res) => {
     // A clean error after a bounded wait, never a hang: Step 4's
     // checklist requires an app that cannot start to produce this rather
     // than holding the visitor's connection open indefinitely.
+    //
+    // "Did not become ready in time" was the ONLY message, and it was
+    // wrong for the common case: the container had exited (bad start
+    // command, missing env var, no database) and Nomad had given up on
+    // it — nothing a retry can fix. Ask Nomad what happened to the task
+    // and say so. The visitor gets the exit code and a sentence; the
+    // log tail goes to this process's log only, since an app's output is
+    // its owner's, not a passer-by's.
+    const crash = await explainCrash(appName);
+    if (crash) {
+      res.writeHead(503, { 'content-type': 'text/plain', 'retry-after': '300' });
+      res.end(crash);
+      return;
+    }
     res.writeHead(503, { 'content-type': 'text/plain', 'retry-after': '30' });
     res.end('This app is starting up and did not become ready in time. Please try again.\n');
   }
