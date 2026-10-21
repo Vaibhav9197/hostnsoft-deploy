@@ -86,8 +86,12 @@ function pick(all, ...names) {
   return out;
 }
 
-function appFacts({ appName, kind, claimed, expiresAt, deploymentId }) {
+function appFacts({ appName, appId, kind, claimed, expiresAt, deploymentId }) {
   const app = { name: appName, kind, claimed };
+  // The app's stable id — the deployer keeps it in embarko.json and sends
+  // it back as X-App-Id, so a rename in the dashboard can't split the app
+  // in two. Only the deploy replies have it.
+  if (appId) app.id = appId;
   if (!claimed && expiresAt) app.expiresAt = expiresAt;
   // The platform's id for this deploy attempt, for support and the
   // dashboard's history. Only the deploy reply has one.
@@ -144,6 +148,21 @@ function warningsHelpTopic(warnings) {
   return warnings.every((w) => w.code.startsWith('embarko_json')) ? 'embarko-json' : 'schedules';
 }
 
+// The deploy reply's opening sentence about which app this deploy reached:
+// a new one (save its id), or an existing one that changed outside this
+// deploy (notices[]). Null when it's the expected app under the expected
+// name, which needs no comment.
+function identitySentence(action, notices, appName) {
+  const renamed = notices.find((n) => n.code === 'app_renamed');
+  if (renamed) {
+    return `This app was renamed to "${appName}" outside this deploy, so this deploy updated it: use "${appName}" from now on and keep app.id as "appId" in embarko.json.`;
+  }
+  if (action === 'created') {
+    return 'New app: save app.id as "appId" in embarko.json, so later deploys reach this app even if it is renamed.';
+  }
+  return null;
+}
+
 // The one sentence about keeping a fresh temporary app, for the deploy
 // reply that carries its link.
 function keepSentence(expiresAt) {
@@ -156,7 +175,7 @@ function keepSentence(expiresAt) {
  * by a static site. `claimUrl` — the keep link, for a just-created
  * temporary app. `deploymentId` — hostnsoft-api's id for this attempt.
  */
-function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, schedules, warnings = [] }) {
+function acceptedBody({ host, appName, appId, action, notices = [], kind, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, schedules, warnings = [] }) {
   const all = linksFor(host, appName, url, claimUrl);
   const poll = POLL_SECONDS[kind];
 
@@ -164,6 +183,8 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
     ? `Static site, no build needed: check links.status in ${poll} seconds.`
     : `Building: poll links.status every ${poll} seconds until it says "live", "failed" or "crashed".`;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
+  const identity = identitySentence(action, notices, appName);
+  if (identity) next = `${identity} ${next}`;
   if (!claimed && claimUrl) next = `${next} ${keepSentence(expiresAt)}`;
   if (convertingFromService) {
     next = `This replaces the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
@@ -176,7 +197,9 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
   return {
     success: true,
     status: kind === 'static' ? 'publishing' : 'building',
-    app: appFacts({ appName, kind, claimed, expiresAt, deploymentId }),
+    app: appFacts({ appName, appId, kind, claimed, expiresAt, deploymentId }),
+    ...(action ? { action } : {}),
+    ...(notices.length ? { notices } : {}),
     ...(sched ? { schedules: sched.facts } : {}),
     ...(warnings.length ? { warnings } : {}),
     next,
@@ -195,17 +218,23 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
  * Same body the status reply would give, minus its deprecated `deploy`
  * field, with the claim/convert notes the 202 would have carried.
  */
-function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, deployState, live, warnings = [] }) {
+function publishedBody({ host, appName, appId, action, notices = [], url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, deployState, live, warnings = [] }) {
   const { deploy, ...body } = statusBody({
-    host, appName, kind: 'static', url, claimed, expiresAt, claimUrl, deploymentId, deployState, staticLive: live,
+    host, appName, appId, kind: 'static', url, claimed, expiresAt, claimUrl, deploymentId, deployState, staticLive: live,
   });
   let next = body.next;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
+  const identity = identitySentence(action, notices, appName);
+  if (identity) next = `${identity} ${next}`;
   if (convertingFromService) {
     next = `This replaced the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
   if (warnings.length) next = `${next} ${warningsSentence(warnings)}`;
-  const extra = warnings.length ? { warnings } : {};
+  const extra = {
+    ...(action ? { action } : {}),
+    ...(notices.length ? { notices } : {}),
+    ...(warnings.length ? { warnings } : {}),
+  };
   return live
     ? { success: true, ...body, ...extra, next }
     : { success: false, code: 'publish_failed', ...body, ...extra, next };
@@ -219,9 +248,9 @@ function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, cla
  * `claimUrl`/`deploymentId` are set only when this backs a deploy reply
  * (publishedBody): a status poll never carries the claim link.
  */
-function statusBody({ host, appName, kind, url, claimed, expiresAt, claimUrl, deploymentId, deployState, health, staticLive }) {
+function statusBody({ host, appName, appId, kind, url, claimed, expiresAt, claimUrl, deploymentId, deployState, health, staticLive }) {
   const all = linksFor(host, appName, url, claimUrl);
-  const app = appFacts({ appName, kind, claimed, expiresAt, deploymentId });
+  const app = appFacts({ appName, appId, kind, claimed, expiresAt, deploymentId });
   const attempt = deployState ? deployState.status : null;
   const poll = POLL_SECONDS[kind];
 
@@ -340,6 +369,9 @@ const NEXT_FOR_CODE = {
   app_name_reserved: 'That name is reserved and never becomes free: pick a different one.',
   app_name_taken: 'That name belongs to someone else: pick a different one.',
   rename_in_progress: 'This app\'s address is being changed: wait a few minutes, then deploy under its new name.',
+  invalid_app_id: 'Send app.id from an earlier deploy reply as X-App-Id, exactly as given, or leave the header out.',
+  app_not_found: 'No app in this workspace has this X-App-Id: check embarko.json\'s "appId" and the token\'s workspace, or remove "appId" to deploy as a new app.',
+  app_deleted: 'This app was deleted: ask the user before deploying it again; to make it a new app, remove "appId" from embarko.json and deploy.',
   app_name_check_failed: 'Temporary problem on our side: retry once, and report it to links.feedback if it keeps happening.',
   invalid_app_version: 'Use only letters, numbers, dots, dashes and underscores in X-App-Version.',
   invalid_app_type: 'Shorten X-App-Type to a plain label like "portfolio", or leave it out.',
