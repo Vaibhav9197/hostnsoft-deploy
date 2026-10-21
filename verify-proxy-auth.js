@@ -29,13 +29,16 @@ const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET;
 // verify" as "let them in". Callers should treat a false `valid` the
 // same whether it means "the PAT itself was rejected" or "hostnsoft-api
 // couldn't be asked" — both are "this credential doesn't check out".
-async function verifyProxyAuthCompanyAccess(proxyAuthToken, companyId) {
+// appName (optional, added with roles): also ask whether this person may
+// see that app — appAccess in the reply. A member limited to some apps must
+// not read another app's status or logs. Absent from an older API's reply.
+async function verifyProxyAuthCompanyAccess(proxyAuthToken, companyId, appName) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/proxy-auth/verify-membership`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_API_SECRET },
-      body: JSON.stringify({ proxyAuthToken, companyId }),
+      body: JSON.stringify({ proxyAuthToken, companyId, ...(appName ? { appName } : {}) }),
     });
   } catch (e) {
     logger.error(`[verify-proxy-auth] could not reach hostnsoft-api: ${e.message}`);
@@ -49,7 +52,11 @@ async function verifyProxyAuthCompanyAccess(proxyAuthToken, companyId) {
   }
 
   const body = await response.json();
-  return { valid: body.valid === true, isMember: body.isMember === true };
+  return {
+    valid: body.valid === true,
+    isMember: body.isMember === true,
+    appAccess: typeof body.appAccess === 'boolean' ? body.appAccess : null,
+  };
 }
 
 module.exports = { verifyProxyAuthCompanyAccess };

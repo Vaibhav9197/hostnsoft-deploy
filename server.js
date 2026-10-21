@@ -1406,9 +1406,13 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader, per
   // already presented above — a deploy token remains the primary/unchanged
   // path for every existing agent/CI caller.
   if (!deployTokenPresented && proxyAuthTokenHeader) {
-    const membership = await verifyProxyAuthCompanyAccess(proxyAuthTokenHeader, lookup.companyId);
+    const membership = await verifyProxyAuthCompanyAccess(proxyAuthTokenHeader, lookup.companyId, appName);
     if (!membership.valid) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
     if (!membership.isMember) return { ok: false, status: 404, code: 'not_found', error: "Not found" };
+    // A member whose role doesn't reach this app (roles: selected apps
+    // only) gets the same 404 as a stranger — the API's rule for an app
+    // someone can't see.
+    if (membership.appAccess === false) return { ok: false, status: 404, code: 'not_found', error: "Not found" };
     callerCompanyId = lookup.companyId;
   }
 
