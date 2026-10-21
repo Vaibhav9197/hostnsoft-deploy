@@ -41,6 +41,11 @@ const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/val
 // (fail closed), same as before.
 // 404/410: an X-App-Id that leads to no app, or to a deleted one
 // (app_not_found / app_deleted) — the caller's to fix, not ours.
+// 403 no_access / 409 app_moved (hostnsoft-api's services/tokenAccess.ts):
+// a personal token whose person lost access to the app's workspace, or any
+// token the app has moved away from. Relayed with their own code like the
+// rest, so the agent is told to ask for access instead of seeing a 502 —
+// and, for app_moved, never retries under a new name.
 const RELAYED_STATUSES = new Set([400, 401, 403, 404, 409, 410]);
 
 async function claimProject(credential, slug, appType, schedules, appId) {
