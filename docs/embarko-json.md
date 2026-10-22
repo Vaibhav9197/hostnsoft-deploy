@@ -72,6 +72,10 @@ old name created a second app.
   with an `app_renamed` notice in the reply's `notices[]`. An id from another
   workspace gets 404 `app_not_found`, and a deleted app 410 `app_deleted`:
   never a new app.
+- The id is followed only under the app's current name or a name it used to
+  have. Any other name gets 409 `app_id_mismatch`: it means the code was
+  copied to start a new app, embarko.json included, and following the id
+  would overwrite the original.
 - Without an id, a deploy under an app's old name also reaches the renamed
   app (hostnsoft-api's `SlugAlias`), so a missing file is no worse than before.
 
