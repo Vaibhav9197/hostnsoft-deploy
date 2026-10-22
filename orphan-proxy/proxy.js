@@ -86,10 +86,11 @@ function buildBannerTag(expiresAt, loginUrl) {
   // than not showing anything at all.
   var host = document.createElement('div');
   host.id = '__embarko_orphan_banner';
-  // In normal flow as the first child of <body>, not position:fixed —
-  // a fixed bar sat on top of the app's own first ~40px (its header,
-  // nav, title) and hid it. In flow, it pushes the page down instead.
-  host.style.cssText = 'all:initial;display:block;width:100%;';
+  // Fixed to the top so the host page's own body layout (flex/grid
+  // centering, etc.) cannot treat the banner as one of its items. The
+  // page is pushed down by a matching margin on <html> so the bar never
+  // covers the app's own header; see offsetPage() below.
+  host.style.cssText = 'all:initial;display:block;position:fixed;top:0;left:0;right:0;width:100%;z-index:2147483647;';
 
   var isolated = !!host.attachShadow;
   var root = isolated ? host.attachShadow({ mode: 'open' }) : host;
@@ -134,15 +135,27 @@ function buildBannerTag(expiresAt, loginUrl) {
     textEl.textContent = 'This app will be deleted in ' + pad(hh) + ':' + pad(mm) + ' hours';
   }
 
+  // Reserve space for the fixed bar by offsetting the whole document, and
+  // keep anchor targets from landing underneath it.
+  function offsetPage() {
+    var h = bar.offsetHeight;
+    document.documentElement.style.setProperty('margin-top', h + 'px', 'important');
+    document.documentElement.style.setProperty('scroll-padding-top', h + 'px', 'important');
+  }
+
   function mount() {
-    function place() { document.body.insertBefore(host, document.body.firstChild); }
+    function place() {
+      document.body.insertBefore(host, document.body.firstChild);
+      offsetPage();
+      window.addEventListener('resize', offsetPage);
+    }
+    render();
     if (document.body) {
       place();
     } else {
       document.addEventListener('DOMContentLoaded', place);
     }
-    render();
-    setInterval(render, 30000);
+    setInterval(function () { render(); offsetPage(); }, 30000);
   }
   mount();
 })();</script>`;

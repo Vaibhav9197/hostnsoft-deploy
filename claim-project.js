@@ -39,9 +39,16 @@ const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/val
 // session expired" or "you're not in that company", not a blanket "could
 // not verify app name availability". Everything else still becomes a 502
 // (fail closed), same as before.
-const RELAYED_STATUSES = new Set([400, 401, 403, 409]);
+// 404/410: an X-App-Id that leads to no app, or to a deleted one
+// (app_not_found / app_deleted) — the caller's to fix, not ours.
+// 403 no_access / 409 app_moved (hostnsoft-api's services/tokenAccess.ts):
+// a personal token whose person lost access to the app's workspace, or any
+// token the app has moved away from. Relayed with their own code like the
+// rest, so the agent is told to ask for access instead of seeing a 502 —
+// and, for app_moved, never retries under a new name.
+const RELAYED_STATUSES = new Set([400, 401, 403, 404, 409, 410]);
 
-async function claimProject(credential, slug, appType, schedules) {
+async function claimProject(credential, slug, appType, schedules, appId) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/projects/claim`, {
@@ -50,6 +57,7 @@ async function claimProject(credential, slug, appType, schedules) {
       body: JSON.stringify({
         ...credentialBody(credential),
         slug,
+        ...(appId ? { appId } : {}),
         ...(appType ? { appType } : {}),
         ...(schedules !== undefined ? { schedules } : {}),
       }),
@@ -111,6 +119,13 @@ async function claimProject(credential, slug, appType, schedules) {
   return {
     ok: true,
     projectId: body.projectId,
+    // The app's current name — differs from `slug` when the app was renamed
+    // and found by its id or old name. server.js deploys under this one.
+    slug: body.slug || slug,
+    // "created" | "updated", and what changed outside this deploy
+    // ({code, from, to, detail}) — relayed in the deploy reply.
+    action: body.action || null,
+    notices: Array.isArray(body.notices) ? body.notices : [],
     customDomains: body.customDomains || [],
     envVars: body.envVars || [],
     memoryMb: typeof body.memoryMb === 'number' ? body.memoryMb : null,

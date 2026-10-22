@@ -1,12 +1,14 @@
 # embarko.json
 
 An optional file in the app's top folder that holds platform settings which
-belong with the code. Added 2026-10-17. Today it carries one setting,
-`schedules` (see hostnsoft-api's `docs/schedules.md`).
+belong with the code. Added 2026-10-17. It carries two settings: `appId`
+(added 2026-10-21, see "appId" below) and `schedules` (see hostnsoft-api's
+`docs/schedules.md`).
 
 ```json
 {
   "$schema": "https://embarko.ai/schema/embarko.json",
+  "appId": "cm2x7k9qp0001abcd",
   "schedules": [
     { "cron": "0 9 * * 1-5", "path": "/tasks/daily-digest", "timezone": "Asia/Kolkata", "name": "daily digest" }
   ]
@@ -52,6 +54,30 @@ whose app is nested is refused anyway by the manifest-root check).
 
 Schedule content (cron, path, timezone, limits) is checked by hostnsoft-api
 at claim time, the one place those rules live.
+
+## appId
+
+The app's stable id: `app.id` in the first deploy reply, which tells the
+agent to save it here. The app's name can be changed from the dashboard
+without the agent knowing; before this, the agent's next deploy under the
+old name created a second app.
+
+- The `X-App-Id` header, when sent, wins over the file.
+- Read only for token deploys (agents, CI). A dashboard upload deploys to the
+  app the person picked, whatever a zip's file says.
+- Not a valid id (lowercase letters and digits) refuses the deploy
+  (`invalid_embarko_json`): ignoring it would fall back to deploying by name.
+- hostnsoft-api decides the app (`services/projectClaim.ts`
+  `resolveDeployTarget`). A renamed app is deployed under its current name,
+  with an `app_renamed` notice in the reply's `notices[]`. An id from another
+  workspace gets 404 `app_not_found`, and a deleted app 410 `app_deleted`:
+  never a new app.
+- The id is followed only under the app's current name or a name it used to
+  have. Any other name gets 409 `app_id_mismatch`: it means the code was
+  copied to start a new app, embarko.json included, and following the id
+  would overwrite the original.
+- Without an id, a deploy under an app's old name also reaches the renamed
+  app (hostnsoft-api's `SlugAlias`), so a missing file is no worse than before.
 
 ## Warnings in the deploy reply
 

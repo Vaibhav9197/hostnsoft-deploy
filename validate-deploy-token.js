@@ -53,13 +53,21 @@ async function validateDeployToken(token) {
 // truthy, so every existing `if (!(await validateDeployToken(token)))`
 // call site would have silently stopped rejecting invalid tokens if this
 // had been done in place instead.
-async function validateDeployTokenWithCompany(token) {
+//
+// appName/permission (optional, 2026-10-21): also ask hostnsoft-api whether
+// this token may act on that app. A personal ("user") token reaches apps in
+// every workspace its person is in, so "same companyId" is no longer the
+// whole answer; hostnsoft-api decides (its services/tokenAccess.ts) and
+// replies appAccess, plus appRefusal {status, code, error} for a caller it
+// owes an explanation (app_moved, no_access). An older hostnsoft-api sends
+// neither, and the companyId comparison in server.js still applies.
+async function validateDeployTokenWithCompany(token, appName, permission) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/deploy-tokens/validate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, ...(appName ? { appName } : {}), ...(permission ? { permission } : {}) }),
     });
   } catch (e) {
     logger.error(`[validate-deploy-token] could not reach hostnsoft-api: ${e.message}`);
@@ -74,7 +82,11 @@ async function validateDeployTokenWithCompany(token) {
 
   const body = await response.json();
   if (body.valid !== true || typeof body.companyId !== 'string') return null;
-  return { companyId: body.companyId };
+  return {
+    companyId: body.companyId,
+    appAccess: typeof body.appAccess === 'boolean' ? body.appAccess : null,
+    appRefusal: body.appRefusal && typeof body.appRefusal.code === 'string' ? body.appRefusal : null,
+  };
 }
 
 module.exports = { validateDeployToken, validateDeployTokenWithCompany };

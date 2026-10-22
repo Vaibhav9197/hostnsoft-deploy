@@ -77,6 +77,7 @@ const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = req
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
 const { getNomadJob, stopNomadJob } = require('./nomad-job');
+const { describeTaskFailure, formatForOwner } = require('./nomad-task-failure');
 const { renameApp, renameStaticApp } = require('./rename-app');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
@@ -244,6 +245,7 @@ app.use(
       'proxy_auth_token',
       'X-Company-Id',
       'X-App-Name',
+      'X-App-Id',
       'X-App-Version',
       'X-Agent-Name',
     ],
@@ -347,6 +349,33 @@ async function purgeIfNotRunning(appName) {
   });
 }
 
+/**
+ * Runs `nomad job run` (no -detach, so it returns only once the deployment
+ * succeeds or fails). On failure, replaces the CLI's unhelpful error with
+ * the app's own crash details (exit code, restarts, last log lines) from
+ * nomad-task-failure.js. The thrown error carries no stdout/stderr so
+ * setBuildLog does not overwrite the railpack build log.
+ */
+async function runNomadJob(appName, nomadFilePath) {
+  // Allocations older than this belong to earlier deploys/wakes and must
+  // not be blamed for this one (see pickAllocation in nomad-task-failure).
+  const since = Date.now() - 5000; // clock skew between us and Nomad
+  try {
+    await execPromise(`nomad job run ${nomadFilePath}`);
+  } catch (e) {
+    logger.error(`[${appName}] nomad job run failed: ${(e.stderr || e.stdout || e.message || '').trim().slice(-2000)}`);
+    const diagnosis = await describeTaskFailure(appName, { since }).catch(() => null);
+    const explained = formatForOwner(appName, diagnosis);
+    if (explained) {
+      logger.warn(`[${appName}] Deploy failed at startup: exit code ${diagnosis.exitCode}, ${diagnosis.restarts} restart(s), alloc ${diagnosis.allocId}`);
+      throw new Error(explained);
+    }
+    throw new Error(
+      `Nomad could not bring the app up and the deploy was stopped (${e.message.split('\n')[0]}). ` +
+      `GET /apps/${appName}/logs has the container's output, if any was produced.`
+    );
+  }
+}
 
 // `railpack build` can exit 0 without leaving a tagged image behind — a
 // production incident did exactly that (docs/CLAUDE.md, "The still-open
@@ -532,7 +561,7 @@ async function performBuildAndDeploy({
     // See purgeIfNotRunning: without this, redeploying the same app
     // version over a dead job is a silent no-op reported as a failure.
     await purgeIfNotRunning(appName);
-    await execPromise(`nomad job run ${nomadFilePath}`);
+    await runNomadJob(appName, nomadFilePath);
     await saveJobSpec(appName);
 
     // AFTER saveJobSpec, which is what the router generation reads
@@ -771,7 +800,16 @@ function deployWarnings({ config, timers, claim, isStaticDeploy, schedules }) {
 }
 
 app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
-  const appName = req.headers['x-app-name'];
+  // `let`: replaced by the app's current name once the claim has resolved
+  // it (see below) — everything after the claim builds and routes under that.
+  let appName = req.headers['x-app-name'];
+
+  // Optional: the app's stable id from an earlier deploy reply (app.id),
+  // which the deployer keeps in embarko.json. It finds the app even after
+  // its name was changed in the dashboard — see hostnsoft-api's
+  // services/projectClaim.ts resolveDeployTarget.
+  const rawAppId = req.headers['x-app-id'];
+  const appId = typeof rawAppId === 'string' ? rawAppId.trim() : '';
 
   // Multer has already written the upload to disk by the time this runs,
   // so every rejection below must remove it — nothing else ever will.
@@ -870,6 +908,10 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     return reject(400, 'invalid_agent_name', "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".");
   }
 
+  if (appId && (appId.length > 64 || !/^[a-z0-9]+$/.test(appId))) {
+    return reject(400, 'invalid_app_id', "Invalid X-App-Id header. Send the app.id from an earlier deploy reply exactly as given, or leave it out.");
+  }
+
   // The app's optional embarko.json, read from the archive before the
   // claim so a file that can't be trusted refuses the deploy before any
   // work, and the claim can check its schedules and create CRON_SECRET in
@@ -883,9 +925,21 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   }
   const schedules = config.schedules;
 
-  const claim = await orDiscard(claimProject(credential, appName, appType || undefined, schedules));
+  // The header wins over embarko.json's appId: it is what this deployer
+  // means right now. The file covers token deployers (agents, CI) that
+  // don't send one. Not a dashboard upload: there the person picked the
+  // app, and a stale file in their zip must not send it somewhere else.
+  const isDashboardUpload = !!(credential && credential.proxyAuthToken);
+  const targetAppId = appId || (isDashboardUpload ? undefined : config.appId) || undefined;
+  const claim = await orDiscard(claimProject(credential, appName, appType || undefined, schedules, targetAppId));
   if (!claim.ok) {
     return reject(claim.status, claim.code, claim.error);
+  }
+  // The app may have been renamed since the deployer last looked: build,
+  // route and report under its current name. claim.notices says so.
+  if (claim.slug && claim.slug !== appName) {
+    logger.info(`[${appName}] Resolved to the app's current name "${claim.slug}"`);
+    appName = claim.slug;
   }
 
   // In flight from the claim on, for orphan cleanup's teardown (see
@@ -1165,6 +1219,9 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     const replyFacts = {
       host,
       appName,
+      appId: claim.projectId,
+      action: claim.action,
+      notices: claim.notices,
       url: `https://${domain}`,
       claimed: !claim.isOrphan,
       claimedNow: !!claim.claimedNow,
@@ -1307,16 +1364,30 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
 // loadCompanyContext uses. A credential that's PRESENT but itself invalid
 // (a bad deploy token, or a rejected/expired PAT) is 401 instead — "your
 // credential is wrong" reads differently from "this isn't your app".
-async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
+//
+// A personal ("user") deploy token (2026-10-21) reaches apps outside its own
+// workspace, so for a token the access decision is hostnsoft-api's
+// (validation.appAccess, see validate-deploy-token.js), with the companyId
+// comparison below kept only for an older hostnsoft-api that doesn't answer
+// it. `permission` names what the route does — app.view or app.logs.
+async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader, permission = 'app.view') {
   let callerCompanyId = null;
   let deployTokenPresented = false;
+  let tokenAppAccess = null;
   if (authHeader) {
     deployTokenPresented = true;
     const token = authHeader.split(' ')[1];
     if (!token) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
-    const validation = await validateDeployTokenWithCompany(token);
+    const validation = await validateDeployTokenWithCompany(token, appName, permission);
     if (!validation) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
     callerCompanyId = validation.companyId;
+    tokenAppAccess = validation.appAccess;
+    // A caller the app moved away from, or a person who lost access: told
+    // why, rather than a 404 that reads as "the app is gone".
+    if (validation.appRefusal) {
+      const r = validation.appRefusal;
+      return { ok: false, status: r.status || 403, code: r.code, error: r.error };
+    }
   }
 
   const lookup = await lookupProject(appName);
@@ -1341,6 +1412,12 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
     callerCompanyId = lookup.companyId;
   }
 
+  if (deployTokenPresented && tokenAppAccess !== null) {
+    if (!tokenAppAccess) return { ok: false, status: 404, code: 'not_found', error: "Not found" };
+    // The APP's workspace, not the token's: customer-query attributes the
+    // row with it, and for a personal token the two can differ.
+    return { ok: true, companyId: lookup.companyId, isOrphan: false };
+  }
   if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
     return { ok: false, status: 404, code: 'not_found', error: "Not found" };
   }
@@ -1398,7 +1475,7 @@ app.get('/apps/:appName/logs', async (req, res) => {
     return res.status(400).json(errorBody({ host, error: "Invalid app name", code: 'invalid_app_name' }));
   }
 
-  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
+  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token'], 'app.logs');
   if (!auth.ok) {
     return res.status(auth.status).json(errorBody({ host, appName, error: auth.error, code: auth.code }));
   }
@@ -1669,7 +1746,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
         await fs.ensureDir(path.dirname(nomadFilePath));
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
-        await execPromise(`nomad job run ${nomadFilePath}`);
+        await runNomadJob(appName, nomadFilePath);
         await saveJobSpec(appName);
         await fs.remove(nomadFilePath);
         logger.info(`[${appName}] Config update applied.`);
@@ -1687,7 +1764,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
-    await execPromise(`nomad job run ${nomadFilePath}`);
+    await runNomadJob(appName, nomadFilePath);
     await saveJobSpec(appName);
     await fs.remove(nomadFilePath);
     res.json({ success: true });

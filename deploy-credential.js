@@ -12,7 +12,10 @@
  *   deploy token (Authorization: Bearer <token>) — the original path
  *     (agents, CI, the CLI). Company-scoped at creation, so it alone says
  *     which company; validated here before any build resources are spent,
- *     exactly as before.
+ *     exactly as before. A personal ("user") token, since 2026-10-21, can
+ *     also reach apps in its person's other workspaces — hostnsoft-api
+ *     decides that in the claim; nothing here changes, the token is relayed
+ *     as-is.
  *   proxy_auth_token (+ X-Company-Id) — added 2026-09-17 for the
  *     dashboard's upload button. The PAT is the dashboard's own login
  *     credential; it is NOT company-scoped (one person can belong to
