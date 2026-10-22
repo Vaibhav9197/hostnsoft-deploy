@@ -30,15 +30,16 @@ const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET;
 // same whether it means "the PAT itself was rejected" or "hostnsoft-api
 // couldn't be asked" — both are "this credential doesn't check out".
 // appName (optional, added with roles): also ask whether this person may
-// see that app — appAccess in the reply. A member limited to some apps must
-// not read another app's status or logs. Absent from an older API's reply.
-async function verifyProxyAuthCompanyAccess(proxyAuthToken, companyId, appName) {
+// read that app — appAccess in the reply — for `permission`: app.view for
+// status, app.logs for logs (only some access levels include logs). Absent
+// from an older API's reply.
+async function verifyProxyAuthCompanyAccess(proxyAuthToken, companyId, appName, permission) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/proxy-auth/verify-membership`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_API_SECRET },
-      body: JSON.stringify({ proxyAuthToken, companyId, ...(appName ? { appName } : {}) }),
+      body: JSON.stringify({ proxyAuthToken, companyId, ...(appName ? { appName, ...(permission ? { permission } : {}) } : {}) }),
     });
   } catch (e) {
     logger.error(`[verify-proxy-auth] could not reach hostnsoft-api: ${e.message}`);

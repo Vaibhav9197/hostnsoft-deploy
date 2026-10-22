@@ -383,6 +383,7 @@ const NEXT_FOR_CODE = {
   // second copy of an app the user still has.
   app_moved: 'This app was moved to another workspace this token can\'t reach: nothing was deployed. Don\'t deploy it under a new name; ask the user for a personal deploy token, or for access to the workspace it moved to (see links.help).',
   no_access: 'The person this token belongs to has no access to that workspace: nothing was changed. Ask the user to get access there, or for a token from that workspace (see links.help).',
+  permission_denied: 'The person this token belongs to can\'t do this with their access (the error says what they have; publishing needs Full access to the app): nothing was changed. Tell the user; an Owner or Admin can give them more access on the Members page. Don\'t retry, make a new token or deploy under another name (see links.help).',
   app_deleted: 'This app was deleted: ask the user before deploying it again; to make it a new app, remove "appId" from embarko.json and deploy.',
   app_id_mismatch: 'The "appId" belongs to another app, likely because this code was copied from it: for a new app, remove "appId" from embarko.json and deploy; to update that app, deploy under its name.',
   app_name_check_failed: 'Temporary problem on our side: retry once, and report it to links.feedback if it keeps happening.',
@@ -414,6 +415,7 @@ const HELP_FOR_CODE = {
   // The claim topic is also where tokens (personal vs workspace) are explained.
   app_moved: 'claim',
   no_access: 'claim',
+  permission_denied: 'team',
   unsupported_storage_pattern: 'data',
   invalid_static_root: 'static-sites',
   app_kind_changed: 'static-sites',

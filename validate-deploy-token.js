@@ -59,7 +59,7 @@ async function validateDeployToken(token) {
 // every workspace its person is in, so "same companyId" is no longer the
 // whole answer; hostnsoft-api decides (its services/tokenAccess.ts) and
 // replies appAccess, plus appRefusal {status, code, error} for a caller it
-// owes an explanation (app_moved, no_access). An older hostnsoft-api sends
+// owes an explanation (app_moved, no_access, permission_denied). An older hostnsoft-api sends
 // neither, and the companyId comparison in server.js still applies.
 async function validateDeployTokenWithCompany(token, appName, permission) {
   let response;
