@@ -3,11 +3,13 @@
  *
  * Reads the app's optional embarko.json from the uploaded archive, before
  * the claim and before anything is extracted or built. It is where an app
- * declares platform settings that live with its code; today only
- * `schedules` (hostnsoft-api's docs/schedules.md). Spec and the reasoning
- * behind each rule: docs/embarko-json.md.
+ * declares platform settings that live with its code: `appId` (which app
+ * this code deploys to, from the first deploy's reply) and `schedules`
+ * (hostnsoft-api's docs/schedules.md). Spec and the reasoning behind each
+ * rule: docs/embarko-json.md.
  *
  *   { "$schema": "https://embarko.ai/schema/embarko.json",
+ *     "appId": "cm2x7k9qp0001abcd",
  *     "schedules": [{ "cron": "0 9 * * 1-5", "path": "/tasks/daily", "timezone": "Asia/Kolkata" }] }
  *
  * Refuses the deploy (400) only for a file that can't be trusted to mean
@@ -24,7 +26,9 @@ const logger = require('./logger');
 
 const FILE_NAME = 'embarko.json';
 const MAX_BYTES = 64 * 1024;
-const KNOWN_KEYS = new Set(['$schema', 'schedules']);
+const KNOWN_KEYS = new Set(['$schema', 'appId', 'schedules']);
+// Same shape server.js accepts in X-App-Id: the app.id a deploy reply gave.
+const APP_ID_RE = /^[a-z0-9]{1,64}$/;
 
 // Names an agent or person might use by mistake. Matched at the top folder
 // only, case-insensitively, so "Embarko.json" counts too.
@@ -183,7 +187,7 @@ async function readEmbarkoConfig(archivePath) {
   if (unknown.length) {
     warnings.push({
       code: 'embarko_json_unknown_keys',
-      detail: `embarko.json has keys Embarko doesn't use: ${unknown.join(', ')}. They were ignored. Supported: schedules.`,
+      detail: `embarko.json has keys Embarko doesn't use: ${unknown.join(', ')}. They were ignored. Supported: appId, schedules.`,
     });
   }
 
@@ -191,11 +195,17 @@ async function readEmbarkoConfig(archivePath) {
     return fail('invalid_embarko_json', 'In embarko.json, "schedules" must be a list, e.g. [{"cron":"0 9 * * 1-5","path":"/tasks/daily"}], or [] to remove all.');
   }
 
+  // Refused rather than ignored: ignoring it would deploy by name alone,
+  // which is how a renamed app used to get a second copy.
+  if (config.appId !== undefined && (typeof config.appId !== 'string' || !APP_ID_RE.test(config.appId))) {
+    return fail('invalid_embarko_json', 'In embarko.json, "appId" must be the app.id from a deploy reply, exactly as given, e.g. "cm2x7k9qp0001abcd". Remove it to deploy by name.');
+  }
+
   if (nested.length) {
     warnings.push({ code: 'embarko_json_not_at_top', detail: `Also found ${nested.join(', ')}; only the top-folder embarko.json is read.` });
   }
 
-  return { ok: true, present: true, schedules: config.schedules, warnings };
+  return { ok: true, present: true, appId: config.appId, schedules: config.schedules, warnings };
 }
 
 module.exports = { readEmbarkoConfig, FILE_NAME };

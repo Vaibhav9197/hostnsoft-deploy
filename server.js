@@ -245,6 +245,7 @@ app.use(
       'proxy_auth_token',
       'X-Company-Id',
       'X-App-Name',
+      'X-App-Id',
       'X-App-Version',
       'X-Agent-Name',
     ],
@@ -799,7 +800,16 @@ function deployWarnings({ config, timers, claim, isStaticDeploy, schedules }) {
 }
 
 app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
-  const appName = req.headers['x-app-name'];
+  // `let`: replaced by the app's current name once the claim has resolved
+  // it (see below) — everything after the claim builds and routes under that.
+  let appName = req.headers['x-app-name'];
+
+  // Optional: the app's stable id from an earlier deploy reply (app.id),
+  // which the deployer keeps in embarko.json. It finds the app even after
+  // its name was changed in the dashboard — see hostnsoft-api's
+  // services/projectClaim.ts resolveDeployTarget.
+  const rawAppId = req.headers['x-app-id'];
+  const appId = typeof rawAppId === 'string' ? rawAppId.trim() : '';
 
   // Multer has already written the upload to disk by the time this runs,
   // so every rejection below must remove it — nothing else ever will.
@@ -898,6 +908,10 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     return reject(400, 'invalid_agent_name', "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".");
   }
 
+  if (appId && (appId.length > 64 || !/^[a-z0-9]+$/.test(appId))) {
+    return reject(400, 'invalid_app_id', "Invalid X-App-Id header. Send the app.id from an earlier deploy reply exactly as given, or leave it out.");
+  }
+
   // The app's optional embarko.json, read from the archive before the
   // claim so a file that can't be trusted refuses the deploy before any
   // work, and the claim can check its schedules and create CRON_SECRET in
@@ -911,9 +925,21 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
   }
   const schedules = config.schedules;
 
-  const claim = await orDiscard(claimProject(credential, appName, appType || undefined, schedules));
+  // The header wins over embarko.json's appId: it is what this deployer
+  // means right now. The file covers token deployers (agents, CI) that
+  // don't send one. Not a dashboard upload: there the person picked the
+  // app, and a stale file in their zip must not send it somewhere else.
+  const isDashboardUpload = !!(credential && credential.proxyAuthToken);
+  const targetAppId = appId || (isDashboardUpload ? undefined : config.appId) || undefined;
+  const claim = await orDiscard(claimProject(credential, appName, appType || undefined, schedules, targetAppId));
   if (!claim.ok) {
     return reject(claim.status, claim.code, claim.error);
+  }
+  // The app may have been renamed since the deployer last looked: build,
+  // route and report under its current name. claim.notices says so.
+  if (claim.slug && claim.slug !== appName) {
+    logger.info(`[${appName}] Resolved to the app's current name "${claim.slug}"`);
+    appName = claim.slug;
   }
 
   // In flight from the claim on, for orphan cleanup's teardown (see
@@ -1193,6 +1219,9 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
     const replyFacts = {
       host,
       appName,
+      appId: claim.projectId,
+      action: claim.action,
+      notices: claim.notices,
       url: `https://${domain}`,
       claimed: !claim.isOrphan,
       claimedNow: !!claim.claimedNow,
