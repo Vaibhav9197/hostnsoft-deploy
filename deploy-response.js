@@ -372,6 +372,7 @@ const NEXT_FOR_CODE = {
   invalid_app_id: 'Send app.id from an earlier deploy reply as X-App-Id, exactly as given, or leave the header out.',
   app_not_found: 'No app in this workspace has this X-App-Id: check embarko.json\'s "appId" and the token\'s workspace, or remove "appId" to deploy as a new app.',
   app_deleted: 'This app was deleted: ask the user before deploying it again; to make it a new app, remove "appId" from embarko.json and deploy.',
+  app_id_mismatch: 'The "appId" belongs to another app, likely because this code was copied from it: for a new app, remove "appId" from embarko.json and deploy; to update that app, deploy under its name.',
   app_name_check_failed: 'Temporary problem on our side: retry once, and report it to links.feedback if it keeps happening.',
   invalid_app_version: 'Use only letters, numbers, dots, dashes and underscores in X-App-Version.',
   invalid_app_type: 'Shorten X-App-Type to a plain label like "portfolio", or leave it out.',
