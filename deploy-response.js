@@ -157,6 +157,13 @@ function identitySentence(action, notices, appName) {
   if (renamed) {
     return `This app was renamed to "${appName}" outside this deploy, so this deploy updated it: use "${appName}" from now on and keep app.id as "appId" in embarko.json.`;
   }
+  // Moved to another workspace by a person (hostnsoft-api's projectMove.ts),
+  // reached here by a personal token that can deploy there. Nothing for the
+  // agent to change — the address and id are the same — but the person may
+  // want to know where it lives now, which notices[].detail says.
+  if (notices.some((n) => n.code === 'app_moved')) {
+    return 'This app was moved to another workspace outside this deploy, and this deploy updated it there: nothing to change on your side; mention it to the user (notices[] says where).';
+  }
   if (action === 'created') {
     return 'New app: save app.id as "appId" in embarko.json, so later deploys reach this app even if it is renamed.';
   }
@@ -370,7 +377,12 @@ const NEXT_FOR_CODE = {
   app_name_taken: 'That name belongs to someone else: pick a different one.',
   rename_in_progress: 'This app\'s address is being changed: wait a few minutes, then deploy under its new name.',
   invalid_app_id: 'Send app.id from an earlier deploy reply as X-App-Id, exactly as given, or leave the header out.',
-  app_not_found: 'No app in this workspace has this X-App-Id: check embarko.json\'s "appId" and the token\'s workspace, or remove "appId" to deploy as a new app.',
+  app_not_found: 'No app this token can reach has this X-App-Id: check embarko.json\'s "appId" and the token, or remove "appId" to deploy as a new app.',
+  // From hostnsoft-api's services/tokenAccess.ts. Neither is retryable as-is
+  // and neither must lead to deploying under a new name: that would make a
+  // second copy of an app the user still has.
+  app_moved: 'This app was moved to another workspace this token can\'t reach: nothing was deployed. Don\'t deploy it under a new name; ask the user for a personal deploy token, or for access to the workspace it moved to (see links.help).',
+  no_access: 'The person this token belongs to has no access to that workspace: nothing was changed. Ask the user to get access there, or for a token from that workspace (see links.help).',
   app_deleted: 'This app was deleted: ask the user before deploying it again; to make it a new app, remove "appId" from embarko.json and deploy.',
   app_id_mismatch: 'The "appId" belongs to another app, likely because this code was copied from it: for a new app, remove "appId" from embarko.json and deploy; to update that app, deploy under its name.',
   app_name_check_failed: 'Temporary problem on our side: retry once, and report it to links.feedback if it keeps happening.',
@@ -399,6 +411,9 @@ const NEXT_FOR_CODE = {
 // static site can't do.
 const HELP_FOR_CODE = {
   unauthorized: 'claim',
+  // The claim topic is also where tokens (personal vs workspace) are explained.
+  app_moved: 'claim',
+  no_access: 'claim',
   unsupported_storage_pattern: 'data',
   invalid_static_root: 'static-sites',
   app_kind_changed: 'static-sites',

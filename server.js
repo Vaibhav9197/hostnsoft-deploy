@@ -1364,16 +1364,30 @@ app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
 // loadCompanyContext uses. A credential that's PRESENT but itself invalid
 // (a bad deploy token, or a rejected/expired PAT) is 401 instead — "your
 // credential is wrong" reads differently from "this isn't your app".
-async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
+//
+// A personal ("user") deploy token (2026-10-21) reaches apps outside its own
+// workspace, so for a token the access decision is hostnsoft-api's
+// (validation.appAccess, see validate-deploy-token.js), with the companyId
+// comparison below kept only for an older hostnsoft-api that doesn't answer
+// it. `permission` names what the route does — app.view or app.logs.
+async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader, permission = 'app.view') {
   let callerCompanyId = null;
   let deployTokenPresented = false;
+  let tokenAppAccess = null;
   if (authHeader) {
     deployTokenPresented = true;
     const token = authHeader.split(' ')[1];
     if (!token) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
-    const validation = await validateDeployTokenWithCompany(token);
+    const validation = await validateDeployTokenWithCompany(token, appName, permission);
     if (!validation) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
     callerCompanyId = validation.companyId;
+    tokenAppAccess = validation.appAccess;
+    // A caller the app moved away from, or a person who lost access: told
+    // why, rather than a 404 that reads as "the app is gone".
+    if (validation.appRefusal) {
+      const r = validation.appRefusal;
+      return { ok: false, status: r.status || 403, code: r.code, error: r.error };
+    }
   }
 
   const lookup = await lookupProject(appName);
@@ -1398,6 +1412,12 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
     callerCompanyId = lookup.companyId;
   }
 
+  if (deployTokenPresented && tokenAppAccess !== null) {
+    if (!tokenAppAccess) return { ok: false, status: 404, code: 'not_found', error: "Not found" };
+    // The APP's workspace, not the token's: customer-query attributes the
+    // row with it, and for a personal token the two can differ.
+    return { ok: true, companyId: lookup.companyId, isOrphan: false };
+  }
   if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
     return { ok: false, status: 404, code: 'not_found', error: "Not found" };
   }
@@ -1455,7 +1475,7 @@ app.get('/apps/:appName/logs', async (req, res) => {
     return res.status(400).json(errorBody({ host, error: "Invalid app name", code: 'invalid_app_name' }));
   }
 
-  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
+  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token'], 'app.logs');
   if (!auth.ok) {
     return res.status(auth.status).json(errorBody({ host, appName, error: auth.error, code: auth.code }));
   }
