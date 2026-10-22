@@ -160,7 +160,7 @@ during a real production investigation (see session log for detail):
   `Server-setup/server-setup.sh` — with it off Nomad silently ignores
   `memory_max` and the low floor becomes a hard cap instead. See
   `docs/Memory-oversubscription-req.md`.
-- **CPU limits are NOT hard-enforced today.** The job spec's `cpu = 100`
+- **CPU limits are NOT hard-enforced today.** The job spec's `cpu = 50`
   becomes a relative `--cpu-shares` weight, not a cap, unless the Nomad
   client config sets `cpu_hard_limit = true` (unconfirmed whether it is).
   A CPU-heavy app can degrade others under contention.

@@ -221,9 +221,9 @@ function memoryResourceLines(taskMemory, schedulingFloorMb) {
       : taskMemory;
 
   if (floor >= taskMemory) {
-    return `        cpu    = 100\n        memory = ${taskMemory}`;
+    return `        cpu    = 50\n        memory = ${taskMemory}`;
   }
-  return `        cpu        = 100\n        memory     = ${floor}\n        memory_max = ${taskMemory}`;
+  return `        cpu        = 50\n        memory     = ${floor}\n        memory_max = ${taskMemory}`;
 }
 
 function buildNomadJobSpec({
