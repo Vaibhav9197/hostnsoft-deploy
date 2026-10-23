@@ -2093,8 +2093,12 @@ app.get('/internal/apps/:appName/analytics', requireInternalSecret, async (req, 
 // (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
 // without colliding; defaults to 4000 to match prior fixed behavior.
 const PORT = Number(process.env.PORT) || 4000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
+// Loopback only: Traefik (host network) and hostnsoft-api both reach this
+// service over 127.0.0.1. Binding every interface would also expose the
+// /internal/* routes to app containers via the docker bridge gateway.
+const HOST = process.env.HOST || '127.0.0.1';
+const server = app.listen(PORT, HOST, () => {
+  logger.info(`🚀 Platform Deployment API running on ${HOST}:${PORT}`);
   // Tell pm2 we can serve (wait_ready). No-op outside pm2.
   if (process.send) process.send('ready');
 });
