@@ -12,7 +12,10 @@
  *   deploy token (Authorization: Bearer <token>) — the original path
  *     (agents, CI, the CLI). Company-scoped at creation, so it alone says
  *     which company; validated here before any build resources are spent,
- *     exactly as before.
+ *     exactly as before. A personal ("user") token, since 2026-10-21, can
+ *     also reach apps in its person's other workspaces — hostnsoft-api
+ *     decides that in the claim; nothing here changes, the token is relayed
+ *     as-is.
  *   proxy_auth_token (+ X-Company-Id) — added 2026-09-17 for the
  *     dashboard's upload button. The PAT is the dashboard's own login
  *     credential; it is NOT company-scoped (one person can belong to
@@ -60,7 +63,7 @@ async function readDeployCredential(req) {
         ok: false,
         status: 400,
         code: 'company_id_required',
-        error: "Missing X-Company-Id header. A proxy_auth_token isn't scoped to one company, so the deploy has to say which company this app belongs to.",
+        error: "Missing X-Company-Id header. A proxy_auth_token isn't scoped to one workspace, so the deploy has to say which workspace this app belongs to.",
       };
     }
     return { ok: true, credential: { proxyAuthToken, companyId } };
@@ -89,11 +92,4 @@ function credentialHeaders(credential) {
     : {};
 }
 
-// True for anything that identifies a company — i.e. everything except
-// anonymous. Gates deployment-history recording, which has no company to
-// attribute an anonymous deploy to (docs/Anonymous-deploy-req.md).
-function isIdentified(credential) {
-  return credential !== null;
-}
-
-module.exports = { readDeployCredential, credentialBody, credentialHeaders, isIdentified };
+module.exports = { readDeployCredential, credentialBody, credentialHeaders };

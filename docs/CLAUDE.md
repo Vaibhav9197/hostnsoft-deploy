@@ -114,6 +114,28 @@ history first).
   server app may be redeployed as a static site (its job is retired); a
   static site can NOT become a server app — refused with 422
   `app_kind_changed`. Four new required env vars — see `.env.example`.
+- **`embarko-config.js`** (added 2026-10-17) — reads the app's optional
+  `embarko.json` from the uploaded archive before the claim: today its
+  `schedules`. Refuses bad JSON and anything secret-looking; warns about a
+  nested or misnamed file and unknown keys. `claim-project.js` sends the
+  schedules to hostnsoft-api, which validates them and creates `CRON_SECRET`
+  before the build; `record-deployment.js` sends them again on success, when
+  they are applied. Spec and the reason for each rule: `docs/embarko-json.md`.
+  (An `X-Schedules` header was built first and dropped before release.)
+- **`build-info.js`** and **`GET /health`** (added 2026-10-19) — the git
+  commit this process started with, read once at startup, plus
+  `startedAt`. Public at `ship.embarko.ai/health` (hostnsoft-api has the
+  same at `/api/health`). `.github/workflows/deploy-prod.yml` polls
+  `127.0.0.1:4000/health` after `redeploy.sh` and fails the run unless
+  `commit` is the pushed SHA, so a reload that left the old process serving
+  can't pass silently.
+- **`detect-timers.js`** (added 2026-10-17) — warns, never refuses, when a
+  server app with no `schedules` in embarko.json lists an in-process timer library
+  (node-cron, APScheduler, rufus-scheduler, robfig/cron…): those timers stop
+  when scale-to-zero stops the app. Reads the dependency manifests only, so
+  browser `setInterval` is never flagged; only on a hit does it grep the
+  source for cron expressions to quote. Adds an `in_process_timer` entry to
+  the 202's `warnings[]` (all warnings: `docs/embarko-json.md`). Measured at 0.1–9 ms.
 - **`app-registry.js`** — a **stopgap** flat-JSON-file record of what
   each app last deployed with (`version`, `dbType`, `memory`,
   `deployedAt`). This exists only because this service has no real
@@ -157,18 +179,25 @@ separate future task — this is the right place to fix them.
 
 A prior incident (`railpack build` exiting successfully but producing no
 Docker image) was investigated but never fully root-caused — a retry
-happened to succeed before deeper diagnosis. **Still recommended and not
-yet implemented**: after the Railpack build step, explicitly verify the
-image exists (`docker image inspect <imageName>`) and throw a real error
-if it doesn't, rather than trusting the build command's exit code alone.
-See the session log for the full investigation trail.
+happened to succeed before deeper diagnosis. The deploy service no longer
+trusts the build's exit code alone: `assertImageExists` in `server.js`
+runs `docker image inspect <imageName>` right after the Railpack step and
+fails the deploy with a stated cause if the image is missing, before the
+data directory, `purgeIfNotRunning` or Nomad are touched. The root cause
+of railpack exiting 0 without an image is still unknown; if it recurs, the
+failed deployment's `errorDetail` plus `GET /apps/:appName/logs` (the
+captured railpack output) are now the place to start.
 
 ## Also part of this repo (if applicable — confirm)
 
-If the client-facing `hostnsoft-deploy` skill package (the `SKILL.md` +
-`scripts/deploy.sh` + `scripts/troubleshoot.md` + `scripts/check-app-db.sh`
-bundle that clients/agents use to package and call this API) also lives
-in this repo, keep it in sync with `server.js`'s actual behavior — e.g.
+The agent-facing docs are the guide on the website (embarko.ai/docs,
+built from `app/lib/guide/content.js` in the site repo); this service no
+longer serves its own copy, and `/capabilities*` only redirects there.
+When behavior an agent relies on changes here, update that guide.
+
+If the client-facing skill package (`SKILL.md` + `scripts/deploy.sh`,
+github.com/embarko-ai/skill, which agents use to package and call this API)
+also lives in this repo, keep it in sync with `server.js`'s actual behavior — e.g.
 the client-side pre-flight `window.storage` check in `deploy.sh` should
 stay consistent with `detect-storage-usage.js`'s server-side logic. If
 that skill package lives somewhere else instead, note the actual location

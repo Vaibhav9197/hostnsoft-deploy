@@ -39,15 +39,28 @@ const HOSTNSOFT_API_URL = process.env.HOSTNSOFT_API_URL; // already required/val
 // session expired" or "you're not in that company", not a blanket "could
 // not verify app name availability". Everything else still becomes a 502
 // (fail closed), same as before.
-const RELAYED_STATUSES = new Set([400, 401, 403, 409]);
+// 404/410: an X-App-Id that leads to no app, or to a deleted one
+// (app_not_found / app_deleted) — the caller's to fix, not ours.
+// 403 no_access / 409 app_moved (hostnsoft-api's services/tokenAccess.ts):
+// a personal token whose person lost access to the app's workspace, or any
+// token the app has moved away from. Relayed with their own code like the
+// rest, so the agent is told to ask for access instead of seeing a 502 —
+// and, for app_moved, never retries under a new name.
+const RELAYED_STATUSES = new Set([400, 401, 403, 404, 409, 410]);
 
-async function claimProject(credential, slug, appType) {
+async function claimProject(credential, slug, appType, schedules, appId) {
   let response;
   try {
     response = await fetch(`${HOSTNSOFT_API_URL}/internal/projects/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...credentialHeaders(credential) },
-      body: JSON.stringify({ ...credentialBody(credential), slug, ...(appType ? { appType } : {}) }),
+      body: JSON.stringify({
+        ...credentialBody(credential),
+        slug,
+        ...(appId ? { appId } : {}),
+        ...(appType ? { appType } : {}),
+        ...(schedules !== undefined ? { schedules } : {}),
+      }),
     });
   } catch (e) {
     logger.error(`[claim-project] could not reach hostnsoft-api to claim "${slug}": ${e.message}`);
@@ -106,6 +119,13 @@ async function claimProject(credential, slug, appType) {
   return {
     ok: true,
     projectId: body.projectId,
+    // The app's current name — differs from `slug` when the app was renamed
+    // and found by its id or old name. server.js deploys under this one.
+    slug: body.slug || slug,
+    // "created" | "updated", and what changed outside this deploy
+    // ({code, from, to, detail}) — relayed in the deploy reply.
+    action: body.action || null,
+    notices: Array.isArray(body.notices) ? body.notices : [],
     customDomains: body.customDomains || [],
     envVars: body.envVars || [],
     memoryMb: typeof body.memoryMb === 'number' ? body.memoryMb : null,
@@ -116,7 +136,20 @@ async function claimProject(credential, slug, appType) {
     orphanExpiresAt: body.orphanExpiresAt || null,
     orphanMessage: body.orphanMessage || null,
     orphanLoginUrl: body.orphanLoginUrl || null,
+    // The keep-this-app link, present only on the deploy that CREATED an
+    // orphan: it carries a one-time code hostnsoft-api minted with the
+    // project (its lib/orphanClaim.ts), so an anonymous redeploy of the
+    // same name gets none. server.js relays it as links.claim in the
+    // deploy reply, and nowhere else — status and logs need no
+    // credential, so a link there would hand the app to anyone.
+    claimUrl: body.claimUrl || null,
     isFreePlan: !!body.isFreePlan,
+    // {declared, accepted, reason?} when embarko.json listed schedules —
+    // hostnsoft-api's docs/schedules.md. Relayed in the deploy reply.
+    schedules: body.schedules || null,
+    // How many schedules the app has right now, so a deploy without them
+    // can say they were kept (server.js deployWarnings).
+    scheduleCount: typeof body.scheduleCount === 'number' ? body.scheduleCount : 0,
   };
 }
 

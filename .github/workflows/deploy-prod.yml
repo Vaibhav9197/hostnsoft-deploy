@@ -1,0 +1,40 @@
+name: Deploy prod
+
+on:
+  push:
+    branches:
+      - prod
+  workflow_dispatch:
+
+# One deploy at a time across both repos. A second push waits
+# for the running deploy to finish instead of overlapping it.
+concurrency:
+  group: hostnsoft-prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Redeploy deploy-service
+    runs-on: [self-hosted, prod-deploy]
+    timeout-minutes: 20
+    steps:
+      - name: Redeploy deploy-service
+        run: bash /home/ubuntu/Server-setup/redeploy.sh prod deploy-service
+
+      # Fails the deploy unless the service now reports the commit just
+      # pushed: catches a reload that left the old process serving.
+      # GET /health reports the commit the process read at startup.
+      - name: Check the new version is serving
+        env:
+          HEALTH_URL: http://127.0.0.1:4000/health
+        run: |
+          for i in $(seq 1 30); do
+            live=$(curl -sf --max-time 3 "$HEALTH_URL" | grep -o '"commit":"[0-9a-f]*"' | cut -d'"' -f4 || true)
+            if [ "$live" = "$GITHUB_SHA" ]; then
+              echo "Serving $GITHUB_SHA"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Expected $GITHUB_SHA, but $HEALTH_URL reports '${live:-no answer}'. The old version may still be serving: check pm2 logs. If a newer push is deploying right after this one, a newer commit here is fine."
+          exit 1

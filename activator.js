@@ -22,9 +22,10 @@ const execFileAsync = promisify(execFile);
 
 const { appDataPathFor, defaultDomainFor, specPathFor } = require('./nomad-job-spec');
 const { imagesFromSpec, missingImages } = require('./scale-to-zero-images');
-const { allApps, hostnamesFor } = require('./scale-to-zero-registry');
+const { allApps, hostnamesFor, readSleepState, markAwake } = require('./scale-to-zero-registry');
 const { isBotRequest } = require('./analytics/bot-filter');
-const { isSqliteFile, manifestEntryProblem } = require('./sqlite-data-check');
+const { isSqliteFile, manifestEntryProblem, isLitestreamPath } = require('./sqlite-data-check');
+const { describeTaskFailure, formatForVisitor } = require('./nomad-task-failure');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
@@ -115,6 +116,54 @@ async function jobIsRunning(appName) {
   return Boolean(job) && job.Status === 'running' && job.Stop !== true;
 }
 
+// Stopped, as opposed to not yet running: a job we have just submitted
+// reads "pending" for a while, and that must not count.
+async function jobIsStopped(appName) {
+  const job = await nomadGet(`/v1/job/${encodeURIComponent(appName)}`);
+  return !job || job.Stop === true;
+}
+
+/**
+ * Hold while idle-report is stopping this app. Returns whether it waited.
+ *
+ * idle-report puts this process in front of the app BEFORE it stops it
+ * (holdForStop in scale-to-zero-registry.js), so requests reach here for
+ * the whole stop, and it records 'stopping' until the snapshot is written.
+ * Waking in that time would check the data against the PREVIOUS manifest —
+ * refusing a healthy app, or starting it while its data is being copied.
+ * A 'stopping' record past STOPPING_STALE_MS reads as 'asleep', so a dead
+ * idle-report run cannot hold an app forever.
+ */
+async function waitWhileStopping(appName, deadline) {
+  let waited = false;
+  for (; ;) {
+    const record = await readSleepState(appName);
+    if (!record || record.state !== 'stopping') {
+      if (waited) log(`${appName}: stop finished, continuing`);
+      return waited;
+    }
+    if (!waited) log(`${appName}: being stopped by idle-report — holding the request until it finishes`);
+    waited = true;
+    if (Date.now() > deadline) throw new Error(`${appName} is still being stopped`);
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+// Lowers the app's wake router once it is up, so its traffic goes direct
+// again — markAwake has why that is safe. Not awaited: the visitor's
+// request does not depend on it. One at a time per app, since a page load
+// is a dozen requests arriving together.
+const lowering = new Set();
+
+function lowerWakeRouter(appName) {
+  if (lowering.has(appName)) return;
+  lowering.add(appName);
+  markAwake(appName)
+    .then((lowered) => lowered && log(`${appName}: awake — wake router lowered, traffic goes direct again`))
+    .catch((e) => log(`${appName}: could not lower the wake router (${e.message}); traffic keeps coming through here`))
+    .finally(() => lowering.delete(appName));
+}
+
 /**
 /**
  * Refuse to start if the data directory disagrees with the manifest
@@ -152,7 +201,7 @@ async function verifyDataAgainstManifest(appName) {
   } catch (e) {
     throw new Error(
       `data directory ${dataDir} is unreadable (${e.code}) but the manifest lists ` +
-        `${manifest.fileCount} file(s) — refusing to start an app that would create a fresh, empty one`
+      `${manifest.fileCount} file(s) — refusing to start an app that would create a fresh, empty one`
     );
   }
   for (const entry of entries) {
@@ -162,19 +211,22 @@ async function verifyDataAgainstManifest(appName) {
     actual.set(full.slice(dataDir.length + 1), stat.size);
   }
 
+  // Litestream's own state is skipped on both sides (isLitestreamPath).
+  // Manifests written before idle-report excluded it still list it, and
+  // Litestream deletes those segments while the app sleeps.
+  const files = manifest.files.filter((f) => !isLitestreamPath(f.path));
+
   // Which manifest entries are SQLite databases, judged by the file on
   // disk now (the manifest records only sizes, and older manifests have
-  // nothing else to go on). Litestream's own `.<db>-litestream/` state
-  // directories are dot-dirs it creates next to the database; they are
-  // never in a manifest and only show up as "extra" below.
+  // nothing else to go on).
   const sqliteMains = new Set();
-  for (const f of manifest.files) {
+  for (const f of files) {
     if (actual.has(f.path) && (await isSqliteFile(`${dataDir}/${f.path}`))) sqliteMains.add(f.path);
   }
 
   const problems = [];
   const checkpointed = [];
-  for (const f of manifest.files) {
+  for (const f of files) {
     const problem = manifestEntryProblem(f, actual, sqliteMains);
     if (problem) {
       problems.push(problem);
@@ -189,10 +241,9 @@ async function verifyDataAgainstManifest(appName) {
   // here deletes, and a stray file cannot destroy data the way a missing
   // or truncated one can.
   for (const p of actual.keys()) {
-    // Litestream keeps its own state in `.<db>-litestream/` next to each
-    // database. Expected, and not worth a line per wake.
-    if (/(^|\/)\.[^/]*-litestream\//.test(p)) continue;
-    if (!manifest.files.some((f) => f.path === p)) log(`${appName}: note — extra file not in manifest: ${p}`);
+    // Expected, and not worth a line per wake.
+    if (isLitestreamPath(p)) continue;
+    if (!files.some((f) => f.path === p)) log(`${appName}: note — extra file not in manifest: ${p}`);
   }
 
   if (problems.length > 0) {
@@ -225,7 +276,7 @@ async function runSavedSpec(appName) {
   if (missing.length > 0) {
     throw new Error(
       `image(s) missing on this host: ${missing.join(', ')} — these are built locally and pushed to no ` +
-        `registry, so ${appName} cannot be started without redeploying it`
+      `registry, so ${appName} cannot be started without redeploying it`
     );
   }
 
@@ -234,17 +285,28 @@ async function runSavedSpec(appName) {
   await execFileAsync('nomad', ['job', 'run', '-detach', '-json', specPath]);
 }
 
+async function serviceRegistrations(appName) {
+  const regs = await nomadGet(`/v1/service/${encodeURIComponent(appName)}`).catch(() => null);
+  return Array.isArray(regs) ? regs : [];
+}
+
 /**
  * Wait until Nomad's service registry has an address for the app. This
  * is the same registry Traefik's Nomad provider reads, so an entry here
  * means both that we have somewhere to forward to AND that Traefik is
  * about to route directly and stop involving this process.
+ *
+ * `ignoreAllocs`: registrations of an allocation that was just stopped,
+ * which Nomad can still list for a moment. Forwarding to one would retry a
+ * dead address until the deadline.
  */
-async function waitForAddress(appName, deadline) {
-  for (;;) {
-    const regs = await nomadGet(`/v1/service/${encodeURIComponent(appName)}`).catch(() => null);
-    if (Array.isArray(regs) && regs.length > 0 && regs[0].Address && regs[0].Port) {
-      return { host: regs[0].Address, port: regs[0].Port };
+async function waitForAddress(appName, deadline, ignoreAllocs = new Set()) {
+  for (; ;) {
+    const reg = (await serviceRegistrations(appName)).find(
+      (r) => r.Address && r.Port && !ignoreAllocs.has(r.AllocID)
+    );
+    if (reg) {
+      return { host: reg.Address, port: reg.Port };
     }
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${appName} to register an address`);
     await new Promise((r) => setTimeout(r, 500));
@@ -267,14 +329,26 @@ function ensureAwake(appName) {
 async function wake(appName) {
   const deadline = Date.now() + WAKE_TIMEOUT_MS;
 
-  if (await jobIsRunning(appName)) {
-    // Already up — the ordinary case now that this proxies live traffic,
-    // rather than the rare race it used to be. Nothing to start, and no
-    // integrity check: the app is running and writing, so the manifest is
-    // legitimately out of date by now.
-    return rememberAddr(appName, await waitForAddress(appName, deadline));
-  }
+  let running = await jobIsRunning(appName);
+  // A stop in progress can end either way — a failed stop leaves the app
+  // running — so ask again once it has.
+  if (!running && (await waitWhileStopping(appName, deadline))) running = await jobIsRunning(appName);
 
+  // Already up — the ordinary case now that this proxies live traffic,
+  // rather than the rare race it used to be. Nothing to start, and no
+  // integrity check: the app is running and writing, so the manifest is
+  // legitimately out of date by now.
+  const addr = running ? await waitForAddress(appName, deadline) : await coldStart(appName, deadline);
+  lowerWakeRouter(appName);
+  return rememberAddr(appName, addr);
+}
+
+// When each app's most recent cold start began. explainCrash only blames
+// allocations created after this, never a failure from an earlier wake.
+const wakeStartedAt = new Map();
+
+async function coldStart(appName, deadline) {
+  wakeStartedAt.set(appName, Date.now() - 5000); // clock skew margin
   // Logged phase by phase, not just at the ends. A cold start is the one
   // path here that legitimately takes tens of seconds, so "no output yet"
   // and "wedged" look identical from outside — and that is exactly how
@@ -282,11 +356,14 @@ async function wake(appName) {
   const t0 = Date.now();
   log(`${appName}: cold start requested`);
   await verifyDataAgainstManifest(appName);
+  // Anything registered before the start belongs to the allocation that
+  // was just stopped. See waitForAddress.
+  const stale = new Set((await serviceRegistrations(appName)).map((r) => r.AllocID));
   await runSavedSpec(appName);
   log(`${appName}: job submitted (+${Date.now() - t0}ms), waiting for an address`);
-  const addr = await waitForAddress(appName, deadline);
+  const addr = await waitForAddress(appName, deadline, stale);
   log(`${appName}: awake at ${addr.host}:${addr.port} (+${Date.now() - t0}ms)`);
-  return rememberAddr(appName, addr);
+  return addr;
 }
 
 // ---------------------------------------------------------------------
@@ -356,17 +433,46 @@ const RETRYABLE = ['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'EPIPE'];
  * service when the task starts, not when it listens. Only connection-level
  * failures, and only before any response has begun, so replaying a POST
  * cannot duplicate anything.
+ *
+ * The address can also die under a request that already resolved it: the
+ * app was stopped between the resolve and the connect, which this process
+ * being in front during a stop makes an ordinary case. Retrying that
+ * address would hold the visitor until the deadline; a fresh wake waits
+ * the stop out and starts the app again. A job that is only still
+ * starting is not stopped, and its address keeps being retried.
  */
-async function forwardWhenReady(req, res, addr, body, deadline) {
-  for (;;) {
+async function forwardWhenReady(req, res, appName, addr, body, deadline) {
+  for (; ;) {
     try {
       return await forward(req, res, addr, body);
     } catch (e) {
       const retryable = RETRYABLE.includes(e.code);
       if (!retryable || Date.now() > deadline || res.headersSent) throw e;
       await new Promise((r) => setTimeout(r, 400));
+      if (await jobIsStopped(appName).catch(() => false)) {
+        addrCache.delete(appName);
+        addr = await ensureAwake(appName);
+      }
     }
   }
+}
+
+// Visitor-facing crash explanation, or null when the task is still
+// coming up / Nomad cannot say. Best-effort and bounded (see
+// nomad-task-failure.js): it must never turn a 503 into a hang.
+async function explainCrash(appName) {
+  const since = wakeStartedAt.get(appName);
+  if (!since) return null; // nothing was cold-started by this process: not a startup crash
+  const d = await describeTaskFailure(appName, { tailBytes: 1500, since }).catch(() => null);
+  const text = formatForVisitor(d);
+  if (!text) return null;
+  const tail = (d.stderr || d.stdout || '').split('\n').slice(-5).join(' | ');
+  log(
+    `${appName}: crashed on startup — exit code ${d.exitCode}, ${d.restarts} restart(s), alloc ${d.allocId}` +
+    (d.lastEvent ? `; nomad: ${d.lastEvent}` : '') +
+    (tail ? `; last output: ${tail}` : '')
+  );
+  return text;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -454,7 +560,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const addr = await ensureAwake(appName);
-    await forwardWhenReady(req, res, addr, body, deadline);
+    await forwardWhenReady(req, res, appName, addr, body, deadline);
     log(`${appName}: ${req.method} ${req.url} served in ${Date.now() - started}ms`);
   } catch (e) {
     if (clientGone) {
@@ -469,6 +575,20 @@ const server = http.createServer(async (req, res) => {
     // A clean error after a bounded wait, never a hang: Step 4's
     // checklist requires an app that cannot start to produce this rather
     // than holding the visitor's connection open indefinitely.
+    //
+    // "Did not become ready in time" was the ONLY message, and it was
+    // wrong for the common case: the container had exited (bad start
+    // command, missing env var, no database) and Nomad had given up on
+    // it — nothing a retry can fix. Ask Nomad what happened to the task
+    // and say so. The visitor gets the exit code and a sentence; the
+    // log tail goes to this process's log only, since an app's output is
+    // its owner's, not a passer-by's.
+    const crash = await explainCrash(appName);
+    if (crash) {
+      res.writeHead(503, { 'content-type': 'text/plain', 'retry-after': '300' });
+      res.end(crash);
+      return;
+    }
     res.writeHead(503, { 'content-type': 'text/plain', 'retry-after': '30' });
     res.end('This app is starting up and did not become ready in time. Please try again.\n');
   }

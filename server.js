@@ -25,6 +25,9 @@ const { runWithRequestId } = require('./request-context');
 // building/shipping an app that will break at runtime. Skipped entirely
 // for apps that already declare a real database dependency.
 const { detectWindowStorageUsage, hasRealDatabaseDependency } = require('./detect-storage-usage');
+const { detectTimers } = require('./detect-timers');
+const { readEmbarkoConfig } = require('./embarko-config');
+const { BUILD_INFO } = require('./build-info');
 
 // NEW: confirms the extracted upload actually has a manifest (or
 // index.html) at buildDir's own root — Railpack only looks there. Catches
@@ -62,7 +65,7 @@ const { claimProject } = require('./claim-project');
 // deploy as the logged-in person instead of making them mint a
 // company-wide deploy token first. One module reads whichever credential
 // came in and packages it for the hostnsoft-api calls below.
-const { readDeployCredential, isIdentified } = require('./deploy-credential');
+const { readDeployCredential } = require('./deploy-credential');
 
 // NEW: shared Nomad job spec builder — see docs/Customdomain-req.md. Used
 // here after a fresh build, and by the /internal/apps/:appName/config
@@ -73,6 +76,8 @@ const { readDeployCredential, isIdentified } = require('./deploy-credential');
 const { buildNomadJobSpec, defaultDomainFor, appDataPathFor, specPathFor } = require('./nomad-job-spec');
 const scaleToZero = require('./scale-to-zero-registry');
 const { requireInternalSecret } = require('./internal-auth');
+const { getNomadJob, stopNomadJob } = require('./nomad-job');
+const { describeTaskFailure, formatForOwner } = require('./nomad-task-failure');
 const { renameApp, renameStaticApp } = require('./rename-app');
 
 // NEW: the static fast path — see docs/Static-apps-req.md. build-plan.js
@@ -96,7 +101,7 @@ const { resolveAppKind } = require('./app-kind');
 // low `memory` the scheduler packs against, and the `memory_max` ceiling
 // it may actually burst up to. The CEILING values below are exactly the
 // numbers that used to be the single flat reservation (and are still what
-// capabilities.js publishes and what hostnsoft-api persists as
+// the docs publish and what hostnsoft-api persists as
 // Project.memoryMb) — no app's real limit changed. Only the number Nomad
 // bin-packs against got lower.
 //
@@ -141,6 +146,7 @@ const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/
 // in-process (see GET /apps/:appName/status) and app-logs.js/
 // project-lookup.js back that endpoint and GET /apps/:appName/logs.
 const { setDeployState, getDeployState, clearDeployState } = require('./deploy-status');
+const { beginDeploy, isDeployInFlight } = require('./deploy-in-flight');
 const { lookupProject } = require('./project-lookup');
 const { verifyProxyAuthCompanyAccess } = require('./verify-proxy-auth');
 const { getAppLogs } = require('./app-logs');
@@ -161,15 +167,12 @@ const { pushToRegistry } = require('./image-registry');
 // POST /internal/apps/:appName/config deploymentId branch below) back to
 // hostnsoft-api once it's known.
 const { reportConfigPushResult } = require('./report-config-push');
-const {
-  CAPABILITIES_BODY, CAPABILITIES_ETAG, CONTENTS_SERVED, TOPICS_SERVED, TOPICS, resolveTopic,
-} = require('./capabilities');
 // JSON { files: [...] } source for POST /apps — what an MCP tool call can
 // carry, since it can't attach a file. See json-source.js.
 const { jsonSource } = require('./json-source');
 // The { status, app, next, links } shape every agent-facing reply uses.
 // The docs URL lives there too, so every reply links the same one.
-const { acceptedBody, publishedBody, statusBody, staticLogsBody, errorBody, linksFor } = require('./deploy-response');
+const { acceptedBody, publishedBody, statusBody, staticLogsBody, errorBody, linksFor, timersWarning } = require('./deploy-response');
 
 // How long POST /apps waits for a static site to publish before answering
 // "check back" instead. Almost every static site is done in about a second,
@@ -254,6 +257,7 @@ app.use(
       'proxy_auth_token',
       'X-Company-Id',
       'X-App-Name',
+      'X-App-Id',
       'X-App-Version',
       'X-Agent-Name',
     ],
@@ -318,6 +322,13 @@ const uploadRateLimit = createLimiter({
  * failure here costs the ability to scale that app to zero, which is an
  * opt-in feature. Failing the deploy over it would trade a working
  * deployment for a missing optional file.
+ *
+ * The wake routers are rewritten here too, from the spec just saved. In
+ * universal mode every running app is eligible to be stopped, but the
+ * router file was only rewritten on opt-in/out, rename, delete and a
+ * platform redeploy — so an app first deployed after the last redeploy
+ * was stopped with no wake router and 404'd until the next one
+ * (daily-mandala, 2026-10-11). Same for a custom domain added here.
  */
 async function saveJobSpec(appName) {
   try {
@@ -332,6 +343,9 @@ async function saveJobSpec(appName) {
   } catch (e) {
     logger.warn(`[${appName}] Could not save Nomad job spec (scale-to-zero wake would fail): ${e.message}`);
   }
+  await scaleToZero.regenerateRouters().catch((e) => {
+    logger.warn(`[${appName}] Could not rewrite scale-to-zero wake routers (continuing): ${e.message}`);
+  });
 }
 
 /**
@@ -358,17 +372,20 @@ async function saveJobSpec(appName) {
  * deploy should plainly bring the app back rather than silently no-op.
  */
 async function purgeIfNotRunning(appName) {
+  // Exact lookup: `nomad job inspect` would return a DIFFERENT dead job
+  // whose name merely starts with this one, and the purge below would
+  // then target it (see nomad-job.js).
   let status;
   try {
-    const { stdout } = await execPromise(`nomad job inspect ${appName}`);
-    status = JSON.parse(stdout).Job;
-  } catch {
-    return; // not registered at all — nothing to purge, the run registers it
+    status = await getNomadJob(appName);
+  } catch (e) {
+    logger.warn(`[${appName}] Could not look up existing job (continuing): ${e.message}`);
+    return;
   }
   if (!status || (status.Status === 'running' && status.Stop !== true)) return;
 
   logger.info(`[${appName}] Existing job is ${status.Stop ? 'stopped' : status.Status} — purging before deploy`);
-  await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+  await stopNomadJob(appName, { purge: true }).catch((e) => {
     // Not fatal: the run below may still succeed (it will, whenever the
     // new spec actually differs). Failing the deploy here would turn a
     // recoverable case into an outage.
@@ -376,6 +393,60 @@ async function purgeIfNotRunning(appName) {
   });
 }
 
+/**
+ * Runs `nomad job run` (no -detach, so it returns only once the deployment
+ * succeeds or fails). On failure, replaces the CLI's unhelpful error with
+ * the app's own crash details (exit code, restarts, last log lines) from
+ * nomad-task-failure.js. The thrown error carries no stdout/stderr so
+ * setBuildLog does not overwrite the railpack build log.
+ */
+async function runNomadJob(appName, nomadFilePath) {
+  // Allocations older than this belong to earlier deploys/wakes and must
+  // not be blamed for this one (see pickAllocation in nomad-task-failure).
+  const since = Date.now() - 5000; // clock skew between us and Nomad
+  try {
+    await execPromise(`nomad job run ${nomadFilePath}`);
+  } catch (e) {
+    logger.error(`[${appName}] nomad job run failed: ${(e.stderr || e.stdout || e.message || '').trim().slice(-2000)}`);
+    const diagnosis = await describeTaskFailure(appName, { since }).catch(() => null);
+    const explained = formatForOwner(appName, diagnosis);
+    if (explained) {
+      logger.warn(`[${appName}] Deploy failed at startup: exit code ${diagnosis.exitCode}, ${diagnosis.restarts} restart(s), alloc ${diagnosis.allocId}`);
+      throw new Error(explained);
+    }
+    throw new Error(
+      `Nomad could not bring the app up and the deploy was stopped (${e.message.split('\n')[0]}). ` +
+      `GET /apps/${appName}/logs has the container's output, if any was produced.`
+    );
+  }
+}
+
+// `railpack build` can exit 0 without leaving a tagged image behind — a
+// production incident did exactly that (docs/CLAUDE.md, "The still-open
+// production mystery"), and trusting the exit code alone let the deploy
+// carry on to `nomad job run`, where the allocation died pulling an
+// image that was never there. That failure surfaced far from the build
+// log that could have explained it. So the image is asked for directly,
+// here, and a miss is a build failure like any other: the thrown error
+// lands in finishDeployFailure, and the railpack output captured just
+// before this runs stays retrievable via GET /apps/:appName/logs (a
+// plain Error carries no stdout/stderr, so setBuildLog there is a no-op
+// and does not overwrite it).
+async function assertImageExists(appName, imageName) {
+  try {
+    // --format keeps the output to the image ID; the default is the full
+    // inspect JSON, which is large and not needed here.
+    await execPromise(`docker image inspect --format '{{.Id}}' ${imageName}`);
+  } catch (e) {
+    const detail = (e.stderr || e.message || '').trim();
+    throw new Error(
+      `Railpack reported success but no Docker image named "${imageName}" exists, so there is nothing to deploy. ` +
+      `The build did not produce an image; check the build log (GET /apps/${appName}/logs) for what railpack actually did.` +
+      (detail ? `\n\ndocker image inspect: ${detail}` : '')
+    );
+  }
+  logger.info(`[${appName}] Verified image ${imageName} exists.`);
+}
 
 // Creates this app's host data directory before Nomad is asked to bind
 // mount it. Docker would otherwise create a missing bind-mount source
@@ -402,28 +473,27 @@ async function ensureAppDataDir(appName) {
 // Shared tail of every background deploy, container or static: reports
 // the outcome to hostnsoft-api so its dashboard deployment history is
 // actually populated, and to this process's own deploy-status.js.
-// Skipped for anonymous deploys — see docs/Anonymous-deploy-req.md's
-// "out of scope": there's no company to attribute history to
-// until/unless the project is claimed. deploymentId (from the
-// in_progress call in the request handler) updates that same row in
-// place rather than creating a second one for this attempt. `kind`
+// Anonymous deploys are reported too (since 2026-10-08): the recorded
+// image tag is what lets the claim link keep the app without a rebuild
+// — see record-deployment.js. deploymentId (from the in_progress call
+// in the request handler) updates that same row in place rather than
+// creating a second one for this attempt. `kind`
 // ("static" | "service") is what hostnsoft-api persists as
 // Project.kind — reported only here, on success, because that is
 // the first moment the app's kind on this host is actually settled
 // (a failed static publish is undone, see performStaticDeploy).
-async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind }) {
-  if (isIdentified(credential)) {
-    await recordDeployment({
-      credential,
-      projectSlug: appName,
-      appVersion,
-      status: 'success',
-      imageTag: imageName,
-      memoryMb: taskMemory,
-      deploymentId,
-      kind,
-    });
-  }
+async function finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind, schedules }) {
+  await recordDeployment({
+    schedules,
+    credential,
+    projectSlug: appName,
+    appVersion,
+    status: 'success',
+    imageTag: imageName,
+    memoryMb: taskMemory,
+    deploymentId,
+    kind,
+  });
   setDeployState(appName, {
     status: 'success',
     finishedAt: new Date().toISOString(),
@@ -457,16 +527,14 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
   await fs.remove(buildDir).catch(() => { });
   await fs.remove(filePath).catch(() => { });
 
-  if (isIdentified(credential)) {
-    await recordDeployment({
-      credential,
-      projectSlug: appName,
-      appVersion,
-      status: 'failed',
-      errorDetail,
-      deploymentId,
-    });
-  }
+  await recordDeployment({
+    credential,
+    projectSlug: appName,
+    appVersion,
+    status: 'failed',
+    errorDetail,
+    deploymentId,
+  });
   setDeployState(appName, {
     status: 'failed',
     finishedAt: new Date().toISOString(),
@@ -485,7 +553,7 @@ async function finishDeployFailure({ appName, appVersion, credential, deployment
 async function performBuildAndDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
   claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-  scaleToZeroOptIn, scaleToZeroOptOut,
+  scaleToZeroOptIn, scaleToZeroOptOut, schedules,
 }) {
   try {
     logger.info(`[${appName}] Building image with Railpack (version: ${appVersion})...`);
@@ -503,6 +571,12 @@ async function performBuildAndDeploy({
       { maxBuffer: BUILD_OUTPUT_MAX_BUFFER },
     );
     setBuildLog(appName, buildResult);
+
+    // Exit code 0 above is not proof an image exists — see
+    // assertImageExists. Checked BEFORE anything downstream is touched
+    // (data dir, purgeIfNotRunning, Nomad), so a build that produced
+    // nothing leaves the currently running version of the app alone.
+    await assertImageExists(appName, imageName);
 
     // Before the job spec is applied, not after — Nomad's bind mount
     // needs this to exist and be writable at container start.
@@ -531,7 +605,7 @@ async function performBuildAndDeploy({
     // See purgeIfNotRunning: without this, redeploying the same app
     // version over a dead job is a silent no-op reported as a failure.
     await purgeIfNotRunning(appName);
-    await execPromise(`nomad job run ${nomadFilePath}`);
+    await runNomadJob(appName, nomadFilePath);
     await saveJobSpec(appName);
 
     // AFTER saveJobSpec, which is what the router generation reads
@@ -575,7 +649,7 @@ async function performBuildAndDeploy({
     await fs.remove(buildDir);
     await fs.remove(filePath);
 
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind: 'service' });
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory, credential, deploymentId, kind: 'service', schedules });
   } catch (error) {
     await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
   }
@@ -596,7 +670,7 @@ async function performBuildAndDeploy({
 // can't change the outcome, which is why it happens outside the try below.
 async function performStaticDeploy({
   appName, appVersion, imageName, domain, buildDir, filePath,
-  claim, credential, deploymentId, plan, existingKind, onOutcome = () => { },
+  claim, credential, deploymentId, plan, existingKind, onOutcome = () => { }, schedules,
 }) {
   const convertingFromService = existingKind === 'service';
   try {
@@ -650,7 +724,7 @@ async function performStaticDeploy({
     // deployment history say "live" as soon as it's true.
     // No memoryMb: a static app runs no process, so there is nothing
     // hostnsoft-api's Project.memoryMb could describe for it.
-    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static' });
+    await finishDeploySuccess({ appName, appVersion, imageName, taskMemory: undefined, credential, deploymentId, kind: 'static', schedules });
     onOutcome('live');
   } catch (error) {
     await finishDeployFailure({ appName, appVersion, credential, deploymentId, buildDir, filePath, error });
@@ -674,7 +748,7 @@ async function performStaticDeploy({
     // container on its next deploy.
     if (convertingFromService) {
       logger.info(`[${appName}] Retiring the server job now that the files are served directly.`);
-      await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
+      await stopNomadJob(appName, { purge: true }).catch((e) => {
         logger.warn(`[${appName}] Could not purge the old Nomad job (continuing): ${e.message}`);
       });
       await execPromise(`docker images --filter=reference=${appName}:* -q | xargs -r docker rmi -f`).catch((e) => {
@@ -711,48 +785,63 @@ async function performStaticDeploy({
   }
 }
 
-// The contract an agent reads before designing or deploying an app —
-// runtime requirements, how to get a credential, what persists, and which
-// features it can actually invoke itself. Unauthenticated on purpose: an
-// agent needs this BEFORE it has a token, and it's the same answer for
-// everyone. See capabilities.js for what may and may not go in it.
+// The agent guide lives on the website, one topic per page, and is the only
+// copy: https://embarko.ai/docs (Markdown for agents, HTML for people, .json
+// on request). /capabilities used to be a second copy served from here, and
+// two copies drift. Its URLs are in older replies, skills and prompts, so
+// they redirect to the matching guide topic. The Accept header carries over,
+// so an agent that asked for JSON still gets JSON there.
 //
-// Served like a book: GET /capabilities is the contents page, one line per
-// topic; GET /capabilities/<topic> answers one question in full; and
-// GET /capabilities/all is the whole contract at once. ?feature=<topic> on
-// the contents URL is an alias for the topic path.
-function sendCapabilities(req, res, body, etag) {
-  res.setHeader('ETag', etag);
+// Express puts the address in the body too, so a client that doesn't follow
+// redirects (curl without -L) still learns where to go.
+const GUIDE = 'https://embarko.ai/docs';
+// Topics that were renamed in the guide. Anything else keeps its name; the
+// guide resolves aliases itself and answers an unknown name with its contents.
+const GUIDE_TOPIC = { files: 'data', 'not-supported': 'prerequisites', 'scale-to-zero': 'status', all: '' };
+
+function toGuide(res, topic, ext = '') {
+  const name = topic == null ? '' : (Object.hasOwn(GUIDE_TOPIC, topic) ? GUIDE_TOPIC[topic] : topic);
+  const url = name ? `${GUIDE}/${encodeURIComponent(name)}${ext}` : (ext ? `${GUIDE}/index${ext}` : GUIDE);
   res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  // A revalidating client costs us nothing and costs the agent no tokens.
-  if (req.headers['if-none-match'] === etag) return res.status(304).end();
-  res.status(200).send(body);
+  res.redirect(301, url);
 }
 
-function sendTopic(req, res, name) {
-  const topic = resolveTopic(name);
-  if (!topic) {
-    return res.status(404).json({
-      error: `No capabilities topic called "${name}".`,
-      code: 'unknown_topic',
-      topics: TOPICS.map((t) => t.topic),
-      next: 'Pick one of topics, or read links.contents for what each one covers.',
-      links: { contents: `https://${req.get('host')}/capabilities` },
-    });
-  }
-  const served = TOPICS_SERVED[topic.topic];
-  return sendCapabilities(req, res, served.body, served.etag);
-}
-
-app.get('/capabilities', (req, res) => {
-  if (req.query.feature) return sendTopic(req, res, req.query.feature);
-  return sendCapabilities(req, res, CONTENTS_SERVED.body, CONTENTS_SERVED.etag);
+// Which code is serving and since when — see build-info.js. The deploy
+// workflow polls this after a redeploy and fails unless `commit` is the
+// one it just pushed.
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', commit: BUILD_INFO.commit, startedAt: BUILD_INFO.startedAt });
 });
 
-app.get('/capabilities/all', (req, res) => sendCapabilities(req, res, CAPABILITIES_BODY, CAPABILITIES_ETAG));
+app.get('/capabilities', (req, res) => toGuide(res, req.query.feature ? String(req.query.feature).toLowerCase() : null));
+app.get('/capabilities/:topic', (req, res) => {
+  const [, topic, ext = ''] = /^(.*?)(\.md|\.json)?$/i.exec(req.params.topic.toLowerCase());
+  toGuide(res, topic, ext);
+});
 
-app.get('/capabilities/:topic', (req, res) => sendTopic(req, res, req.params.topic));
+// The deploy reply's warnings — see the call site in POST /apps.
+function deployWarnings({ config, timers, claim, isStaticDeploy, schedules }) {
+  const out = [...config.warnings];
+  const timer = timersWarning(timers);
+  if (timer) out.push(timer);
+  // No embarko.json schedules this time, but the app has some: say they
+  // were kept, so a deleted file isn't mistaken for "removed".
+  if (schedules === undefined && claim.scheduleCount > 0 && !isStaticDeploy) {
+    out.push({
+      code: 'schedules_unchanged',
+      detail:
+        `This app has ${claim.scheduleCount} schedule(s), and this upload has no "schedules" in embarko.json, so they were kept as they are. ` +
+        'To remove them, deploy with {"schedules": []} in embarko.json.',
+    });
+  }
+  if (isStaticDeploy && Array.isArray(schedules) && schedules.length > 0) {
+    out.push({
+      code: 'schedules_on_static_site',
+      detail: 'This is a static site, so nothing runs on a server and its schedules were not applied. Deploy the app as a server app to use schedules.',
+    });
+  }
+  return out;
+}
 
 // multer stops at UPLOAD_MAX_BYTES and throws LIMIT_FILE_SIZE; this turns
 // that into a 413 with the usual error body (the partial file is already
@@ -771,7 +860,15 @@ function uploadSizeError(err, req, res, next) {
 }
 
 app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), uploadSizeError, jsonSource, async (req, res) => {
-  const appName = req.headers['x-app-name'];
+  
+  let appName = req.headers['x-app-name'];
+
+  // Optional: the app's stable id from an earlier deploy reply (app.id),
+  // which the deployer keeps in embarko.json. It finds the app even after
+  // its name was changed in the dashboard — see hostnsoft-api's
+  // services/projectClaim.ts resolveDeployTarget.
+  const rawAppId = req.headers['x-app-id'];
+  const appId = typeof rawAppId === 'string' ? rawAppId.trim() : '';
 
   // Multer has already written the upload to disk by the time this runs,
   // so every rejection below must remove it — nothing else ever will.
@@ -870,10 +967,48 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
     return reject(400, 'invalid_agent_name', "Invalid X-Agent-Name header. Use a short plain-text name of at most 60 characters, e.g. \"claude-code\" or \"chatgpt\".");
   }
 
-  const claim = await orDiscard(claimProject(credential, appName, appType || undefined));
+  if (appId && (appId.length > 64 || !/^[a-z0-9]+$/.test(appId))) {
+    return reject(400, 'invalid_app_id', "Invalid X-App-Id header. Send the app.id from an earlier deploy reply exactly as given, or leave it out.");
+  }
+
+  // The app's optional embarko.json, read from the archive before the
+  // claim so a file that can't be trusted refuses the deploy before any
+  // work, and the claim can check its schedules and create CRON_SECRET in
+  // the same call. See embarko-config.js and docs/embarko-json.md.
+  // `schedules` undefined = no file or no key = leave schedules as they are.
+  const config = req.file
+    ? await orDiscard(readEmbarkoConfig(req.file.path))
+    : { ok: true, present: false, schedules: undefined, warnings: [] };
+  if (!config.ok) {
+    return reject(400, config.code, config.error, { file: 'embarko.json', help: 'https://embarko.ai/docs/embarko-json' });
+  }
+  const schedules = config.schedules;
+
+  // The header wins over embarko.json's appId: it is what this deployer
+  // means right now. The file covers token deployers (agents, CI) that
+  // don't send one. Not a dashboard upload: there the person picked the
+  // app, and a stale file in their zip must not send it somewhere else.
+  const isDashboardUpload = !!(credential && credential.proxyAuthToken);
+  const targetAppId = appId || (isDashboardUpload ? undefined : config.appId) || undefined;
+  const claim = await orDiscard(claimProject(credential, appName, appType || undefined, schedules, targetAppId));
   if (!claim.ok) {
     return reject(claim.status, claim.code, claim.error);
   }
+  // The app may have been renamed since the deployer last looked: build,
+  // route and report under its current name. claim.notices says so.
+  if (claim.slug && claim.slug !== appName) {
+    logger.info(`[${appName}] Resolved to the app's current name "${claim.slug}"`);
+    appName = claim.slug;
+  }
+
+  // In flight from the claim on, for orphan cleanup's teardown (see
+  // deploy-in-flight.js). This registration covers the request itself and
+  // ends with its response, whichever way that goes; a build that carries
+  // on in the background takes its own registration below, before the
+  // response goes out, so there's no gap between the two.
+  const endRequestInFlight = beginDeploy(appName);
+  res.once('finish', endRequestInFlight);
+  res.once('close', endRequestInFlight);
 
   if (rawVersion && !/^[a-zA-Z0-9._-]+$/.test(rawVersion)) {
     return reject(400, 'invalid_app_version', "Invalid X-App-Version header. Use letters, numbers, dots, dashes, underscores only.", {}, true);
@@ -1058,6 +1193,13 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
     // Refusing here instead used to send a static app's owner off to a
     // second app name over a transient railpack failure.
     const isStaticDeploy = plan.ok ? plan.isPlainStatic : existingKind === 'static';
+
+    // In-process timers (node-cron, APScheduler...) stop when an idle app is
+    // put to sleep. Warn, never refuse: the reply tells the agent to move the
+    // jobs to schedules — see detect-timers.js. Skipped when embarko.json
+    // already declares schedules, and for a static site, which runs no code.
+    const timers = !isStaticDeploy && schedules === undefined ? await detectTimers(buildDir, deps) : null;
+    if (timers) logger.info(`[${appName}] In-process timer library detected: ${timers.libraries.join(', ')}`);
     if (plan.ok && !isStaticDeploy && existingKind === 'static') {
       const now = `a server app (railpack detected: ${plan.providers || 'unknown'})`;
       logger.info(`[${appName}] Rejected: app is a static site, this upload is ${now}`);
@@ -1114,18 +1256,16 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
     // the upload was accepted, not wait out the whole build inline.
     // Progress is tracked via deploy-status.js (see GET
     // /apps/:appName/status, whose URL is included in the response
-    // below) and, for token-authenticated deploys, mirrored into
-    // hostnsoft-api's own deployment history too.
-    let deploymentId = null;
-    if (isIdentified(credential)) {
-      deploymentId = await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'in_progress',
-        agentName: agentName || undefined,
-      });
-    }
+    // below) and mirrored into hostnsoft-api's own deployment history —
+    // for anonymous deploys too, since that record is what the claim
+    // link's no-rebuild re-push runs from (see record-deployment.js).
+    const deploymentId = await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'in_progress',
+      agentName: agentName || undefined,
+    });
     setDeployState(appName, {
       status: 'in_progress',
       appVersion,
@@ -1138,11 +1278,26 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
     const replyFacts = {
       host,
       appName,
+      appId: claim.projectId,
+      action: claim.action,
+      notices: claim.notices,
       url: `https://${domain}`,
       claimed: !claim.isOrphan,
       claimedNow: !!claim.claimedNow,
       expiresAt: claim.orphanExpiresAt,
+      // Only on the deploy that created a temporary app — see
+      // claim-project.js. This reply is the one place the link appears.
+      claimUrl: claim.claimUrl,
+      // hostnsoft-api's id for this attempt (null if recording failed),
+      // for support and the dashboard's history; not needed to proceed.
+      deploymentId,
       convertingFromService,
+      // What hostnsoft-api said about embarko.json's schedules, if any.
+      schedules: claim.schedules,
+      // Everything worth fixing that didn't stop the deploy, as
+      // {code, detail}: embarko.json problems, in-process timers, schedules
+      // left as they were, schedules on a static site. deploy-response.js.
+      warnings: deployWarnings({ config, timers, claim, isStaticDeploy, schedules }),
     };
 
     // A static site publishes in about a second, so wait for it (up to
@@ -1154,15 +1309,16 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
       backgroundOwnsFiles = true;
       let settle;
       const outcome = new Promise((resolve) => { settle = resolve; });
+      const endStaticInFlight = beginDeploy(appName);
       performStaticDeploy({
         appName, appVersion, imageName, domain,
         buildDir, filePath: req.file.path,
         claim, credential, deploymentId, plan, existingKind,
-        onOutcome: settle,
+        onOutcome: settle, schedules,
       }).catch((err) => {
         logger.error(`[${appName}] unexpected error in static deploy: ${err.message}`);
         settle('failed');
-      });
+      }).finally(endStaticInFlight);
 
       let timer;
       const result = await Promise.race([
@@ -1181,6 +1337,7 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
     }
 
     backgroundOwnsFiles = true;
+    const endBuildInFlight = beginDeploy(appName);
     // A server app's build takes minutes: answer at once and let the agent
     // poll. The claim and showcase steps come later, in the status reply,
     // once the app is actually live — see deploy-response.js.
@@ -1193,10 +1350,10 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
       appName, appVersion, imageName, domain,
       buildDir, filePath: req.file.path,
       claim, taskMemory, schedulingFloorMb, credential, deploymentId,
-      scaleToZeroOptIn, scaleToZeroOptOut,
+      scaleToZeroOptIn, scaleToZeroOptOut, schedules,
     }).catch((err) => {
       logger.error(`[${appName}] unexpected error in background deploy: ${err.message}`);
-    });
+    }).finally(endBuildInFlight);
 
   } catch (error) {
     // Only the SYNCHRONOUS section above (extraction, package.json read,
@@ -1221,16 +1378,14 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
     await fs.remove(buildDir).catch(() => { });
     await discardUpload();
 
-    if (isIdentified(credential)) {
-      await recordDeployment({
-        credential,
-        projectSlug: appName,
-        appVersion,
-        status: 'failed',
-        errorDetail: error.message,
-        agentName: agentName || undefined,
-      });
-    }
+    await recordDeployment({
+      credential,
+      projectSlug: appName,
+      appVersion,
+      status: 'failed',
+      errorDetail: error.message,
+      agentName: agentName || undefined,
+    });
 
     res.status(500).json(errorBody({
       host, appName, appExists: true,
@@ -1268,16 +1423,30 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
 // loadCompanyContext uses. A credential that's PRESENT but itself invalid
 // (a bad deploy token, or a rejected/expired PAT) is 401 instead — "your
 // credential is wrong" reads differently from "this isn't your app".
-async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
+//
+// A personal ("user") deploy token (2026-10-21) reaches apps outside its own
+// workspace, so for a token the access decision is hostnsoft-api's
+// (validation.appAccess, see validate-deploy-token.js), with the companyId
+// comparison below kept only for an older hostnsoft-api that doesn't answer
+// it. `permission` names what the route does — app.view or app.logs.
+async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader, permission = 'app.view') {
   let callerCompanyId = null;
   let deployTokenPresented = false;
+  let tokenAppAccess = null;
   if (authHeader) {
     deployTokenPresented = true;
     const token = authHeader.split(' ')[1];
     if (!token) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
-    const validation = await validateDeployTokenWithCompany(token);
+    const validation = await validateDeployTokenWithCompany(token, appName, permission);
     if (!validation) return { ok: false, status: 401, code: 'unauthorized', error: "Unauthorized" };
     callerCompanyId = validation.companyId;
+    tokenAppAccess = validation.appAccess;
+    // A caller the app moved away from, or a person who lost access: told
+    // why, rather than a 404 that reads as "the app is gone".
+    if (validation.appRefusal) {
+      const r = validation.appRefusal;
+      return { ok: false, status: r.status || 403, code: r.code, error: r.error };
+    }
   }
 
   const lookup = await lookupProject(appName);
@@ -1302,6 +1471,12 @@ async function authorizeAppAccess(appName, authHeader, proxyAuthTokenHeader) {
     callerCompanyId = lookup.companyId;
   }
 
+  if (deployTokenPresented && tokenAppAccess !== null) {
+    if (!tokenAppAccess) return { ok: false, status: 404, code: 'not_found', error: "Not found" };
+    // The APP's workspace, not the token's: customer-query attributes the
+    // row with it, and for a personal token the two can differ.
+    return { ok: true, companyId: lookup.companyId, isOrphan: false };
+  }
   if (!callerCompanyId || lookup.companyId !== callerCompanyId) {
     return { ok: false, status: 404, code: 'not_found', error: "Not found" };
   }
@@ -1359,7 +1534,7 @@ app.get('/apps/:appName/logs', async (req, res) => {
     return res.status(400).json(errorBody({ host, error: "Invalid app name", code: 'invalid_app_name' }));
   }
 
-  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token']);
+  const auth = await authorizeAppAccess(appName, req.headers.authorization, req.headers['proxy_auth_token'], 'app.logs');
   if (!auth.ok) {
     return res.status(auth.status).json(errorBody({ host, appName, error: auth.error, code: auth.code }));
   }
@@ -1483,7 +1658,7 @@ app.post('/apps/:appName/customer-query', express.json(), async (req, res) => {
 // actually changed.
 app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { imageTag, memoryMb, customDomains, envVars, deploymentId } = req.body || {};
+  const { imageTag, memoryMb, customDomains, envVars, deploymentId, isFreePlan = false } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
@@ -1542,7 +1717,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
       // rebuilt by this same endpoint without isOrphan.
       const manifest = await updateManifest(appName, { customDomains, isOrphan: false });
       await writeStaticRouterFile({
-        appName, domain, customDomains, isOrphan: false, spa: !!(manifest && manifest.spa),
+        appName, domain, customDomains, isOrphan: false, isFreePlan: !!isFreePlan, spa: !!(manifest && manifest.spa),
       });
     };
 
@@ -1605,6 +1780,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     schedulingFloorMb,
     customDomains,
     envVars: envVars || [],
+    isFreePlan: !!isFreePlan,
   });
 
   const nomadFilePath = `/tmp/platform-builds/${appName}-config-${Date.now()}.nomad`;
@@ -1629,7 +1805,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
         await fs.ensureDir(path.dirname(nomadFilePath));
         await fs.writeFile(nomadFilePath, nomadJobSpec);
         logger.info(`[${appName}] Applying config update (rollback, deploymentId=${deploymentId})...`);
-        await execPromise(`nomad job run ${nomadFilePath}`);
+        await runNomadJob(appName, nomadFilePath);
         await saveJobSpec(appName);
         await fs.remove(nomadFilePath);
         logger.info(`[${appName}] Config update applied.`);
@@ -1647,7 +1823,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
     await fs.ensureDir(path.dirname(nomadFilePath));
     await fs.writeFile(nomadFilePath, nomadJobSpec);
     logger.info(`[${appName}] Applying config update (customDomains: ${customDomains.join(', ') || 'none'})...`);
-    await execPromise(`nomad job run ${nomadFilePath}`);
+    await runNomadJob(appName, nomadFilePath);
     await saveJobSpec(appName);
     await fs.remove(nomadFilePath);
     res.json({ success: true });
@@ -1673,7 +1849,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
  * endpoint above does — hostnsoft-api owns all four, and the job spec
  * has to be rebuilt from scratch under the new name anyway.
  *
- * NOT RATE LIMITED HERE. capabilities.js advertises one change per week
+ * NOT RATE LIMITED HERE. The docs advertise one change per week
  * per app; that quota lives in hostnsoft-api, which owns the project
  * record the count hangs off and is the only caller of this route. This
  * side would have nowhere durable to keep it — see deploy-status.js on why
@@ -1683,7 +1859,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
  */
 app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
-  const { newName, imageTag, memoryMb, customDomains, envVars } = req.body || {};
+  const { newName, imageTag, memoryMb, customDomains, envVars, isFreePlan = false } = req.body || {};
 
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name", code: 'invalid_app_name' });
@@ -1705,7 +1881,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
     // data dir to move (see renameStaticApp). imageTag/memory/envVars are
     // container concerns and are ignored on that path.
     const result = (await isStaticApp(appName))
-      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [] })
+      ? await renameStaticApp(appName, newName, { customDomains: customDomains || [], isFreePlan: !!isFreePlan })
       : await renameApp(appName, newName, {
         imageTag,
         taskMemory,
@@ -1714,6 +1890,7 @@ app.post('/internal/apps/:appName/rename', express.json(), requireInternalSecret
         schedulingFloorMb: SCHEDULING_FLOOR_MB,
         customDomains: customDomains || [],
         envVars: envVars || [],
+        isFreePlan: !!isFreePlan,
       });
 
     // The in-memory deploy state is keyed by app name, so carry it over
@@ -1757,22 +1934,24 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     return res.status(400).json({ error: "Invalid app name" });
   }
 
+  // ?ifIdle=1 (orphan cleanup only): leave an app with a deploy in flight
+  // alone and say so, rather than tearing it down under a build that would
+  // bring it back up afterwards — see deploy-in-flight.js. hostnsoft-api
+  // retries on its next cleanup run. Without the flag a deploy in flight
+  // doesn't stop a teardown, as before.
+  if (req.query.ifIdle === '1' && isDeployInFlight(appName)) {
+    logger.info(`[${appName}] Teardown skipped: a deploy is in progress`);
+    return res.status(409).json({ error: "A deploy of this app is in progress", code: "deploy_in_progress" });
+  }
+
   try {
-    await execPromise(`nomad job stop -purge ${appName}`).catch((e) => {
-      // A job that was never successfully deployed (e.g. an orphan whose
-      // build/deploy failed) has no Nomad job at all — treat "not found"
-      // as already-torn-down rather than an error. Nomad's actual message
-      // here is "No job(s) with prefix or id \"x\" found" (confirmed via
-      // Nomad's own CLI source/issue tracker) — it does NOT contain the
-      // substring "not found", so the previous check here never matched
-      // and this path silently fell through to `throw e` instead (caught
-      // by this function's own outer try/catch, surfaced as a 500 to
-      // hostnsoft-api rather than the "already torn down" success this
-      // comment always described). Found while adding the same
-      // not-found detection to app-health.js's GET .../status endpoint.
-      const output = `${e.stdout || ''}${e.stderr || ''}`;
-      if (!/no job\(s\) with prefix or id/i.test(output)) throw e;
-    });
+    // A job that was never successfully deployed (e.g. an orphan whose
+    // build/deploy failed) has no Nomad job at all, and a static app never
+    // has one — stopNomadJob treats that as already torn down. It looks
+    // the job up by exact ID first: a bare `nomad job stop -purge demo`
+    // with no job "demo" resolves by prefix to someone else's job (see
+    // nomad-job.js).
+    await stopNomadJob(appName, { purge: true });
 
     // A static app (static-site.js) has no job to purge; it has a Traefik
     // router file and a directory of files instead. Router first, so
@@ -1887,9 +2066,33 @@ app.get('/internal/apps/:appName/analytics', requireInternalSecret, async (req, 
 // (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
 // without colliding; defaults to 4000 to match prior fixed behavior.
 const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
+  // Tell pm2 we can serve (wait_ready). No-op outside pm2.
+  if (process.send) process.send('ready');
 });
+
+// Graceful shutdown, same shape as api-service. pm2 sends SIGINT on
+// reload/stop (SIGTERM from docker/systemd); without a handler Node would
+// exit at once, cutting in-flight requests and background builds. Close
+// the server, give in-flight requests and background builds the grace
+// period, then exit. pm2 kill_timeout must be longer than this.
+// server-setup.md#zero-downtime
+const SHUTDOWN_GRACE_MS = 120000;
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`[server] ${signal} received: closing HTTP server, finishing in-flight work`);
+  server.close(() => logger.info('[server] HTTP server closed'));
+  setTimeout(() => {
+    logger.info(`[server] grace period of ${SHUTDOWN_GRACE_MS / 1000}s over, exiting`);
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // Started after listen() so a broken analytics subsystem can never
 // prevent the actual deploy pipeline from coming up — each function

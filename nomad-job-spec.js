@@ -310,9 +310,12 @@ function buildNomadJobSpec({
         BANNER_EXPIRES_AT = "${isOrphan ? orphanExpiresAt : ''}"
         BANNER_LOGIN_URL  = "${isOrphan ? orphanLoginUrl : ''}"
       }
+      # Small at idle; memory_max covers bursts, since the proxy buffers
+      # each HTML response in full to inject the footer.
       resources {
-        cpu    = 50
-        memory = 64
+        cpu        = 20
+        memory     = 32
+        memory_max = 128
       }
     }` : '';
 
@@ -320,6 +323,23 @@ function buildNomadJobSpec({
 job "${appName}" {
   datacenters = ["dc1"]
   type        = "service"
+
+  # Rolling update: the new allocation is placed (on its own dynamic
+  # port) and must be healthy before the old one is stopped, so a config
+  # push — e.g. the free<->paid plan change that adds/removes the footer
+  # sidecar — is not a visible outage. Both allocs briefly share /data.
+  update {
+    max_parallel     = 1
+    canary           = 1
+    auto_promote     = true
+    auto_revert      = true
+    health_check     = "task_states"
+    min_healthy_time = "5s"
+    healthy_deadline = "3m"
+    # How long Nomad waits for progress before failing the deployment.
+    # Default is 10m; must stay above healthy_deadline.
+    progress_deadline = "4m"
+  }
 
   group "web" {
     network {

@@ -16,9 +16,12 @@
  * companyId for a dashboard upload. Pass the SAME one that was sent to
  * claim-project.js for this deploy: either resolves to the right company,
  * but the history row is attributed to whoever the credential names, so
- * mixing them would credit the wrong actor. Never called at all for an
- * anonymous deploy — there's no company to attribute history to (see
- * docs/Anonymous-deploy-req.md's out-of-scope list).
+ * mixing them would credit the wrong actor. `null` (an anonymous deploy)
+ * is sent too, since 2026-10-08: hostnsoft-api records the row against
+ * the orphan project as "anonymous". That row is what lets the claim
+ * link keep the app with no rebuild — hostnsoft-api re-pushes the
+ * recorded image without the orphan banner — so it is not optional
+ * bookkeeping. Before this, anonymous deploys were skipped here.
  *
  * hostnsoft-api assigns the deployment's actual sequence number (v1, v2,
  * ...) itself — this only reports appVersion, whatever X-App-Version (or
@@ -57,6 +60,7 @@ async function recordDeployment({
   deploymentId,
   kind,
   agentName,
+  schedules,
 }) {
   try {
     const response = await fetch(`${HOSTNSOFT_API_URL}/internal/deployments/record`, {
@@ -73,6 +77,7 @@ async function recordDeployment({
         deploymentId,
         kind,
         agentName,
+        ...(schedules !== undefined ? { schedules } : {}),
       }),
     });
 

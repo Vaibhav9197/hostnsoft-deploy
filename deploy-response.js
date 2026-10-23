@@ -15,8 +15,8 @@
  *
  * `next` stays short on purpose. When a step needs more than a sentence —
  * how to claim, what the showcase needs, the runtime rules behind a crash,
- * how to send feedback — the detail lives in a capabilities topic
- * (capabilities.js) and the reply links it as links.help. The agent reads
+ * how to send feedback — the detail lives in a topic of the agent guide
+ * (embarko.ai/docs) and the reply links it as links.help. The agent reads
  * it only if it needs to.
  *
  * Errors keep their existing `error` and `code` (callers branch on code)
@@ -25,6 +25,14 @@
  * The flow this steers an agent through: deploy -> confirm it is live ->
  * claim it (an anonymous deploy, the usual first-time case, is deleted
  * after 24h) -> offer the showcase. Feedback is always one link away.
+ *
+ * Claiming: the deploy that creates a temporary app answers with
+ * links.claim, a link to the dashboard carrying a one-time code. The
+ * user opens it and signs in; nothing is redeployed. It appears in that
+ * reply only — status replies need no credential, so one there would
+ * hand the app to whoever asked — which is why the status reply's `next`
+ * points back at the deploy reply, and at links.help (the claim topic,
+ * which also covers the redeploy-with-a-token fallback) when it's gone.
  */
 
 const DOCS_URL = 'https://embarko.ai/docs';
@@ -35,8 +43,9 @@ const SHOWCASE_URL = 'https://embarko.ai/showcase';
 const POLL_SECONDS = { static: 2, service: 10 };
 
 // Every URL a reply can carry lives here, and only here: `app` and the
-// rest of the body never repeat one.
-function linksFor(host, appName, appUrl) {
+// rest of the body never repeat one. `claimUrl` is the keep-this-app link
+// for a fresh temporary app (see the file comment); absent otherwise.
+function linksFor(host, appName, appUrl, claimUrl) {
   const base = `https://${host}`;
   return {
     // The app's own public address — what the user is given once it's live.
@@ -46,7 +55,8 @@ function linksFor(host, appName, appUrl) {
     // App-scoped feedback: needs no credential while the app is unclaimed,
     // the app's own token once it is.
     feedback: `${base}/apps/${appName}/customer-query`,
-    claim: `${base}/api/public/deploy-tokens/request`,
+    // For the user, not the agent: they open it and sign in to keep the app.
+    ...(claimUrl ? { claim: claimUrl } : {}),
     showcase: SHOWCASE_URL,
     docs: DOCS_URL,
   };
@@ -59,10 +69,13 @@ function publicFeedbackUrl(host) {
   return `https://${host}/api/public/customer-query`;
 }
 
-// links.help: the capabilities topic that explains this reply's next step
-// in full. One per reply at most, and only where a sentence isn't enough.
-function helpUrl(host, topic) {
-  return `https://${host}/capabilities/${topic}`;
+// links.help: the guide topic that explains this reply's next step in
+// full. One per reply at most, and only where a sentence isn't enough. The
+// guide answers an agent in Markdown and a browser in HTML at the same URL.
+// `host` is unused since the guide moved off this host; kept so callers
+// don't change.
+function helpUrl(_host, topic) {
+  return `${DOCS_URL}/${topic}`;
 }
 
 // `links` with only the named entries, and feedback always.
@@ -73,35 +86,135 @@ function pick(all, ...names) {
   return out;
 }
 
-function appFacts({ appName, kind, claimed, expiresAt }) {
+function appFacts({ appName, appId, kind, claimed, expiresAt, deploymentId }) {
   const app = { name: appName, kind, claimed };
+  // The app's stable id — the deployer keeps it in embarko.json and sends
+  // it back as X-App-Id, so a rename in the dashboard can't split the app
+  // in two. Only the deploy replies have it.
+  if (appId) app.id = appId;
   if (!claimed && expiresAt) app.expiresAt = expiresAt;
+  // The platform's id for this deploy attempt, for support and the
+  // dashboard's history. Only the deploy reply has one.
+  if (deploymentId) app.deploymentId = deploymentId;
   return app;
+}
+
+// What the deploy did with embarko.json's schedules, for the deploy replies. Null
+// when the deploy sent none. `claim` is hostnsoft-api's answer at claim
+// time ({declared, accepted, reason?}); the schedules themselves are
+// applied once the deploy is live — see hostnsoft-api's docs/schedules.md.
+function schedulesFacts(host, appName, claim) {
+  if (!claim) return null;
+  if (!claim.accepted) {
+    return { facts: { declared: claim.declared, applied: false, reason: claim.reason }, sentence: `Schedules not applied: ${claim.reason}`, links: {} };
+  }
+  if (claim.declared === 0) {
+    return { facts: { declared: 0, appliesWhen: 'live' }, sentence: 'Once live, the app has no schedules.', links: {} };
+  }
+  return {
+    facts: { declared: claim.declared, appliesWhen: 'live' },
+    sentence:
+      `Once live, its ${claim.declared === 1 ? 'schedule runs' : `${claim.declared} schedules run`} on time; ` +
+      `POST links.runSchedules (deploy token) to run ${claim.declared === 1 ? 'it' : 'them'} once now, and tell the user it works only when each run's outcome is "ok".`,
+    links: { runSchedules: `https://${host}/api/apps/${appName}/schedules/run` },
+  };
+}
+
+// A warning for in-process timers (detect-timers.js). Null when none.
+function timersWarning(timers) {
+  if (!timers) return null;
+  const libs = timers.libraries.join(', ');
+  const found = timers.expressions.length
+    ? ` Timing found in the code: ${timers.expressions.map((e) => `"${e.cron}" (${e.file})`).join(', ')}.`
+    : '';
+  return {
+    code: 'in_process_timer',
+    libraries: timers.libraries,
+    expressions: timers.expressions,
+    detail:
+      `This app uses ${libs} to run jobs on a timer inside the app. Those timers are not guaranteed to run on Embarko and can stop with no error.` +
+      found +
+      ' Move each job into a GET route that checks Authorization: Bearer $CRON_SECRET, remove the timer, and deploy again with the jobs listed under "schedules" in embarko.json (see links.help).',
+  };
+}
+
+// One sentence pointing at the warnings, for `next`.
+function warningsSentence(warnings) {
+  return `${warnings.length === 1 ? 'One warning' : `${warnings.length} warnings`} in warnings[]: fix before telling the user it's done.`;
+}
+
+// The guide topic for links.help when a reply has warnings.
+function warningsHelpTopic(warnings) {
+  return warnings.every((w) => w.code.startsWith('embarko_json')) ? 'embarko-json' : 'schedules';
+}
+
+// The deploy reply's opening sentence about which app this deploy reached:
+// a new one (save its id), or an existing one that changed outside this
+// deploy (notices[]). Null when it's the expected app under the expected
+// name, which needs no comment.
+function identitySentence(action, notices, appName) {
+  const renamed = notices.find((n) => n.code === 'app_renamed');
+  if (renamed) {
+    return `This app was renamed to "${appName}" outside this deploy, so this deploy updated it: use "${appName}" from now on and keep app.id as "appId" in embarko.json.`;
+  }
+  // Moved to another workspace by a person (hostnsoft-api's projectMove.ts),
+  // reached here by a personal token that can deploy there. Nothing for the
+  // agent to change — the address and id are the same — but the person may
+  // want to know where it lives now, which notices[].detail says.
+  if (notices.some((n) => n.code === 'app_moved')) {
+    return 'This app was moved to another workspace outside this deploy, and this deploy updated it there: nothing to change on your side; mention it to the user (notices[] says where).';
+  }
+  if (action === 'created') {
+    return 'New app: save app.id as "appId" in embarko.json, so later deploys reach this app even if it is renamed.';
+  }
+  return null;
+}
+
+// The one sentence about keeping a fresh temporary app, for the deploy
+// reply that carries its link.
+function keepSentence(expiresAt) {
+  return `Temporary app: once it is live, give the user links.claim to open and sign in, which keeps it with no redeploy; otherwise it is deleted at ${expiresAt}.`;
 }
 
 /**
  * POST /apps 202. `claimedNow` — this deploy just adopted a previously
  * anonymous app. `convertingFromService` — a server app is being replaced
- * by a static site.
+ * by a static site. `claimUrl` — the keep link, for a just-created
+ * temporary app. `deploymentId` — hostnsoft-api's id for this attempt.
  */
-function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt, convertingFromService }) {
-  const all = linksFor(host, appName, url);
+function acceptedBody({ host, appName, appId, action, notices = [], kind, url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, schedules, warnings = [] }) {
+  const all = linksFor(host, appName, url, claimUrl);
   const poll = POLL_SECONDS[kind];
 
   let next = kind === 'static'
     ? `Static site, no build needed: check links.status in ${poll} seconds.`
-    : `Building: poll links.status every ${poll} seconds until it says "live" or "failed".`;
+    : `Building: poll links.status every ${poll} seconds until it says "live", "failed" or "crashed".`;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
+  const identity = identitySentence(action, notices, appName);
+  if (identity) next = `${identity} ${next}`;
+  if (!claimed && claimUrl) next = `${next} ${keepSentence(expiresAt)}`;
   if (convertingFromService) {
     next = `This replaces the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
 
+  const sched = schedulesFacts(host, appName, schedules);
+  if (sched) next = `${next} ${sched.sentence}`;
+  if (warnings.length) next = `${next} ${warningsSentence(warnings)}`;
+
   return {
     success: true,
     status: kind === 'static' ? 'publishing' : 'building',
-    app: appFacts({ appName, kind, claimed, expiresAt }),
+    app: appFacts({ appName, appId, kind, claimed, expiresAt, deploymentId }),
+    ...(action ? { action } : {}),
+    ...(notices.length ? { notices } : {}),
+    ...(sched ? { schedules: sched.facts } : {}),
+    ...(warnings.length ? { warnings } : {}),
     next,
-    links: pick(all, 'status'),
+    links: {
+      ...pick(all, 'status', 'claim'),
+      ...(sched ? sched.links : {}),
+      ...(warnings.length ? { help: helpUrl(host, warningsHelpTopic(warnings)) } : {}),
+    },
   };
 }
 
@@ -112,18 +225,26 @@ function acceptedBody({ host, appName, kind, url, claimed, claimedNow, expiresAt
  * Same body the status reply would give, minus its deprecated `deploy`
  * field, with the claim/convert notes the 202 would have carried.
  */
-function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, convertingFromService, deployState, live }) {
+function publishedBody({ host, appName, appId, action, notices = [], url, claimed, claimedNow, expiresAt, claimUrl, deploymentId, convertingFromService, deployState, live, warnings = [] }) {
   const { deploy, ...body } = statusBody({
-    host, appName, kind: 'static', url, claimed, expiresAt, deployState, staticLive: live,
+    host, appName, appId, kind: 'static', url, claimed, expiresAt, claimUrl, deploymentId, deployState, staticLive: live,
   });
   let next = body.next;
   if (claimedNow) next = `Claimed, so the app is permanent now. ${next}`;
+  const identity = identitySentence(action, notices, appName);
+  if (identity) next = `${identity} ${next}`;
   if (convertingFromService) {
     next = `This replaced the server app with a static site, which can't be undone; if that's wrong, redeploy the server version under a new name. ${next}`;
   }
+  if (warnings.length) next = `${next} ${warningsSentence(warnings)}`;
+  const extra = {
+    ...(action ? { action } : {}),
+    ...(notices.length ? { notices } : {}),
+    ...(warnings.length ? { warnings } : {}),
+  };
   return live
-    ? { success: true, ...body, next }
-    : { success: false, code: 'publish_failed', ...body, next };
+    ? { success: true, ...body, ...extra, next }
+    : { success: false, code: 'publish_failed', ...body, ...extra, next };
 }
 
 /**
@@ -131,26 +252,37 @@ function publishedBody({ host, appName, url, claimed, claimedNow, expiresAt, con
  * the last attempt (deploy-status.js), null after a restart. `health` is
  * Nomad's view (app-health.js) — meaningless for a static site, which has
  * no job; `staticLive` says whether its files are being served instead.
+ * `claimUrl`/`deploymentId` are set only when this backs a deploy reply
+ * (publishedBody): a status poll never carries the claim link.
  */
-function statusBody({ host, appName, kind, url, claimed, expiresAt, deployState, health, staticLive }) {
-  const all = linksFor(host, appName, url);
-  const app = appFacts({ appName, kind, claimed, expiresAt });
+function statusBody({ host, appName, appId, kind, url, claimed, expiresAt, claimUrl, deploymentId, deployState, health, staticLive }) {
+  const all = linksFor(host, appName, url, claimUrl);
+  const app = appFacts({ appName, appId, kind, claimed, expiresAt, deploymentId });
   const attempt = deployState ? deployState.status : null;
   const poll = POLL_SECONDS[kind];
 
   // Live: give the user the URL, then the one next step for this app —
   // claim it while it's temporary, offer the showcase once it's kept.
-  const live = claimed
-    ? {
-        status: 'live',
-        next: 'Live: give the user links.app. If they want it listed publicly, follow links.help.',
-        links: { ...pick(all, 'app'), help: helpUrl(host, 'showcase') },
-      }
-    : {
-        status: 'live',
-        next: `Live: give the user links.app and tell them it will be deleted at ${expiresAt} unless claimed. To claim it, follow links.help.`,
-        links: { ...pick(all, 'app'), help: helpUrl(host, 'claim') },
-      };
+  let live;
+  if (claimed) {
+    live = {
+      status: 'live',
+      next: 'Live: give the user links.app. If they want it listed publicly, follow links.help.',
+      links: { ...pick(all, 'app'), help: helpUrl(host, 'showcase') },
+    };
+  } else if (claimUrl) {
+    live = {
+      status: 'live',
+      next: `Live: give the user links.app, and links.claim to open and sign in, which keeps the app with no redeploy; otherwise it is deleted at ${expiresAt}. Details in links.help.`,
+      links: { ...pick(all, 'app', 'claim'), help: helpUrl(host, 'claim') },
+    };
+  } else {
+    live = {
+      status: 'live',
+      next: `Live: give the user links.app and tell them it will be deleted at ${expiresAt} unless claimed. To keep it they open the claim link from the deploy reply (its links.claim) and sign in; if that link is gone, follow links.help.`,
+      links: { ...pick(all, 'app'), help: helpUrl(host, 'claim') },
+    };
+  }
   const feedbackHelp = helpUrl(host, 'feedback');
 
   let body;
@@ -179,11 +311,10 @@ function statusBody({ host, appName, kind, url, claimed, expiresAt, deployState,
     body = staticLive
       ? live
       : { status: 'not_deployed', next: 'Nothing is published under this name: deploy it with POST /apps.', links: pick(all) };
-  } else if (health === 'running') {
+  } else if (health === 'running' || health === 'stopped') {
+    // 'stopped' = parked by scale-to-zero, woken by the first request. That
+    // is internal, so it reads as plain live to agents.
     body = live;
-  } else if (health === 'stopped') {
-    // Parked by scale-to-zero: reachable, woken by the first request.
-    body = { ...live, next: `${live.next} It's asleep now and wakes on the first request.` };
   } else if (health === 'starting') {
     body = {
       status: 'starting',
@@ -245,6 +376,15 @@ const NEXT_FOR_CODE = {
   app_name_reserved: 'That name is reserved and never becomes free: pick a different one.',
   app_name_taken: 'That name belongs to someone else: pick a different one.',
   rename_in_progress: 'This app\'s address is being changed: wait a few minutes, then deploy under its new name.',
+  invalid_app_id: 'Send app.id from an earlier deploy reply as X-App-Id, exactly as given, or leave the header out.',
+  app_not_found: 'No app this token can reach has this X-App-Id: check embarko.json\'s "appId" and the token, or remove "appId" to deploy as a new app.',
+  // From hostnsoft-api's services/tokenAccess.ts. Neither is retryable as-is
+  // and neither must lead to deploying under a new name: that would make a
+  // second copy of an app the user still has.
+  app_moved: 'This app was moved to another workspace this token can\'t reach: nothing was deployed. Don\'t deploy it under a new name; ask the user for a personal deploy token, or for access to the workspace it moved to (see links.help).',
+  no_access: 'The person this token belongs to has no access to that workspace: nothing was changed. Ask the user to get access there, or for a token from that workspace (see links.help).',
+  app_deleted: 'This app was deleted: ask the user before deploying it again; to make it a new app, remove "appId" from embarko.json and deploy.',
+  app_id_mismatch: 'The "appId" belongs to another app, likely because this code was copied from it: for a new app, remove "appId" from embarko.json and deploy; to update that app, deploy under its name.',
   app_name_check_failed: 'Temporary problem on our side: retry once, and report it to links.feedback if it keeps happening.',
   invalid_app_version: 'Use only letters, numbers, dots, dashes and underscores in X-App-Version.',
   invalid_app_type: 'Shorten X-App-Type to a plain label like "portfolio", or leave it out.',
@@ -264,16 +404,19 @@ const NEXT_FOR_CODE = {
   invalid_static_root: 'Point the Staticfile\'s root at a folder inside the upload, like "root: dist".',
   app_kind_changed: 'A static site can\'t become a server app: deploy this version under a new name (see links.help).',
   deploy_failed: 'Couldn\'t read the upload: check it\'s a valid tar.gz and redeploy, then report it to links.feedback if it keeps failing.',
-  not_found: 'No app you can see has this name: check the name, and send the owning company\'s token if it\'s claimed.',
+  not_found: 'No app you can see has this name: check the name, and send the owning workspace\'s token if it\'s claimed.',
   lookup_failed: 'Temporary problem on our side: retry in a few seconds, and report it to links.feedback if it keeps happening.',
 };
 
-// The capabilities topic that explains the error in full, for the few codes
+// The guide topic that explains the error in full, for the few codes
 // where a sentence can't: how to get a token, where data lives, and what a
 // static site can't do.
 const HELP_FOR_CODE = {
   unauthorized: 'claim',
-  unsupported_storage_pattern: 'files',
+  // The claim topic is also where tokens (personal vs workspace) are explained.
+  app_moved: 'claim',
+  no_access: 'claim',
+  unsupported_storage_pattern: 'data',
   invalid_static_root: 'static-sites',
   app_kind_changed: 'static-sites',
 };
@@ -289,7 +432,7 @@ const GENERIC_NEXT = 'Fix the request as the error says and retry, or report it 
 function errorBody({ host, appName, error, code, extra = {}, appExists = false, next }) {
   const links = {};
   const docsAnchored = ['no_manifest_at_root', 'app_nested_in_subdirectory', 'invalid_static_root'];
-  if (docsAnchored.includes(code)) links.docs = DOCS_URL;
+  if (docsAnchored.includes(code)) links.docs = `${DOCS_URL}/errors`;
   const text = next || NEXT_FOR_CODE[code] || GENERIC_NEXT;
   // An error with no topic of its own that asks for a report points at the
   // feedback topic, which says what to send.
@@ -310,6 +453,7 @@ function errorBody({ host, appName, error, code, extra = {}, appExists = false, 
 }
 
 module.exports = {
+  timersWarning,
   DOCS_URL,
   SHOWCASE_URL,
   linksFor,
