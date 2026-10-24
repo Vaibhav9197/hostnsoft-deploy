@@ -202,6 +202,18 @@ const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGIN || 'http://localhost:3000'
 
 const app = express();
 
+// Traefik sits in front on the same box and forwards the real client
+// address in X-Forwarded-For. Without this, req.ip is always 127.0.0.1
+// and every anonymous deploy would share ONE rate-limit counter (see
+// rate-limit.js). Exactly one hop is trusted: a client cannot
+// forge its address by sending its own X-Forwarded-For.
+//
+// When Cloudflare proxies the host, the rate limiter reads the client
+// address from CF-Connecting-IP instead (rate-limit.js clientIp()), so
+// a load balancer between Cloudflare and Traefik does not collapse
+// every client into one address.
+app.set('trust proxy', 1);
+
 // First, ahead of every route — assigns a unique id to each request so
 // every log line made while handling it (anywhere, including inside
 // claim-project.js/record-deployment.js) can be correlated back to this
@@ -256,8 +268,40 @@ app.use(
   })
 );
 
-// Configure Multer to save uploaded files to a temporary folder
-const upload = multer({ dest: '/tmp/platform-uploads/' });
+// Configure Multer to save uploaded files to a temporary folder.
+// fileSize caps one tarball so a single upload cannot fill the disk;
+// multer stops writing at the cap and the handler below answers 413.
+// Optional, defaults to 100 MB.
+const UPLOAD_MAX_BYTES = parseInt(process.env.UPLOAD_MAX_BYTES, 10) || 100 * 1024 * 1024;
+const upload = multer({ dest: '/tmp/platform-uploads/', limits: { fileSize: UPLOAD_MAX_BYTES } });
+
+// Caps how often one caller may upload (see rate-limit.js). Runs BEFORE
+// multer so a rejected request never touches the disk. Two counters,
+// checked in this order:
+//
+//   1. uploadIpRateLimit — per client IP, for EVERY request, token or
+//      not. identifyCaller() does not validate the token, so without
+//      this one machine could mint a fresh budget per made-up token.
+//      Looser than the per-caller limit because an office NAT or a CI
+//      runner pool puts many honest callers behind one address.
+//   2. uploadRateLimit — per deploy token, per company for dashboard
+//      uploads, or per client IP for anonymous deploys.
+//
+// IP first, so a flood from one address is refused before it touches
+// the per-token counter of a token that is also in honest use elsewhere.
+const { createLimiter, ipLimiter, intEnv } = require('./rate-limit');
+const uploadIpRateLimit = ipLimiter({
+  prefix: 'upload-ip',
+  limit: intEnv('UPLOAD_IP_LIMIT', 30),
+  windowMs: intEnv('UPLOAD_IP_LIMIT_WINDOW_MIN', 1) * 60_000,
+  label: 'uploads',
+});
+const uploadRateLimit = createLimiter({
+  prefix: 'upload',
+  limit: intEnv('UPLOAD_LIMIT', 10),
+  windowMs: intEnv('UPLOAD_LIMIT_WINDOW_MIN', 1) * 60_000,
+  label: 'uploads',
+});
 /**
  * Save the app's Nomad job spec so it can be woken after a stop.
  *
@@ -799,9 +843,24 @@ function deployWarnings({ config, timers, claim, isStaticDeploy, schedules }) {
   return out;
 }
 
-app.post('/apps', upload.single('source'), jsonSource, async (req, res) => {
-  // `let`: replaced by the app's current name once the claim has resolved
-  // it (see below) — everything after the claim builds and routes under that.
+// multer stops at UPLOAD_MAX_BYTES and throws LIMIT_FILE_SIZE; this turns
+// that into a 413 with the usual error body (the partial file is already
+// discarded by multer itself). Any other multer error falls through.
+function uploadSizeError(err, req, res, next) {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json(errorBody({
+      host: req.get('host'),
+      appName: req.headers['x-app-name'],
+      code: 'upload_too_large',
+      error: `The upload is larger than the ${Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))} MB limit.`,
+      extra: { maxBytes: UPLOAD_MAX_BYTES },
+    }));
+  }
+  return next(err);
+}
+
+app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), uploadSizeError, jsonSource, async (req, res) => {
+  
   let appName = req.headers['x-app-name'];
 
   // Optional: the app's stable id from an earlier deploy reply (app.id),
