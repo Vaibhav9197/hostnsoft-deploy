@@ -42,6 +42,11 @@ async function getRedis() {
   if (!client) {
     client = createClient({
       url: REDIS_URL,
+      // Talk the older RESP2 protocol. The client's default RESP3
+      // handshake (HELLO 3) is refused by Redis 5, which prod runs, and
+      // every store call then fails open with no rate limiting at all.
+      // RESP2 works on Redis 5 and on every newer version.
+      RESP: 2,
       socket: { reconnectStrategy: false },
     });
     client.on('error', (e) => logger.error(`[redis] ${e.message}`));
