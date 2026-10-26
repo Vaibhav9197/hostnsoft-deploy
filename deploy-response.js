@@ -375,6 +375,7 @@ const NEXT_FOR_CODE = {
   app_name_too_long: 'Use an app name of at most 63 characters.',
   app_name_reserved: 'That name is reserved and never becomes free: pick a different one.',
   app_name_taken: 'That name belongs to someone else: pick a different one.',
+  builds_paused: 'Nothing was changed. Wait retryAfterSeconds (10 minutes), then send the identical request again. Tell the person deploys are briefly paused, not broken.',
   rename_in_progress: 'This app\'s address is being changed: wait a few minutes, then deploy under its new name.',
   invalid_app_id: 'Send app.id from an earlier deploy reply as X-App-Id, exactly as given, or leave the header out.',
   app_not_found: 'No app this token can reach has this X-App-Id: check embarko.json\'s "appId" and the token, or remove "appId" to deploy as a new app.',

@@ -859,6 +859,9 @@ function uploadSizeError(err, req, res, next) {
   return next(err);
 }
 
+// How long a paused deploy is told to wait (Retry-After).
+const BUILDS_PAUSED_RETRY_SEC = 600;
+
 app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), uploadSizeError, jsonSource, async (req, res) => {
   
   let appName = req.headers['x-app-name'];
@@ -921,6 +924,14 @@ app.post('/apps', uploadIpRateLimit, uploadRateLimit, upload.single('source'), u
   const appVersion = (rawVersion && /^[a-zA-Z0-9._-]+$/.test(rawVersion))
     ? rawVersion
     : `${Date.now()}`;
+
+  // The platform monitor pauses new builds while the server is short of
+  // memory (Server-setup server-setup.md#platform-monitor), by creating
+  // this file. Refused before anything is claimed or built.
+  if (process.env.BUILDS_PAUSED_FILE && fs.existsSync(process.env.BUILDS_PAUSED_FILE)) {
+    res.set('Retry-After', String(BUILDS_PAUSED_RETRY_SEC));
+    return reject(503, 'builds_paused', 'Embarko is short of memory right now, so new deploys are paused for a few minutes. Nothing was changed.', { retryAfterSeconds: BUILDS_PAUSED_RETRY_SEC });
+  }
 
   // 1. Validation
   // Which credential this deploy carries, if any — a deploy token, a
