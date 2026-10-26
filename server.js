@@ -12,9 +12,12 @@ const cors = require('cors');
 const multer = require('multer');
 const tar = require('tar');
 const fs = require('fs-extra');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+// Argument-array runner: no shell, so a value passed as an arg can never be
+// parsed as a command. Use for any command built from caller-supplied data.
+const execFilePromise = util.promisify(execFile);
 const { randomUUID } = require('crypto');
 const logger = require('./logger');
 const { runWithRequestId } = require('./request-context');
@@ -463,10 +466,14 @@ async function assertImageExists(appName, imageName) {
 async function ensureAppDataDir(appName) {
   const dir = appDataPathFor(appName);
   await fs.ensureDir(dir);
-  // ensureDir's own mode argument only applies to directories it
-  // actually creates, so chmod separately to also correct a directory
-  // that already exists from an earlier, stricter default.
-  await fs.chmod(dir, 0o777);
+  // Apps run as the shared non-root app user (security review issue #05),
+  // so the data dir must be writable by that group — not world-writable.
+  // The app data root is owned by that group with the setgid bit (see
+  // server-setup.sh), so a dir created here already inherits the group;
+  // 2770 keeps it group-writable (setgid preserved) and drops world access.
+  // chmod separately from ensureDir so it also corrects a directory that
+  // already exists from the earlier, world-writable (0777) default.
+  await fs.chmod(dir, 0o2770);
   return dir;
 }
 
@@ -1677,8 +1684,14 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
     return res.status(400).json({ error: "Invalid app name" });
   }
-  if (typeof imageTag !== 'string' || !imageTag.includes(':')) {
-    return res.status(400).json({ error: 'imageTag is required and must be a full "name:version" image reference' });
+  // imageTag is interpolated into `docker image inspect` and into the Nomad
+  // job's `image = "..."` field, so it must be exactly this app's own image
+  // reference and nothing else. appName is already /^[a-z0-9-]+$/ (checked
+  // above), so it is safe to anchor the pattern on it. This rejects a tag
+  // for another app's image and any shell/template metacharacters.
+  const imageTagPattern = new RegExp('^' + appName + ':[A-Za-z0-9._-]+$');
+  if (typeof imageTag !== 'string' || !imageTagPattern.test(imageTag)) {
+    return res.status(400).json({ error: 'imageTag must be "<appName>:<version>" using letters, digits, dot, dash, underscore in the version.' });
   }
   if (!Array.isArray(customDomains) || !customDomains.every((d) => typeof d === 'string')) {
     return res.status(400).json({ error: "customDomains must be an array of strings" });
@@ -1769,7 +1782,7 @@ app.post('/internal/apps/:appName/config', express.json(), requireInternalSecret
   // fail deep in its own retry/placement logic with a confusing
   // "pull access denied" error unrelated to the actual cause.
   try {
-    await execPromise(`docker image inspect ${imageTag}`);
+    await execFilePromise('docker', ['image', 'inspect', imageTag]);
   } catch (e) {
     logger.warn(`[${appName}] Requested image "${imageTag}" not found locally, refusing config update`);
     // code + retainCount let the caller (hostnsoft-api's rollback route)
@@ -2080,8 +2093,12 @@ app.get('/internal/apps/:appName/analytics', requireInternalSecret, async (req, 
 // (see server-setup.sh's per-APP_ENV port offset) can coexist on one host
 // without colliding; defaults to 4000 to match prior fixed behavior.
 const PORT = Number(process.env.PORT) || 4000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`🚀 Platform Deployment API running on port ${PORT}`);
+// Loopback only: Traefik (host network) and hostnsoft-api both reach this
+// service over 127.0.0.1. Binding every interface would also expose the
+// /internal/* routes to app containers via the docker bridge gateway.
+const HOST = process.env.HOST || '127.0.0.1';
+const server = app.listen(PORT, HOST, () => {
+  logger.info(`🚀 Platform Deployment API running on ${HOST}:${PORT}`);
   // Tell pm2 we can serve (wait_ready). No-op outside pm2.
   if (process.send) process.send('ready');
 });
