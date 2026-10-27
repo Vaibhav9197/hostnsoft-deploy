@@ -26,6 +26,7 @@ const { allApps, hostnamesFor, readSleepState, markAwake } = require('./scale-to
 const { isBotRequest } = require('./analytics/bot-filter');
 const { isSqliteFile, manifestEntryProblem, isLitestreamPath } = require('./sqlite-data-check');
 const { describeTaskFailure, formatForVisitor } = require('./nomad-task-failure');
+const { recordWakeFailure } = require('./wake-failures');
 
 const NOMAD_ADDR = process.env.NOMAD_ADDR || 'http://127.0.0.1:4646';
 const PORT = Number(process.env.ACTIVATOR_PORT) || 4200;
@@ -584,6 +585,8 @@ const server = http.createServer(async (req, res) => {
     // log tail goes to this process's log only, since an app's output is
     // its owner's, not a passer-by's.
     const crash = await explainCrash(appName);
+    // For the admin Customer apps page (wake-failures.js); never awaited for the visitor.
+    recordWakeFailure(appName, crash ? 'crashed on start' : 'did not become ready in time', Date.now() - started);
     if (crash) {
       res.writeHead(503, { 'content-type': 'text/plain', 'retry-after': '300' });
       res.end(crash);

@@ -140,6 +140,7 @@ const { startAccessLogTailer } = require('./analytics/access-log-tailer');
 const { startResourcePoller } = require('./analytics/resource-poller');
 const { startRetentionLoop } = require('./analytics/retention');
 const { isValidRange, queryTraffic, queryResourceUsage } = require('./analytics/query');
+const { buildAdminOverview } = require('./admin-overview');
 
 // NEW: POST /apps now responds as soon as the upload is validated and
 // accepted, before the (potentially multi-minute) build/deploy actually
@@ -2053,6 +2054,18 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
 // /companies/:companyId/projects/:projectId consumes this, replacing the
 // previously-hardcoded health: "unknown"). See app-health.js for how
 // Nomad's own status vocabulary is simplified.
+// Everything the admin panel's Customer apps and Platform health pages show,
+// in one call — see admin-overview.js. hostnsoft-api's /admin/apps and
+// /admin/platform read it, for super admins only.
+app.get('/internal/admin/overview', requireInternalSecret, async (req, res) => {
+  try {
+    res.json(await buildAdminOverview());
+  } catch (e) {
+    logger.error(`[admin-overview] ${e.message}`);
+    res.status(502).json({ error: `Could not build the overview: ${e.message}` });
+  }
+});
+
 app.get('/internal/apps/:appName/status', requireInternalSecret, async (req, res) => {
   const { appName } = req.params;
   if (!appName || !/^[a-z0-9-]+$/.test(appName)) {
