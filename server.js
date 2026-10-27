@@ -2002,9 +2002,9 @@ app.delete('/internal/apps/:appName', requireInternalSecret, async (req, res) =>
     // After the job stop, not before: removing a running container's bind
     // mount source out from under it is how you corrupt a database rather
     // than delete one.
-    // Before the data and spec are removed: the router file is generated
-    // from those, and a deleted app left in the registry would keep a
-    // router pointing at the activator for a hostname nothing serves.
+    // Before the data is removed: forget() drops the registry entry, sleep
+    // record and saved spec, then rewrites the router file, so no wake
+    // router is left pointing at a hostname nothing serves.
     await scaleToZero.forget(appName).catch((e) => {
       logger.warn(`[${appName}] Could not remove from the scale-to-zero registry: ${e.message}`);
     });

@@ -423,15 +423,27 @@ async function setOptedOut(appName) {
 
 /**
  * Forget an app entirely, for a DELETED app. Distinct from setOptedOut:
- * this one means "gone", and leaving an entry behind would keep a router
+ * this one means "gone", and leaving anything behind would keep a router
  * pointing at a hostname nothing serves.
+ *
+ * Removes everything the wake path reads — registry entry, sleep record,
+ * saved spec — and always regenerates the router file. In universal mode
+ * most apps have no registry entry (allApps() lists them from the saved
+ * spec), so the regenerate must not depend on an entry being present.
  */
 async function forget(appName) {
   const reg = await readRegistry();
-  if (!(appName in reg.apps)) return null;
-  delete reg.apps[appName];
-  await writeRegistry(reg);
-  return regenerateRouters();
+  const hadEntry = appName in reg.apps;
+  if (hadEntry) {
+    delete reg.apps[appName];
+    await writeRegistry(reg);
+  }
+  // Spec and sleep record go before the regenerate, so the rewrite no
+  // longer sees the app.
+  await clearSleepState(appName);
+  await fs.remove(specPathFor(appName));
+  const result = await regenerateRouters();
+  return { ...result, hadEntry };
 }
 
 /**
